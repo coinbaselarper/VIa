@@ -373,11 +373,35 @@ id<MTLTexture> MetalUpscaler::encode_readback(id<MTLCommandBuffer> cb, id<MTLTex
     return dst;
 }
 
-bool MetalUpscaler::write_png(const std::string& path, id<MTLTexture> t) {
+bool MetalUpscaler::write_png(const std::string& path, id<MTLTexture> t, std::string* stats) {
     if (!t) return false;
     const std::uint32_t w = std::uint32_t(t.width), h = std::uint32_t(t.height);
     std::vector<float> px(std::size_t(w) * h * 4);
     [t getBytes:px.data() bytesPerRow:w * 16 fromRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0];
+    if (stats) {
+        double sum[3] = {0, 0, 0};
+        float mx = 0;
+        std::size_t nonzero = 0, nonfinite = 0;
+        for (std::size_t i = 0; i < std::size_t(w) * h; ++i) {
+            bool nz = false;
+            for (int c = 0; c < 3; ++c) {
+                const float v = px[i * 4 + c];
+                if (!std::isfinite(v)) {
+                    ++nonfinite;
+                    continue;
+                }
+                sum[c] += v;
+                mx = std::max(mx, v);
+                nz = nz || v != 0.0f;
+            }
+            nonzero += nz;
+        }
+        const double n = double(std::size_t(w) * h);
+        char b[200];
+        std::snprintf(b, sizeof b, "%ux%u: %.4f of texels non-zero, mean rgb %.4g %.4g %.4g, max %.4g, %zu non-finite",
+                      w, h, double(nonzero) / n, sum[0] / n, sum[1] / n, sum[2] / n, double(mx), nonfinite);
+        *stats = b;
+    }
     std::vector<std::uint8_t> rgba(std::size_t(w) * h * 4);
     for (std::size_t i = 0; i < std::size_t(w) * h; ++i) {
         for (int c = 0; c < 3; ++c) {
@@ -389,7 +413,7 @@ bool MetalUpscaler::write_png(const std::string& path, id<MTLTexture> t) {
     }
     CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
     CGDataProviderRef dp = CGDataProviderCreateWithData(nullptr, rgba.data(), rgba.size(), nullptr);
-    CGImageRef img = CGImageCreate(w, h, 8, 32, w * 4, cs, CGBitmapInfo(kCGImageAlphaNoneSkipLast), dp, nullptr, false,
+    CGImageRef img = CGImageCreate(w, h, 8, 32, w * 4, cs, CGBitmapInfo(kCGImageAlphaPremultipliedLast), dp, nullptr, false,
                                    kCGRenderingIntentDefault);
     CFURLRef url = CFURLCreateFromFileSystemRepresentation(nullptr, (const UInt8*)path.c_str(), CFIndex(path.size()), false);
     CGImageDestinationRef dst = CGImageDestinationCreateWithURL(url, CFSTR("public.png"), 1, nullptr);

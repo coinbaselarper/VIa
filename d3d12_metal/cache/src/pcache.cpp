@@ -518,16 +518,17 @@ void monitor_main() {
             s.world_next = s.world_t0 + (rel < 14.5 ? std::floor(rel) + 1 : rel < 118 ? std::floor(rel / 5) * 5 + 5 : 1e30);
             const auto q = s.cfg.device->compile_queue_stats();
             const std::uint64_t skips = s.cfg.device->stats().draws_skipped_not_ready;
-            log_line("world+%.0fs: draws skipped not ready %llu since the world began; first uses %llu (handed over ready "
-                     "%llu, compiled or waited for %llu); first-use waits %llu, longest %.0f ms (%s); compiles running "
-                     "%llu, queued %llu",
-                     rel, (unsigned long long)(skips - s.world_skips0),
+            log_line("world+%.0fs: first uses %llu (handed over ready %llu, compiled or waited for %llu), %zu of all first "
+                     "uses not ready yet; first-use waits %llu, longest %.0f ms (%s); compiles running %llu, queued %llu; "
+                     "backend NotReady skips %llu",
+                     rel,
                      (unsigned long long)(s.stats.first_uses - s.world_first_uses0),
                      (unsigned long long)(s.stats.adopted_ready - s.world_ready0),
                      (unsigned long long)(s.stats.first_uses - s.world_first_uses0 - (s.stats.adopted_ready - s.world_ready0)),
-                     (unsigned long long)(s.stats.waits - s.world_waits0), s.world_wait_longest * 1e3,
+                     s.watch.size(), (unsigned long long)(s.stats.waits - s.world_waits0), s.world_wait_longest * 1e3,
                      s.world_wait_label.empty() ? "-" : s.world_wait_label.c_str(), (unsigned long long)q.running,
-                     (unsigned long long)(q.queued[0] + q.queued[1] + q.queued[2]));
+                     (unsigned long long)(q.queued[0] + q.queued[1] + q.queued[2]),
+                     (unsigned long long)(skips - s.world_skips0));
         }
         if (tick % 3000 == 0) log_line("%s", report_locked(s).c_str());
         // A burst of new pipelines (the world's first seconds) is written at once, not at the next 20 s flush: runs

@@ -128,7 +128,7 @@ kernel void gta6rt_rect_indirect(device const uint* args [[buffer(0)]], device c
     w[3] = draw[3];
     for (uint k = 0; k < 8u; ++k) w[4u + k] = p.strides[k];
 }
-struct IndirectGroupsParams { uint stride_words; uint max_count; uint count_word; uint has_count; uint mesh; };
+struct IndirectGroupsParams { uint stride_words; uint max_count; uint count_word; uint has_count; uint mesh; uint mesh_max; uint cs_max; };
 kernel void gta6rt_indirect_groups(device const uint* args [[buffer(0)]], device const uint* count [[buffer(1)]],
                                    device uint* out [[buffer(2)]], constant IndirectGroupsParams& p [[buffer(3)]],
                                    uint i [[thread_position_in_grid]]) {
@@ -137,8 +137,8 @@ kernel void gta6rt_indirect_groups(device const uint* args [[buffer(0)]], device
     device const uint* a = args + i * p.stride_words;
     uint3 g = i < n ? uint3(a[0], a[1], a[2]) : uint3(0u);
     const ulong groups = ulong(g.x) * ulong(g.y) * ulong(g.z);
-    const bool legal = p.mesh != 0u ? g.x <= 65535u && g.y <= 65535u && g.z <= 65535u && groups <= 4194304ul
-                                    : groups <= 67108864ul;
+    const bool legal = p.mesh != 0u ? g.x <= 65535u && g.y <= 65535u && g.z <= 65535u && groups <= ulong(p.mesh_max)
+                                    : groups <= ulong(p.cs_max);
     if (!legal) g = uint3(0u);
     out[i * 3u + 0u] = g.x;
     out[i * 3u + 1u] = g.y;

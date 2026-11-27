@@ -325,7 +325,7 @@ int main(int argc, char** argv) {
                     if (f == frames - 1 && !out_dir.empty()) {
                         std::string n = k.name;
                         for (char& ch : n)
-                            if (!std::isalnum((unsigned char)ch)) ch = '_';
+                            ch = ch == '+' ? 'p' : ch == '-' ? 'm' : std::isalnum((unsigned char)ch) ? ch : '_';
                         if (k.mode != Mode::metalfx_temporal || k.name == "temporal j(+1,+1) mv(+1,+1)" ||
                             k.name == "temporal j(-1,-1) mv(+1,+1)")
                             write_png(out_dir + "/offline-" + n + ".png", o, ow, oh);

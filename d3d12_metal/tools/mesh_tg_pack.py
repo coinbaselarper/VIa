@@ -8,6 +8,9 @@ manifest with those rows pointing at them (GTA6RT_METAL_SHADER_MANIFEST=OUT/mani
 
   mesh_tg_pack.py OUT --scan [--jobs N]     every hw-route mesh shader of the store, sized; packed where over
   mesh_tg_pack.py OUT NAME...               these only
+  mesh_tg_pack.py OUT --split NAME...       these through the store's meshlet split instead (route split64: object
+                                            stage + 64-vertex mesh groups, 7 chunks), for shaders whose staged
+                                            outputs alone pass Metal's 61,440-byte threadgroup + mesh output limit
 """
 import argparse
 import concurrent.futures as cf
@@ -49,7 +52,8 @@ def manifest_rows():
 
 
 def opts_of(row):
-    meta = json.load(open(os.path.join(STORE_ROOT, row[4][: -len(".metallib")] + ".json")))
+    lib = row[11] if len(row) > 11 and row[10] == "split64" else row[4]
+    meta = json.load(open(os.path.join(STORE_ROOT, lib[: -len(".metallib")] + ".json")))
     o = {}
     for p in meta["passes"]:
         if p["pass"] == "drop_outputs":
@@ -112,7 +116,11 @@ def pack(msl, arrays):
 def cross(name, row, tmp):
     raw = open(os.path.join(SPIRV, name + ".spv"), "rb").read()
     words = list(spv.struct.unpack("<%dI" % (len(raw) // 4), raw))
-    w, passes, extra = R.prepare(words, "ms", opts_of(row))
+    opts = opts_of(row)
+    w, passes, extra = R.prepare(words, "ms", opts)
+    if len(row) > 15 and row[10] == "split64":
+        opts["split_mesh"] = {"chunks": int(row[13]), "vmax": int(row[14]), "pmax": int(row[15])}
+        w, _task = R.apply_split(w, passes, opts)
     os.makedirs(tmp, exist_ok=True)
     base = os.path.join(tmp, hashlib.sha256(name.encode()).hexdigest()[:16])
     open(base + ".spv", "wb").write(spv.to_bytes(w))
@@ -173,9 +181,30 @@ def build(out_dir, name, row, force):
             except OSError:
                 pass
     r["status"] = "packed"
+    r["split_route"] = len(row) > 10 and row[10] == "split64"
     r["key"] = key
     r["passes"] = [p["pass"] for p in passes] + ["pack_threadgroup_vec3"]
     return r
+
+
+def build_split(out_dir, name, row, chunks=7, vmax=64, pmax=64):
+    tmp = os.path.join(out_dir, "tmp", str(os.getpid()))
+    os.makedirs(tmp, exist_ok=True)
+    o = opts_of(row)
+    o["split_mesh"] = {"chunks": chunks, "vmax": vmax, "pmax": pmax}
+    tr = R.translator_id(SPIRV)
+    r = R.compile_one(os.path.join(SPIRV, name + ".spv"), "ms", os.path.join(out_dir, "cas"), tr, o, tmp=tmp)
+    out = {"name": name, "status": "split" if r.get("status") == "ok" and r.get("object_key") else "split_" + str(r.get("status")),
+           "error": r.get("error")}
+    if out["status"] == "split":
+        plan = r.get("plan") or {}
+        sets = {k: v for k, v in (plan.get("sets") or {}).items() if int(k) < 30}
+        out.update(key=r["key"], object_key=r["object_key"], chunks=chunks, vmax=vmax, pmax=pmax,
+                   push=plan.get("push"), tables=",".join("%d:%d" % (int(k) - 1, v) for k, v in
+                                                          sorted(sets.items(), key=lambda kv: int(kv[0]))) or "-",
+                   mesh_lib=os.path.join(out_dir, "cas", r["key"][:2], r["key"] + ".metallib"),
+                   object_lib=os.path.join(out_dir, "cas", r["object_key"][:2], r["object_key"] + ".metallib"))
+    return out
 
 
 def main():
@@ -185,15 +214,17 @@ def main():
     ap.add_argument("--scan", action="store_true")
     ap.add_argument("--jobs", type=int, default=2)
     ap.add_argument("--force", action="store_true")
+    ap.add_argument("--split", action="store_true")
     a = ap.parse_args()
     out_dir = os.path.abspath(a.out)
     head, rows = manifest_rows()
-    names = a.names or [n for n, f in rows.items() if f[2] == "ms" and len(f) > 10 and f[10] == "hw"]
+    names = a.names or [n for n, f in rows.items() if f[2] == "ms" and len(f) > 10 and f[10] in ("hw", "split64")]
     if not a.scan and not a.names:
         ap.error("names or --scan")
     results = []
     with cf.ProcessPoolExecutor(max_workers=a.jobs) as ex:
-        futs = {ex.submit(build, out_dir, n, rows[n], a.force): n for n in names if n in rows}
+        futs = {(ex.submit(build_split, out_dir, n, rows[n]) if a.split else ex.submit(build, out_dir, n, rows[n], a.force)): n
+                for n in names if n in rows}
         for i, f in enumerate(cf.as_completed(futs)):
             try:
                 r = f.result()
@@ -220,19 +251,32 @@ def main():
         for r in old.values():
             f.write(json.dumps(r) + "\n")
     packed = {n: r for n, r in old.items() if r["status"] == "packed"}
+    split = {n: r for n, r in old.items() if r["status"] == "split"}
     rel_root = os.path.relpath(STORE_ROOT, out_dir)
     with open(os.path.join(out_dir, "manifest.tsv.part"), "w") as f:
         for h in head:
             f.write(re.sub(r"root=\S+", "root=" + rel_root, h) if "root=" in h else h)
         for n, row in rows.items():
-            if n in packed:
+            if n in packed and packed[n].get("split_route"):
+                row = list(row)
+                row[11] = os.path.relpath(packed[n]["metallib"], STORE_ROOT)
+                row[8] = (row[8] + "," if row[8] not in ("", "-") else "") + "pack_threadgroup_vec3"
+            elif n in packed:
                 row = list(row)
                 row[1] = packed[n]["key"]
                 row[4] = os.path.relpath(packed[n]["metallib"], STORE_ROOT)
                 row[8] = (row[8] + "," if row[8] not in ("", "-") else "") + "pack_threadgroup_vec3"
+            elif n in split:
+                r = split[n]
+                row = list(row) + ["-"] * max(0, 28 - len(row))
+                row[10] = "split64"
+                row[11] = os.path.relpath(r["mesh_lib"], STORE_ROOT)
+                row[12] = os.path.relpath(r["object_lib"], STORE_ROOT)
+                row[13:18] = [str(r["chunks"]), str(r["vmax"]), str(r["pmax"]),
+                              str(r["push"]) if r["push"] is not None else "-", r["tables"]]
             f.write("\t".join(row) + "\n")
     os.replace(os.path.join(out_dir, "manifest.tsv.part"), os.path.join(out_dir, "manifest.tsv"))
-    print("# manifest: %d rows, %d packed -> %s" % (len(rows), len(packed), os.path.join(out_dir, "manifest.tsv")),
+    print("# manifest: %d rows, %d packed, %d split -> %s" % (len(rows), len(packed), len(split), os.path.join(out_dir, "manifest.tsv")),
           file=sys.stderr)
 
 

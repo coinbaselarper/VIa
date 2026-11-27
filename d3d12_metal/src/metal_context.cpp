@@ -916,10 +916,16 @@ bool SceneProbe::dispatch(const char* pipeline, bool recorded, gpu::CommandList&
         ++passes_.back().calls;
         if (recorded) ++passes_.back().recorded;
     }
-    const bool upscaler = name.compare(0, 5, "fspx/") == 0 || name.find("GTA6RT_METAL_REFUSE_CS") != std::string::npos;
+    const bool upscaler = name.compare(0, 5, "fspx/") == 0 || name.find("GTA6RT_METAL_REFUSE_CS") != std::string::npos ||
+                          name.compare(0, 14, "gta6rt-upscale") == 0;
     if (!upscaler || latched_) return false;
     latched_ = true;
     ++upscaled_frames_;
+    if (upscaled_frames_ == 1 || upscaled_frames_ == 10 || upscaled_frames_ % 100 == 0)
+        std::fprintf(stderr, "[rt] d3d12-metal scene latch %llu (frame %llu, at %s): colour %s by %s; G-buffer %u by %s\n",
+                     static_cast<unsigned long long>(upscaled_frames_), static_cast<unsigned long long>(frame_),
+                     short_name(name).c_str(), hdr_.id ? target_text(hdr_).c_str() : "none", short_name(hdr_by_).c_str(),
+                     gbuffer_count_, short_name(gbuffer_by_).c_str());
     bool copied = false;
     gpu::Texture* colour = hdr_.id ? resolve(hdr_.id) : nullptr;
     if (present_mode_ && colour) {

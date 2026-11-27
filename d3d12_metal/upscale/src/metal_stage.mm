@@ -112,7 +112,11 @@ private:
             std::string s = dump;
             const auto comma = s.find(',');
             dump_dir_ = s.substr(0, comma);
-            if (comma != std::string::npos) dump_at_ = std::strtoull(s.c_str() + comma + 1, nullptr, 10);
+            if (comma != std::string::npos) {
+                char* end = nullptr;
+                dump_at_ = std::strtoull(s.c_str() + comma + 1, &end, 10);
+                if (end && *end == ',') dump_every_ = std::strtoull(end + 1, nullptr, 10);
+            }
             if (!dump_at_) dump_at_ = 600;
         }
         ok_ = true;
@@ -232,7 +236,7 @@ private:
         }
         id<MTLTexture> dump_in = nil, dump_out = nil;
         const std::uint64_t ran = counters().ran.load() + 1;
-        if (ok && !dump_dir_.empty() && ran == dump_at_) {
+        if (ok && !dump_dir_.empty() && (ran == dump_at_ || (dump_every_ && ran > dump_at_ && (ran - dump_at_) % dump_every_ == 0))) {
             dump_in = MetalUpscaler::encode_readback(cb, j.color, in.render_w, in.render_h);
             dump_out = MetalUpscaler::encode_readback(cb, j.output, in.output_w, in.output_h);
         }
@@ -279,10 +283,12 @@ private:
                 char a[64], c[64];
                 std::snprintf(a, sizeof a, "/upscale-%06llu-input.png", static_cast<unsigned long long>(frame));
                 std::snprintf(c, sizeof c, "/upscale-%06llu-output.png", static_cast<unsigned long long>(frame));
-                const bool w1 = MetalUpscaler::write_png(dir + a, dump_in), w2 = MetalUpscaler::write_png(dir + c, dump_out);
-                std::fprintf(stderr, "[upscale] dumped frame %llu: %s%s (%s), %s%s (%s)\n",
-                             static_cast<unsigned long long>(frame), dir.c_str(), a, w1 ? "ok" : "FAILED", dir.c_str(), c,
-                             w2 ? "ok" : "FAILED");
+                std::string s1, s2;
+                const bool w1 = MetalUpscaler::write_png(dir + a, dump_in, &s1),
+                           w2 = MetalUpscaler::write_png(dir + c, dump_out, &s2);
+                std::fprintf(stderr, "[upscale] dumped frame %llu: %s%s (%s; %s), %s%s (%s; %s)\n",
+                             static_cast<unsigned long long>(frame), dir.c_str(), a, w1 ? "ok" : "FAILED", s1.c_str(),
+                             dir.c_str(), c, w2 ? "ok" : "FAILED", s2.c_str());
             }
         }];
         [cb commit];
@@ -343,7 +349,7 @@ private:
     std::uint64_t last_context_ = 0, last_frame_ = 0;
     double budget_ms_ = 8.0;
     std::string dump_dir_;
-    std::uint64_t dump_at_ = 0;
+    std::uint64_t dump_at_ = 0, dump_every_ = 0;
     std::mutex stats_mutex_, flight_mutex_;
     std::vector<double> gpu_ms_, wall_ms_, gate_ms_;
     std::vector<Flight> flights_;

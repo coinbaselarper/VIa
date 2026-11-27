@@ -48,6 +48,10 @@ public:
         auto& st = context_.stats();
         for (const Command& command : list_.commands()) {
             st.commands.fetch_add(1, std::memory_order_relaxed);
+            if (context_.scene())
+                if (const auto* m = std::get_if<DebugMarker>(&command);
+                    m && m->kind == DebugMarker::Kind::set && gta6rt::upscale::is_marker(m->label))
+                    scene_dispatch("gta6rt-upscale (host upscaler stage)", true);
             std::visit([this](const auto& c) { record(c); }, command);
         }
         if (event_depth_) {
@@ -1071,8 +1075,15 @@ private:
                 return s;
             };
             text = read ? floats(cb, int(std::min<std::uint64_t>(n, sizeof cb) / 4)) : "";
-            std::uint64_t lo = 0, hi = 0, alias = 0, room = 0;
+            std::uint64_t lo = 0, hi = 0, alias = 0, room = 0, source = 0, source_room = 0;
             auto& aliases = title_va_aliases();
+            if (!read && aliases.source_of_vsharp(base, source, source_room) && source_room >= 64 &&
+                texture_memory_readable(std::uintptr_t(source), 64)) {
+                std::memcpy(cb, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(source)),
+                            std::size_t(std::min<std::uint64_t>(source_room, sizeof cb)));
+                text = " (from title 0x" + [&] { char h[24]; std::snprintf(h, sizeof h, "%llx", (unsigned long long)source); return std::string(h); }() +
+                       ")" + floats(cb, int(std::min<std::uint64_t>(source_room, sizeof cb) / 4));
+            }
             const bool title = aliases.title_memory(base, lo, hi);
             const bool mapped = aliases.range_of(base, alias, room);
             std::fprintf(stderr,

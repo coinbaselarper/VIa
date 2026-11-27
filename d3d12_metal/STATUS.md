@@ -1,5 +1,45 @@
 # port/d3d12_metal status (round 6)
 
+## Round 6, menus (2026-11-26, 20:05-23:30): launch movie fixed; BRIGHTNESS grey is the title's; other pages match
+
+Tree `build/d3m-ui-x86_64`; every run is `host/tools/s3_storyload.sh` with `S3_SAVES=empty` (new-game flow: landing,
+movie, the five setup pages, legal pages, terms), hidden window, load 4-60 (other workers' titles before and after).
+
+- **Launch movie: shown.** Cause: the movie's draw had no render target on Metal. The title draws it through an
+  `R8G8B8A8_UNORM` RTV of an `R8G8B8A8_UNORM_SRGB` target with no castable list; the Metal copy of `CreateRenderTargetView`
+  wrote a null view ("No typed-resource format casting") and replay skipped the null slot, so the movie drew into
+  nothing and `ps_srgb_write` composed that target's unchanged content (uniform 17/17/17). Upstream fixed the same thing
+  at texture creation (`console_format_stand_ins` twin, 16:05+, not in this copy). Fix: `CreateRenderTargetView`
+  accepts the UNORM/sRGB twin of a typed RGBA8/BGRA8 render target without a list (`console_twin`; every Metal
+  texture already has pixel-format-view usage). Evidence: `run/logs/ui-s3m10.log` ("null RTV for a known resource
+  ... DXGI 29 3840x2160 ... view DXGI 28 dimension 4"), `run/logs/ui-s3m11.log` (no null RTV);
+  `run/present/ui-rt11/rt_5_VS_Bink_e9aa19fd_Wrapped.png` (the movie's target right after the Bink draw: the opening
+  stars); presented `run/present/ui-s3m11/present_001381.png` against MoltenVK `run/present/ui-s3v1/present_001201.png`
+  (same shot one frame apart: means 106.1/74.7/55.8 vs 105.9/74.7/55.9, |d| 13.4 from the animation),
+  `present_001141.png` vs `ui-s3v1/present_001301.png` |d| 2.6. The shaders, vertex layout, constant buffers and
+  planes were fine (checked with the table trace below).
+- **BRIGHTNESS background grey 63 is what the title draws.** A `VS_Blit_6e5520d1/PS_BlitColour` rect fills the
+  1920x1080 calibration target every frame with its CB colour (0.247059, 0.247059, 0.247059, 1) = 63/255
+  (`run/logs/ui-s3m16.log`, CB read through the alias of the V#); the target is 63 before (`ui-s3m12`, 7 dumps) and
+  after the calibration draw (`run/present/ui-rt15/rt_0_VS_Blit_f8e5001d_Wrapped.png`). On MoltenVK the same draws read their tables wrong
+  (`LEONIDA_LOCAL_DIAGNOSTICS=1` fsdraw lines of `run/logs/ui-s3v2.log`: the GPU copy of the calibration table
+  "DIFFER"s from the CPU slot; the BlitColour table reads zeros), so MoltenVK's black is the Vulkan path's defect, not
+  the reference. Calibration CB: sRGB constants 12.92/0.4167/1.055/0.055, 0.247059, 0.0196 (5/255 step), 2.4/2.4.
+  The symbol is still missing on Metal (its rect stays 63): the two T#s at table +0 / +0x20 (base 0x743f80000 and
+  0x743f40000) are not proven bound; not the Vulkan worker's 256x1 T# class (those are at 0x2d8000/0x2ef600).
+- **Other pages** (Metal `ui-s3m11` vs MoltenVK `ui-s3v1`/`ui-s3v3`, same binary): account picker |d| 0.04,
+  navigation 0.46 (vs `s2-firstrun/present_001441.png`), UI text size 0.49, subtitles 0.45, FINISH SETUP 0.38 and
+  LEGAL NOTICES 0.33 (vs `ui-s3v3/present_002101.png`, `_002401.png`), LEGAL TERMS 0.42 (`ui-s3m11/present_004501.png`
+  vs `ui-s3v3/present_003701.png`): noise. The light beam MoltenVK showed on FINISH SETUP / LEGAL NOTICES in `ui-s3v1`
+  (|d| 4.3 / 12.1) is an animation passing at that moment: `ui-s3v3` has none in its frames either.
+- **Diagnostics added** (all off by default): `GTA6RT_METAL_DRAW_TRACE` takes a comma list; `_TRACE_EVERY`,
+  `_TRACE_AFTER_S`, `_TRACE_TABLE=<hex offsets>` (the s8 table as the shader reads it, each V# and its memory, through
+  the alias inverse when replay has no buffer), `GTA6RT_METAL_DRAW_DUMP_RT=<dir>` (+`_BEFORE=1`: the draw's first
+  target as PNG, halved), `GTA6RT_METAL_CLEAR_TRACE=1`; `CreateRenderTargetView` logs the first 16 null RTVs.
+  `vsharp_address` counts and logs a V# base that is title memory and also a backed shader VA ("taken as already
+  rewritten"); `GTA6RT_METAL_VSHARP_TITLE_FIRST=1` takes such a base as the title's (off: no run showed it wrong).
+- `tools/check_prelink.sh`: `rt::xbox_bvh::` (shims_core, upstream 22:32) allowed.
+
 ## Round 6 (2026-11-26, 20:05-21:55): the world phase on Metal (S4) — two crashes fixed; a heap-damage SIGSEGV and an FSR4 GPU timeout open; no world frame yet
 
 Host as round 5. Trees: `build/d3m-s4-x86_64` (`-build1..17.log`), ASAN tree `build/d3m-s4-asan-x86_64`

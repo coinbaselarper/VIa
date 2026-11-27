@@ -1537,9 +1537,20 @@ Prepared Encoder::groups_prepass(const IndirectDesc& d) {
     prepass_largest_ = std::max(prepass_largest_, d.max_count);
     if (!k || !d.max_count) return out;
     out.buffer = scratch(std::uint64_t(d.max_count) * 12, &out.offset);
+    // GTA6RT_METAL_INDIRECT_MESH_GROUPS / _CS_GROUPS: the largest grid a record may launch (default 2^18 mesh groups,
+    // 2^20 compute groups; D3D12 allows 2^22 / 2^26): a garbage record then costs at most a frame's worth of groups.
+    static const std::uint32_t mesh_max = [] {
+        const char* v = std::getenv("GTA6RT_METAL_INDIRECT_MESH_GROUPS");
+        return std::uint32_t(v && *v ? std::strtoul(v, nullptr, 0) : (1u << 18));
+    }();
+    static const std::uint32_t cs_max = [] {
+        const char* v = std::getenv("GTA6RT_METAL_INDIRECT_CS_GROUPS");
+        return std::uint32_t(v && *v ? std::strtoul(v, nullptr, 0) : (1u << 20));
+    }();
     struct {
-        std::uint32_t stride_words, max_count, count_word, has_count, mesh;
-    } params{d.stride / 4, d.max_count, 0, d.count_buffer ? 1u : 0u, d.kind == IndirectKind::dispatch_mesh ? 1u : 0u};
+        std::uint32_t stride_words, max_count, count_word, has_count, mesh, mesh_max, cs_max;
+    } params{d.stride / 4, d.max_count, 0, d.count_buffer ? 1u : 0u, d.kind == IndirectKind::dispatch_mesh ? 1u : 0u,
+             mesh_max, cs_max};
     id<MTLComputeCommandEncoder> e = compute();
     auto* args = static_cast<MetalBuffer*>(d.arguments);
     auto* count = static_cast<MetalBuffer*>(d.count_buffer);

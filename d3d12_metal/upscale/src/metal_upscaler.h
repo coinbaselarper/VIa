@@ -45,7 +45,7 @@ public:
     // A shared RGBA32Float copy of `src` (w x h from the origin) encoded into `cb`, and a tone-mapped sRGB PNG of it
     // once `cb` completed (x / (1 + x), gamma 2.2: the dumps compare inputs and outputs, not the title's grading).
     static id<MTLTexture> encode_readback(id<MTLCommandBuffer> cb, id<MTLTexture> src, std::uint32_t w, std::uint32_t h);
-    static bool write_png(const std::string& path, id<MTLTexture> rgba32f);
+    static bool write_png(const std::string& path, id<MTLTexture> rgba32f, std::string* stats = nullptr);
 
 private:
     struct Impl;
