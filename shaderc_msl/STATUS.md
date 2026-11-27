@@ -212,7 +212,7 @@ Load (first listed wins): `GTA6RT_METAL_SHADER_OVERLAY=<port>/build/tmem-x86_64/
 Expected saving (I, from the per-kernel M values and the "largest kernel decides" staircase): the compute pool goes
 from 1,524.8 MiB (00968) to the next kernel, 00977 at 349.6 MiB: **-1,175 MiB**; with 00977/00974 verified and added
 it would be 197.6 MiB (-1,327 MiB). The render pool (~580 MiB, a pixel shader) is unchanged. Not confirmed in a world
-run (left to the memory worker: request in run/requests/d3d12_metal.md, 06:xx).
+run (left to the memory worker: request in run/requests/d3d12_metal.md, 06:06).
 
 ### Files
 
