@@ -641,6 +641,17 @@ std::unique_ptr<gpu::Heap> MetalDevice::create_heap(const HeapDesc& desc) {
 
 std::unique_ptr<gpu::Buffer> MetalDevice::create_buffer(const BufferDesc& desc) {
     if (!desc.size) return nullptr;
+    if (desc.va_only) {
+        id<MTLBuffer> b = nil;
+        if (@available(macOS 26.0, *))
+            b = [device_ newBufferWithLength:(desc.size + 0x3fff) & ~std::uint64_t(0x3fff)
+                                     options:MTLResourceStorageModePrivate
+                     placementSparsePageSize:MTLSparsePageSize16];
+        if (!b) return nullptr;
+        if (desc.label) b.label = @(desc.label);
+        const std::uint64_t va = va_.allocate(desc.size, 1ull << 16);
+        return std::make_unique<MetalBuffer>(this, b, va, desc.size, false, true, MemoryCategory::buffer, false);
+    }
     id<MTLBuffer> b = [device_ newBufferWithLength:desc.size options:storage_options(desc.memory)];
     if (!b) return nullptr;
     if (desc.label) b.label = @(desc.label);

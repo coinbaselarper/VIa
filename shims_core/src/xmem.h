@@ -84,7 +84,18 @@ struct TitlePoolStats {
     bool on = false;
     std::uint64_t runs = 0, run_bytes = 0, runs_refused = 0, plain_commits = 0, plain_commit_bytes = 0;
     std::uint64_t generation = 0, removals = 0;
+    // multi-page XMemAllocatePhysicalPages calls given consecutive slots / not
+    std::uint64_t contiguous_allocations = 0, scattered_allocations = 0;
 };
 TitlePoolStats title_pool_stats();
+// Whether the title pool is on for this process: GTA6RT_METAL_TITLE_POOL=1 / =0, else on when GTA6RT_GPU=metal.
+bool title_pool_wanted();
+// The range below 4 GiB held from process start for the title's 32-bit reservations (LEONIDA_XMEM_LOW_HOLD_MB):
+// what is left of it, and what was asked.
+struct LowHoldInfo {
+    void* base = nullptr;
+    std::uint64_t size = 0, asked = 0;
+};
+LowHoldInfo low_hold_info();
 
 }  // namespace rt::xmem

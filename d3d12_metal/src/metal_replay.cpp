@@ -4,6 +4,7 @@
 
 #include "metal_formats.h"
 #include "metal_context.h"
+#include "metal_rt_alias.h"
 #include "present_dump.h"
 #include "gfx10_descriptors.h"
 #include "rect_list_geometry.h"
@@ -46,8 +47,10 @@ public:
         for (std::uint32_t b = 0; b < bindless::binding_count; ++b)
             if (gpu::DescriptorHeap* t = context_.table(b)) out_.set_descriptor_table(b, t);
         auto& st = context_.stats();
+        const bool alias_watch = metal_rt_alias::watching();
         for (const Command& command : list_.commands()) {
             st.commands.fetch_add(1, std::memory_order_relaxed);
+            if (alias_watch) note_alias_uses(command);
             if (context_.scene())
                 if (const auto* m = std::get_if<DebugMarker>(&command);
                     m && m->kind == DebugMarker::Kind::set && gta6rt::upscale::is_marker(m->label))
@@ -119,6 +122,97 @@ private:
         return false;
     }
     void unsupported(const char* what) { context_.note_unsupported(what); }
+
+    // How the command uses render targets that may share a placement heap (metal_rt_alias.h), before it is recorded;
+    // a target whose bytes are not its own is poisoned first when GTA6RT_METAL_RT_ALIAS_POISON=1.
+    void note_alias_uses(const Command& command) {
+        namespace s = d3d12_state;
+        namespace l = d3d12_layout;
+        namespace a = metal_rt_alias;
+        const auto note = [&](ResourceId id, int use, bool direct) {
+            if (!id) return;
+            const MetalBinding* b = binding(id, direct);
+            if (!b || !b->alias_watch) return;
+            if (const int act = a::note_use(b->alias_watch, use); act != a::act_none && b->texture)
+                clear_alias_target(*b, act == a::act_poison);
+        };
+        constexpr std::uint32_t read_states = s::non_pixel_shader_resource | s::pixel_shader_resource | s::copy_source |
+                                              s::resolve_source | s::depth_read;
+        const auto layout_use = [](std::uint32_t layout) {
+            switch (layout) {
+            case l::unordered_access: case l::direct_queue_unordered_access: case l::compute_queue_unordered_access:
+                return int(a::use_write);
+            case l::generic_read: case l::depth_stencil_read: case l::shader_resource: case l::copy_source:
+            case l::resolve_source: case l::direct_queue_generic_read: case l::direct_queue_shader_resource:
+            case l::direct_queue_copy_source: case l::compute_queue_generic_read: case l::compute_queue_shader_resource:
+            case l::compute_queue_copy_source:
+                return int(a::use_read);
+            default:
+                return int(a::use_common);
+            }
+        };
+        constexpr std::uint32_t write_states =
+            s::render_target | s::unordered_access | s::depth_write | s::copy_dest | s::resolve_dest;
+        const auto wrote_in = [](std::uint32_t layout) {
+            switch (layout) {
+            case l::render_target: case l::unordered_access: case l::depth_stencil_write: case l::copy_dest:
+            case l::resolve_dest: case l::direct_queue_unordered_access: case l::direct_queue_copy_dest:
+            case l::compute_queue_unordered_access: case l::compute_queue_copy_dest:
+                return true;
+            default:
+                return false;
+            }
+        };
+        if (const auto* t = std::get_if<TransitionBarrier>(&command)) {
+            if (t->before & write_states) note(t->resource, a::use_wrote, false);
+            note(t->resource, t->after & s::unordered_access ? a::use_write : t->after & read_states ? a::use_read : a::use_common,
+                 false);
+        } else if (const auto* t = std::get_if<TextureBarrier>(&command)) {
+            if ((t->flags & texture_barrier_discard) || t->layout_before == l::undefined) note(t->resource, a::use_fresh, false);
+            else if (wrote_in(t->layout_before)) note(t->resource, a::use_wrote, false);
+            note(t->resource, layout_use(t->layout_after), false);
+        } else if (const auto* x = std::get_if<AliasingBarrier>(&command)) {
+            note(x->after, a::use_fresh, false);
+        } else if (const auto* d = std::get_if<DiscardResource>(&command)) {
+            if (!d->partial) note(d->resource, a::use_fresh, false);
+        } else if (const auto* c = std::get_if<ClearRenderTarget>(&command)) {
+            note(c->target.resource, c->rects.empty() ? a::use_fresh : a::use_write, true);
+        } else if (const auto* c = std::get_if<ClearDepthStencil>(&command)) {
+            const MetalBinding* b = binding(c->target.resource, true);
+            const bool all = c->rects.empty() && (c->flags & clear_depth) && (!(b && b->stencil) || (c->flags & clear_stencil));
+            note(c->target.resource, all ? a::use_fresh : a::use_write, true);
+        } else if (const auto* c = std::get_if<ClearUnorderedAccess>(&command)) {
+            if (!c->view.buffer) note(c->view.resource, a::use_write, true);
+        } else if (const auto* c = std::get_if<CopyTexture>(&command)) {
+            note(c->src.resource, a::use_read, true);
+            note(c->dst.resource, a::use_write, true);
+        } else if (const auto* c = std::get_if<CopyResource>(&command)) {
+            note(c->src, a::use_read, true);
+            note(c->dst, a::use_fresh, true);
+        } else if (const auto* c = std::get_if<ResolveSubresource>(&command)) {
+            note(c->src, a::use_read, true);
+            note(c->dst, a::use_write, true);
+        } else if (const auto draw = draw_command(command); draw.state) {
+            if (draw.state->views)
+                for (std::uint32_t i = 0; i < draw.state->views->render_target_count && i < 8; ++i)
+                    note(draw.state->views->render_targets[i].resource, a::use_write, true);
+            note(draw.state->depth.resource, a::use_write, true);
+        }
+    }
+    void clear_alias_target(const MetalBinding& b, bool poison) {
+        const std::uint32_t layers = b.volume ? 1 : std::max(1u, b.array_layers);
+        for (std::uint32_t mip = 0; mip < std::max(1u, b.mip_levels); ++mip)
+            for (std::uint32_t layer = 0; layer < layers; ++layer) {
+                gpu::TargetView t;
+                t.texture = b.texture;
+                t.mip = mip;
+                t.layer = layer;
+                if (b.depth_stencil) out_.clear_depth_stencil(t, true, poison ? 0.5f : 0.0f, b.stencil, poison ? 0x5a : 0);
+                else if (poison) out_.clear_render_target(t, {1.0f, 0.0f, 1.0f, 1.0f});
+                else out_.clear_render_target(t, {0.0f, 0.0f, 0.0f, 0.0f});
+            }
+        rt_dirty_ = true;
+    }
 
     gpu::TargetView target(const TargetView& v, const MetalBinding& b, std::uint32_t layer) {
         gpu::TargetView t;
@@ -563,11 +657,31 @@ private:
         default: return Fate::recorded;
         }
     }
+    // GTA6RT_METAL_FORCE_SKIP=name,name (debug, off by default): these compute pipelines are treated as still
+    // compiling, so a warm run reproduces a cold run's skip of exactly them (producer guard included).
+    static bool forced_skip(const char* name) {
+        static const std::vector<std::string> names = [] {
+            std::vector<std::string> v;
+            const char* e = std::getenv("GTA6RT_METAL_FORCE_SKIP");
+            for (std::string t = e ? e : ""; !t.empty();) {
+                const auto comma = t.find(',');
+                v.push_back(t.substr(0, comma));
+                t = comma == std::string::npos ? "" : t.substr(comma + 1);
+            }
+            return v;
+        }();
+        if (names.empty() || !name) return false;
+        const std::string_view n(name);
+        for (const auto& k : names)
+            if (!k.empty() && n.size() >= k.size() && n.substr(n.size() - k.size()) == k) return true;
+        return false;
+    }
     Fate compute(std::uintptr_t id, MetalComputePipeline& p, const char*& why) {
         if (!context_.compute_pipeline(id, p)) {
             unsupported("Dispatch with an unknown compute pipeline");
             return Fate::pso_unknown;
         }
+        if (forced_skip(p.name)) return Fate::compiling;
         if (p.refused) {
             why = p.name;
             return Fate::pso_refused;
@@ -578,6 +692,24 @@ private:
             return Fate::pso_refused;
         }
         return pipeline_fate(p.pipeline, why);
+    }
+    // A compute pass skipped: into the per-pipeline report; one whose pipeline waits in the compile queue (a prebuild
+    // queues at background priority) is moved up to demand, as the backend's own NotReady path does for draws.
+    void compute_skipped(const MetalComputePipeline& p, bool indirect, Fate f) {
+        const char* state = nullptr;
+        if (f == Fate::compiling || f == Fate::library_pending) {
+            if (!p.pipeline) {
+                state = "no pipeline object yet";
+            } else {
+                const gpu::PipelineState s = p.pipeline->state();
+                state = s == gpu::PipelineState::queued ? "queued" : s == gpu::PipelineState::compiling ? "compiling" : "other";
+                if (s == gpu::PipelineState::queued) {
+                    gpu::Pipeline* pl = p.pipeline;
+                    context_.gpu().precompile(std::span<gpu::Pipeline* const>(&pl, 1), gpu::Priority::demand);
+                }
+            }
+        }
+        context_.note_compute_skip(p.name, indirect, f, state);
     }
     void set_compute(const MetalComputePipeline& p, const std::array<std::uint32_t, 32>& user_data) {
         if (p.pipeline != bound_compute_) {
@@ -673,6 +805,7 @@ private:
         if (const Fate f = fate; f != Fate::recorded) {
             st.dispatches_skipped.fetch_add(1, std::memory_order_relaxed);
             producer_skipped(p.name, f, c.user_data);
+            compute_skipped(p, false, f);
             context_.note_work(Work::dispatch, f, why);
             if (MetalContext::census_on()) context_.note_census(p.name, "dispatch-skipped");
             return;
@@ -699,6 +832,7 @@ private:
                        c.count_offset, why);
         if (f != Fate::recorded) {
             st.dispatches_skipped.fetch_add(1, std::memory_order_relaxed);
+            compute_skipped(p, true, f);
             context_.note_work(Work::indirect_dispatch, f, why);
             return;
         }
@@ -793,7 +927,7 @@ private:
         rt_dirty_ = false;
         return true;
     }
-    Fate bind_draw_state(const Draw& draw, const MetalGraphicsPipeline& p, const char*& why) {
+    Fate bind_draw_state(const Draw& draw, const MetalGraphicsPipeline& p, const char*& why, bool indirect = false) {
         if (!bind_targets(draw)) {
             unsupported("draw with an unknown render target or depth texture");
             return Fate::target_unknown;
@@ -815,6 +949,31 @@ private:
                 if (const Fate f = pipeline_fate(pipeline, why); f != Fate::recorded) return f;
             }
             out_.set_pipeline(pipeline);
+            // A rect-list draw the backend expands on the CPU reads slot 0's vertices (and the indices) through their
+            // CPU pointers; without one the backend fails the encoder, and with it the whole held submission
+            // (fcpu-a: 405 ExecuteCommandLists dropped, ~1 a frame). Such a draw is skipped alone instead
+            // (GTA6RT_METAL_RECT_SKIP_ALONE=0: the old behaviour). Indirect rect lists never take the CPU path.
+            static const bool rect_alone = [] {
+                const char* e = std::getenv("GTA6RT_METAL_RECT_SKIP_ALONE");
+                return !e || *e != '0';
+            }();
+            const bool cpu_rect = rect_alone && !indirect && draw.topology == gpu::topology::rect_list && pipeline &&
+                                  pipeline->rect_mode() == gpu::RectMode::cpu_rewrite;
+            if (cpu_rect) {
+                const VertexBufferView* v0 = draw.views ? &draw.views->vertex_buffers[0] : nullptr;
+                Resolved r;
+                const bool vb_ok = v0 && v0->va && va(v0->va, v0->size, r, TitleVaAliases::vertex_view) &&
+                                   r.buffer->cpu_pointer();
+                Resolved ri;
+                const bool ib_ok = !draw.indexed || (draw.index.va && va(draw.index.va, draw.index.size, ri,
+                                                                       TitleVaAliases::index_view) &&
+                                                     ri.buffer->cpu_pointer());
+                if (!vb_ok || !ib_ok) {
+                    why = !vb_ok ? "rect list expanded on the CPU: vertex buffer not CPU visible"
+                                 : "rect list expanded on the CPU: index buffer not CPU visible";
+                    return Fate::vertex_unknown;
+                }
+            }
             if (draw.views) {
                 std::array<gpu::VertexBufferView, 8> vbs{};
                 std::uint32_t used = 0;
@@ -914,7 +1073,7 @@ private:
             unsupported("indirect quad-list or adjacency draw");
             f = Fate::not_implemented;
         }
-        if (f == Fate::recorded) f = bind_draw_state(draw, p, why);
+        if (f == Fate::recorded) f = bind_draw_state(draw, p, why, true);
         gpu::IndirectDesc d;
         const gpu::IndirectKind kind = p.mesh         ? gpu::IndirectKind::dispatch_mesh
                                        : draw.indexed ? gpu::IndirectKind::draw_indexed

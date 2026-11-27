@@ -2,8 +2,12 @@
 
 #include "present_dump.h"
 
+#include <sys/stat.h>
+
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
+#include <string>
 
 namespace leonida {
 
@@ -14,9 +18,31 @@ constexpr std::int32_t kInvalidArg = std::int32_t(0x80070057u);     // E_INVALID
 constexpr std::int32_t kDeviceRemoved = std::int32_t(0x887A0005u);  // DXGI_ERROR_DEVICE_REMOVED
 }  // namespace
 
+// GTA6RT_METAL_WORLD_PRESENT_DUMP=dir[,every[,count]]: once the scene probe has seen an upscaled frame (the world),
+// every `every`-th presented frame (default 10) is written as dir/world_present_<frame>.png, `count` times (default 6).
 struct MetalPresenter::Dump {
     present_dump::PresentDump writer;
     std::vector<std::uint8_t> pixels;
+    std::string world_dir;
+    std::uint64_t world_every = 10, world_count = 6, world_done = 0, world_seen = 0;
+    Dump() {
+        const char* v = std::getenv("GTA6RT_METAL_WORLD_PRESENT_DUMP");
+        if (!v || !*v) return;
+        std::string s = v;
+        const std::size_t c = s.find(',');
+        world_dir = s.substr(0, c);
+        if (c != std::string::npos) {
+            unsigned long long e = 0, n = 0;
+            const int got = std::sscanf(s.c_str() + c + 1, "%llu,%llu", &e, &n);
+            if (got >= 1 && e) world_every = e;
+            if (got >= 2) world_count = n;
+        }
+        ::mkdir(world_dir.c_str(), 0755);
+    }
+    bool world_due(SceneProbe* scene) {
+        if (world_dir.empty() || world_done >= world_count || !scene || !scene->upscaled_frames()) return false;
+        return world_seen++ % world_every == 0;
+    }
 };
 
 MetalPresenter::MetalPresenter(MetalContext& context, MetalQueue& queue, void* layer,
@@ -51,7 +77,7 @@ bool MetalPresenter::ensure_swapchain() {
     d.width = w;
     d.height = h;
     d.buffer_count = 2;
-    d.keep_last_frame = dump_->writer.enabled();
+    d.keep_last_frame = dump_->writer.enabled() || !dump_->world_dir.empty();
     if (swapchain_) queue_.idle(2'000'000'000ull);
     swapchain_ = context_.gpu().create_swapchain(d);
     width_ = w;
@@ -89,10 +115,31 @@ std::int32_t MetalPresenter::submit(const gpu::PresentDesc& desc) {
 
 void MetalPresenter::after_present() {
     auto& w = dump_->writer;
-    if (!w.enabled() || !w.due(presented_ - 1)) return;
+    const bool world = dump_->world_due(context_.scene());
+    const bool due = w.enabled() && w.due(presented_ - 1);
+    if (!world && !due) return;
     std::uint32_t pw = 0, ph = 0;
     if (swapchain_->read_last_frame(dump_->pixels, pw, ph) != gpu::Status::ok || !pw || !ph) return;
-    w.save(presented_, VkExtent2D{pw, ph}, VK_FORMAT_B8G8R8A8_UNORM, false, dump_->pixels.data(), dump_->pixels.size());
+    if (world) {
+        ++dump_->world_done;
+        std::uint64_t lit = 0;
+        const std::uint64_t n = std::uint64_t(pw) * ph;
+        for (std::uint64_t i = 0; i < n && 4 * i + 3 < dump_->pixels.size(); ++i)
+            lit += (dump_->pixels[4 * i] | dump_->pixels[4 * i + 1] | dump_->pixels[4 * i + 2]) != 0;
+        char name[64];
+        std::snprintf(name, sizeof name, "/world_present_%06llu.png", static_cast<unsigned long long>(presented_));
+        const std::string path = dump_->world_dir + name;
+        bool written = false;
+        if (std::FILE* f = std::fopen(path.c_str(), "wb")) {
+            written = present_dump::write_png(f, VkExtent2D{pw, ph}, VK_FORMAT_B8G8R8A8_UNORM, false, dump_->pixels.data());
+            std::fclose(f);
+        }
+        std::fprintf(stderr, "[rt] d3d12-metal world present %llu (%ux%u): %.1f%% of pixels not black; %s %s\n",
+                     static_cast<unsigned long long>(presented_), pw, ph, n ? 100.0 * double(lit) / double(n) : 0.0,
+                     written ? "written to" : "NOT written to", path.c_str());
+    }
+    if (due)
+        w.save(presented_, VkExtent2D{pw, ph}, VK_FORMAT_B8G8R8A8_UNORM, false, dump_->pixels.data(), dump_->pixels.size());
 }
 
 std::int32_t MetalPresenter::present(ResourceId source, std::uint32_t sync_interval, const PresentRect* rect) {

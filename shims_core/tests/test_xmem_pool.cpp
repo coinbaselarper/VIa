@@ -208,3 +208,50 @@ TEST(xmem_pool_physical_windows_follow_map_and_unmap) {
     CHECK(zero);
     call<int>(kX, "XMemFreePhysicalPages", uint64_t{4}, static_cast<const uint64_t*>(again));
 }
+
+TEST(xmem_pool_multi_page_allocations_take_consecutive_slots) {
+    uint64_t singles[64] = {};
+    for (uint64_t& p : singles) {
+        uint64_t one = 1;
+        CHECK_EQ(call<int>(kX, "XMemAllocatePhysicalPages", uint64_t{0}, &one, &p), 1);
+    }
+    for (int i = 0; i < 64; i += 2) CHECK_EQ(call<int>(kX, "XMemFreePhysicalPages", uint64_t{1}, &singles[i]), 1);
+    uint64_t pages[16] = {};
+    uint64_t count = 16;
+    CHECK_EQ(call<int>(kX, "XMemAllocatePhysicalPages", uint64_t{0}, &count, pages), 1);
+    auto* w = call<uint8_t*>(kX, "XMemVirtualAlloc", static_cast<void*>(nullptr), size_t{16 * kPage}, 0x20402000u, uint64_t{1}, kReadWrite);
+    CHECK(w != nullptr);
+    if (!w) return;
+    CHECK(call<void*>(kX, "XMemMapPhysicalPages", w, uint64_t{16}, static_cast<const uint64_t*>(pages)) == w);
+    bool consecutive = true;
+    for (int i = 1; i < 16; ++i)
+        consecutive &= rt::xmem::physical_page_host_address(pages[i]) ==
+                       static_cast<uint8_t*>(rt::xmem::physical_page_host_address(pages[0])) + i * kPage;
+    if (pool_on()) {
+        CHECK(consecutive);
+        uint64_t run = 0;
+        CHECK(view_of(w + 0x40, &run) != nullptr);
+        CHECK_EQ(run, 16 * kPage - 0x40);
+        CHECK(rt::xmem::title_pool_stats().contiguous_allocations >= 1);
+    }
+    call<void*>(kX, "XMemMapPhysicalPages", w, uint64_t{16}, static_cast<const uint64_t*>(nullptr));
+    call<int>(kK, "VirtualFree", w, size_t{0}, kRelease);
+    CHECK_EQ(call<int>(kX, "XMemFreePhysicalPages", uint64_t{16}, static_cast<const uint64_t*>(pages)), 1);
+    for (int i = 1; i < 64; i += 2) CHECK_EQ(call<int>(kX, "XMemFreePhysicalPages", uint64_t{1}, &singles[i]), 1);
+}
+
+TEST(xmem_32bit_reservation_uses_the_low_range_held_at_start) {
+    const rt::xmem::LowHoldInfo before = rt::xmem::low_hold_info();
+    auto* p = call<uint8_t*>(kX, "XMemVirtualAlloc", static_cast<void*>(nullptr), size_t{4 << 20}, kReserve, uint64_t{7}, kReadWrite);
+    const auto at = reinterpret_cast<uintptr_t>(p);
+    if (before.size >= (4u << 20)) {
+        CHECK(p != nullptr);
+        const auto lo = reinterpret_cast<uintptr_t>(before.base);
+        CHECK(at >= lo && at + (4u << 20) <= lo + before.size);
+        CHECK_EQ(rt::xmem::low_hold_info().size, before.size - (4u << 20));
+    }
+    if (p) {
+        CHECK(at + (4u << 20) <= (uint64_t{1} << 32) || rt::xmem::low32_placed_above() > 0);
+        call<int>(kK, "VirtualFree", p, size_t{0}, kRelease);
+    }
+}

@@ -230,6 +230,9 @@ struct BufferDesc {
     const char* label = nullptr;
     // false: kept out of the device residency set (no footprint while untouched) until metal::make_resident
     bool resident = true;
+    // GPU address range only: a placement-sparse private buffer with no pages mapped (no memory, nothing in Metal's
+    // allocated size), never resident; null where the OS has no placement-sparse buffers (before macOS 26)
+    bool va_only = false;
 };
 
 enum class TextureDimension : std::uint32_t { tex1d, tex2d, tex2d_array, tex3d, cube };

@@ -367,10 +367,51 @@ void MetalContext::note_work(Work w, Fate f, const char* why) {
     ++work_why_[key];
 }
 
+static bool skip_report_on() {
+    static const bool on = [] {
+        const char* v = std::getenv("GTA6RT_METAL_SKIP_REPORT");
+        return !v || *v != '0';
+    }();
+    return on;
+}
+
+void MetalContext::note_compute_skip(const char* pipeline, bool indirect, Fate f, const char* state) {
+    if (!skip_report_on()) return;
+    std::string key = std::string(pipeline ? pipeline : "?") + (indirect ? " indirect " : " direct ") + fate_name(f);
+    if (state && *state) key += std::string(" [") + state + "]";
+    std::lock_guard lock(skip_mutex_);
+    ++skips_[key];
+    ++skipped_ever_[pipeline ? pipeline : "?"];
+}
+
 std::string MetalContext::take_work_report(std::uint64_t presents) {
     const double frames = presents ? double(presents) : 1.0;
     std::string out;
     char text[256];
+    if (skip_report_on()) {
+        std::map<std::string, std::uint64_t> skips;
+        std::size_t ever = 0;
+        {
+            std::lock_guard lock(skip_mutex_);
+            skips.swap(skips_);
+            ever = skipped_ever_.size();
+        }
+        if (!skips.empty()) {
+            std::vector<std::pair<std::uint64_t, std::string>> rows;
+            std::uint64_t total = 0;
+            for (const auto& [k, n] : skips) rows.emplace_back(n, k), total += n;
+            std::sort(rows.rbegin(), rows.rend());
+            std::string line;
+            for (const auto& [n, k] : rows) {
+                std::snprintf(text, sizeof text, "%s%s %.1f", line.empty() ? "" : "; ", k.c_str(), double(n) / frames);
+                line += text;
+            }
+            std::fprintf(stderr,
+                         "[rt] d3d12-metal compute skipped by pipeline (since the last report, per frame; %zu "
+                         "pipelines, %.1f passes a frame; %zu pipelines skipped since the start): %s\n",
+                         rows.size(), double(total) / frames, ever, line.c_str());
+        }
+    }
     for (std::size_t w = 0; w < std::size_t(Work::count); ++w) {
         std::string row;
         std::uint64_t total = 0;
@@ -1048,6 +1089,8 @@ SceneProbe::SceneProbe(MetalContext& context) : context_(context) {
         ::mkdir(dump_dir_.c_str(), 0755);
     }
     if (const char* l = std::getenv("GTA6RT_METAL_SCENE_LOG"); l && *l == '1') log_only_ = dump_dir_.empty();
+    if (const char* n = std::getenv("GTA6RT_METAL_SCENE_PASSES"); n && *n)
+        max_passes_ = std::max<std::size_t>(1, std::strtoull(n, nullptr, 10));
     std::fprintf(stderr,
                  "[rt] d3d12-metal scene probe: render size %ux%u, present %s, %s%s (frame %llu, then every %llu, %llu "
                  "times)\n",
@@ -1065,7 +1108,7 @@ void SceneProbe::draw(const Target* rts, std::uint32_t count, const Target& dept
                       const char* kind, bool recorded) {
     std::lock_guard lock(mutex_);
     const char* name = pipeline ? pipeline : "";
-    if (logging_ && passes_.size() < 600) {
+    if (logging_ && passes_.size() < max_passes_) {
         Pass* last = passes_.empty() ? nullptr : &passes_.back();
         const auto same = [&](const Pass& p) {
             if (p.dispatch || p.count != count || p.depth.id != depth.id) return false;
@@ -1089,12 +1132,24 @@ void SceneProbe::draw(const Target* rts, std::uint32_t count, const Target& dept
         if (kind && last->kind.find(kind) == std::string::npos && last->kind.size() < 60)
             last->kind += std::string(last->kind.empty() ? "" : "+") + kind;
     }
+    if (count == 1 && rts[0].id && rts[0].width == 1 && rts[0].height == 1 && std::strstr(name, "Exposure"))
+        exposure_target_ = rts[0];
     if (latched_) return;
     std::uint32_t at_size = 0;
     for (std::uint32_t i = 0; i < count; ++i)
         if (rts[i].id && render_size(rts[i])) ++at_size;
     if (count >= 3 && at_size >= 3) {
-        if (count >= gbuffer_count_) {
+        // The G-buffer is the render-size target set with the most draws this frame (a clear or a full-screen pass
+        // over the same or another set draws once).
+        Mrt* m = nullptr;
+        for (Mrt& c : mrts_)
+            if (c.first == rts[0].id && c.count == count) m = &c;
+        if (!m && mrts_.size() < 16) {
+            mrts_.push_back({rts[0].id, count, 0});
+            m = &mrts_.back();
+        }
+        if (m && ++m->calls > gbuffer_calls_) {
+            gbuffer_calls_ = m->calls;
             gbuffer_count_ = std::min<std::uint32_t>(count, 8);
             for (std::uint32_t i = 0; i < gbuffer_count_; ++i) gbuffer_[i] = rts[i];
             if (gbuffer_by_ != name) gbuffer_by_ = name;
@@ -1155,7 +1210,7 @@ bool SceneProbe::queue_readback(gpu::CommandList& out, gpu::Texture* texture, co
 bool SceneProbe::dispatch(const char* pipeline, bool recorded, gpu::CommandList& out, const Resolve& resolve) {
     std::lock_guard lock(mutex_);
     const std::string name = pipeline ? pipeline : "";
-    if (logging_ && passes_.size() < 600) {
+    if (logging_ && passes_.size() < max_passes_) {
         if (passes_.empty() || !passes_.back().dispatch || passes_.back().first != name) {
             Pass p;
             p.dispatch = true;
@@ -1227,6 +1282,8 @@ bool SceneProbe::dispatch(const char* pipeline, bool recorded, gpu::CommandList&
                     copied |= queue_readback(out, t, gbuffer_[i], "gbuffer" + std::to_string(i), false);
             if (gpu::Texture* t = gbuffer_depth_.id ? resolve(gbuffer_depth_.id) : nullptr)
                 copied |= queue_readback(out, t, gbuffer_depth_, "depth", false);
+            if (gpu::Texture* t = exposure_target_.id ? resolve(exposure_target_.id) : nullptr)
+                copied |= queue_readback(out, t, exposure_target_, "exposure1x1", false);
         }
     }
     return copied;
@@ -1357,6 +1414,8 @@ void SceneProbe::end_frame() {
     hdr_ = {};
     hdr_by_.clear();
     gbuffer_count_ = 0;
+    gbuffer_calls_ = 0;
+    mrts_.clear();
     gbuffer_by_.clear();
     gbuffer_depth_ = {};
 }

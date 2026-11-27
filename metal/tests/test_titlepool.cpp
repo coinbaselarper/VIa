@@ -257,6 +257,47 @@ void growth(Env& e) {
     CHECK(bad == 0, "two chunks in one kernel");
 }
 
+// GPU-VA-only buffers (BufferDesc::va_only): a hold takes GPU VA and no memory, and a chunk wrapped right after a
+// released probe of its size gets the probe's address.
+void va_holds(Env& e) {
+    BufferDesc hd;
+    hd.size = 1ull << 30;
+    hd.va_only = true;
+    hd.resident = false;
+    const Memory m0 = memory_now();
+    auto hold = e.dev->create_buffer(hd);
+    if (!hold) {
+        std::printf("va holds: no placement-sparse buffers on this OS; skipped\n");
+        return;
+    }
+    const Memory m1 = memory_now();
+    CHECK(hold->host_gpu_address() != 0, "a VA hold has a GPU address");
+    std::printf("va holds: 1 GiB hold at gpu 0x%llx, footprint %+.1f MiB, machine wired %+.0f MiB\n",
+                (unsigned long long)hold->host_gpu_address(), m1.footprint_mib - m0.footprint_mib, m1.wired_mib - m0.wired_mib);
+    CHECK(m1.footprint_mib - m0.footprint_mib < 16, "a VA hold costs no footprint");
+    int same = 0;
+    for (unsigned i = 0; i < 16; ++i) {
+        hd.size = 4u << 20;
+        std::uint64_t probe_va = 0;
+        {
+            auto probe = e.dev->create_buffer(hd);
+            CHECK(probe != nullptr, "probe");
+            if (!probe) return;
+            probe_va = probe->host_gpu_address();
+        }
+        std::string err;
+        HostBufferDesc d;
+        d.cpu = e.pool + 7 * kChunk + i * (4u << 20);
+        d.size = 4u << 20;
+        d.resident = false;
+        auto b = e.dev->create_host_buffer(d, &err);
+        CHECK(b != nullptr, "wrap after a probe: %s", err.c_str());
+        same += b && b->host_gpu_address() == probe_va;
+    }
+    std::printf("va holds: a 4 MiB chunk wrapped right after a released probe got the probe's GPU address %d of 16\n", same);
+    CHECK(same >= 12, "probe address reused");
+}
+
 void residency(Env& e) {
     constexpr unsigned k = 3;
     std::memset(e.pool + k * kChunk, 1, 1 << 20);
@@ -407,6 +448,7 @@ int main() {
     decommit(e);
     read_overwrite(e);
     growth(e);
+    va_holds(e);
     residency(e);
     naming_cost(e);
     std::printf("encoder resources now %llu, useResource calls %llu\n",

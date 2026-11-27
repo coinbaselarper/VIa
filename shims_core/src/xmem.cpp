@@ -13,6 +13,7 @@
 // planted by the fault handler into window pages the title never mapped (such an access faults), write-watch shadows
 // and XMemResetWriteWatch, the title-memory/label/geometry notifications for the D3D12 layer, and the stream-pool
 // mirror of CopyPageMappingsBatchX. These are listed in STATUS.md.
+#include <libproc.h>
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
 #include <sys/sysctl.h>
@@ -20,7 +21,9 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <cerrno>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -30,6 +33,7 @@
 #include <map>
 #include <mutex>
 #include <set>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -196,12 +200,199 @@ struct PhysicalPool {
 // whatever the title does to its own views. Freed slots are zeroed when handed out again instead of decommitted
 // (a decommit maps fresh memory over the host range), and committed XMemVirtualAlloc and MEM_GRAPHICS VirtualAlloc
 // memory is a run of pool slots the title's range is a view of.
+// On by default on the Metal path (GTA6RT_GPU=metal); GTA6RT_METAL_TITLE_POOL=1 / =0 forces it either way.
+bool entry_pool_default(const char* pool, const char* gpu) {
+    if (pool && *pool) return std::strcmp(pool, "1") == 0;
+    return gpu && std::strcmp(gpu, "metal") == 0;
+}
 bool entry_pool_wanted() {
-    static const bool on = [] {
-        const char* v = gta6rt_env_get("GTA6RT_METAL_TITLE_POOL");
-        return v && std::strcmp(v, "1") == 0;
-    }();
+    static const bool on = entry_pool_default(gta6rt_env_get("GTA6RT_METAL_TITLE_POOL"), gta6rt_env_get("GTA6RT_GPU"));
     return on;
+}
+
+// Physical slots on the free list, as a bitmap: a multi-page allocation can then take consecutive slots (one pool
+// stretch for the GPU side), and any other takes the lowest free one.
+class FreeSlots {
+public:
+    void push_back(uint64_t slot) {
+        if (slot / 64 >= words_.size()) words_.resize(slot / 64 + 1, 0);
+        uint64_t& w = words_[slot / 64];
+        const uint64_t m = uint64_t{1} << (slot & 63);
+        if (w & m) return;
+        w |= m;
+        ++count_;
+        low_ = std::min<size_t>(low_, slot / 64);
+    }
+    bool empty() const { return !count_; }
+    size_t size() const { return count_; }
+    uint64_t take_any() {
+        while (low_ < words_.size() && !words_[low_]) ++low_;
+        if (low_ >= words_.size()) return 0;
+        const uint64_t slot = low_ * 64 + std::countr_zero(words_[low_]);
+        clear(slot);
+        return slot;
+    }
+    // The first run of n consecutive free slots, taken; 0 when there is none.
+    uint64_t take_run(uint64_t n) {
+        if (n > count_) return 0;
+        uint64_t start = 0, len = 0;
+        for (size_t wi = low_; wi < words_.size(); ++wi) {
+            const uint64_t w = words_[wi];
+            if (!w) {
+                len = 0;
+                continue;
+            }
+            if (w == ~uint64_t{0} && (len || n >= 64)) {
+                if (!len) start = wi * 64;
+                len += 64;
+                if (len >= n) return claim(start, n);
+                continue;
+            }
+            for (unsigned b = 0; b < 64; ++b) {
+                if (!(w >> b & 1)) {
+                    len = 0;
+                    continue;
+                }
+                if (!len) start = wi * 64 + b;
+                if (++len >= n) return claim(start, n);
+            }
+        }
+        return 0;
+    }
+
+private:
+    void clear(uint64_t slot) {
+        words_[slot / 64] &= ~(uint64_t{1} << (slot & 63));
+        --count_;
+    }
+    uint64_t claim(uint64_t start, uint64_t n) {
+        for (uint64_t s = start; s < start + n; ++s) clear(s);
+        return start;
+    }
+    std::vector<uint64_t> words_;
+    size_t count_ = 0, low_ = 0;
+};
+
+// A range below 4 GiB reserved (no access, no memory) from process start for the title's 32-bit reservations: large
+// "anywhere" mappings made before the title asks (Metal's binary archive shards with the pipeline tier on) otherwise
+// take the low 4 GiB of a process with a small page zero, and the title's 185 MB reservation found no room (fr10-c..g).
+// LEONIDA_XMEM_LOW_HOLD_MB (256 by default on the Metal path, GTA6RT_GPU=metal; none elsewhere unless set; 0: none).
+struct LowVaHold {
+    uintptr_t base = 0;
+    uint64_t size = 0;
+    uint64_t asked = 0;
+    bool tried = false;
+};
+LowVaHold g_low_va;
+bool g_base_hint_defaulted = false;  // GTA6RT_VM_BASE_HINT set by Registration (title pool default)
+
+void hold_low_va() {
+    g_low_va.tried = true;
+    const char* v = std::getenv("LEONIDA_XMEM_LOW_HOLD_MB");
+    const char* gpu = std::getenv("GTA6RT_GPU");
+    const bool metal = gpu && std::strcmp(gpu, "metal") == 0;
+    const uint64_t mb = v && *v ? std::strtoull(v, nullptr, 10) : metal ? 256 : 0;
+    if (!mb || mb >= 4096) return;
+    const uint64_t bytes = mb << 20, top = uint64_t{1} << 32;
+    g_low_va.asked = bytes;
+    uint64_t best = 0;
+    mach_vm_address_t at = kPage64k;
+    uint64_t gap_start = kPage64k;
+    for (int i = 0; i < 4096 && gap_start < top; ++i) {
+        mach_vm_size_t size = 0;
+        vm_region_basic_info_data_64_t info{};
+        mach_msg_type_number_t n = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t object = MACH_PORT_NULL;
+        const bool found = mach_vm_region(mach_task_self(), &at, &size, VM_REGION_BASIC_INFO_64,
+                                          reinterpret_cast<vm_region_info_t>(&info), &n, &object) == KERN_SUCCESS;
+        const uint64_t gap_end = std::min<uint64_t>(found ? at : top, top);
+        if (gap_end > gap_start && gap_end - gap_start >= bytes) {
+            const uint64_t place = (gap_end - bytes) & ~(kPage64k - 1);
+            if (place >= gap_start) best = place;
+        }
+        if (!found) break;
+        gap_start = at + size;
+        at = gap_start;
+    }
+    if (!best) return;
+    mach_vm_address_t place = best;
+    if (mach_vm_map(mach_task_self(), &place, bytes, 0, VM_FLAGS_FIXED, MEMORY_OBJECT_NULL, 0, FALSE, VM_PROT_NONE,
+                    VM_PROT_NONE, VM_INHERIT_NONE) != KERN_SUCCESS)
+        return;
+    g_low_va.base = static_cast<uintptr_t>(place);
+    g_low_va.size = bytes;
+}
+
+// [at, at + size) carved from the top of the held range and given back to the system, so the caller reserves it at
+// once with a fixed address; 0 when the hold is too small. g_mutex held.
+uintptr_t take_low_va(uint64_t size, uint64_t align) {
+    if (!g_low_va.size || size > g_low_va.size) return 0;
+    const uint64_t a = align > kPage64k ? align : kPage64k;
+    const uintptr_t end = g_low_va.base + g_low_va.size;
+    const uintptr_t at = (end - size) & ~(uintptr_t(a) - 1);
+    if (at < g_low_va.base) return 0;
+    if (mach_vm_deallocate(mach_task_self(), at, end - at) != KERN_SUCCESS) return 0;
+    g_low_va.size = at - g_low_va.base;
+    return at;
+}
+
+// What holds the address space below 4 GiB when the title asks for it: bytes by mapping kind (file-backed mappings by
+// file name), the largest first. Once per process.
+void report_low_va() {
+    static bool done = false;
+    if (done) return;
+    done = true;
+    std::map<std::string, std::pair<uint64_t, uint64_t>> kinds;  // name -> (bytes, mappings)
+    uint64_t total = 0, free_bytes = 0, largest_gap = 0, gap_start = kPage64k;
+    mach_vm_address_t at = kPage64k;
+    const uint64_t top = uint64_t{1} << 32;
+    for (int i = 0; i < 65536; ++i) {
+        mach_vm_size_t size = 0;
+        natural_t depth = 0;
+        vm_region_submap_info_data_64_t info{};
+        mach_msg_type_number_t n = VM_REGION_SUBMAP_INFO_COUNT_64;
+        if (mach_vm_region_recurse(mach_task_self(), &at, &size, &depth, reinterpret_cast<vm_region_recurse_info_t>(&info),
+                                   &n) != KERN_SUCCESS || at >= top) {
+            const uint64_t gap = top > gap_start ? top - gap_start : 0;
+            free_bytes += gap;
+            largest_gap = std::max(largest_gap, gap);
+            break;
+        }
+        if (at > gap_start) {
+            free_bytes += at - gap_start;
+            largest_gap = std::max<uint64_t>(largest_gap, at - gap_start);
+        }
+        const uint64_t bytes = std::min<uint64_t>(at + size, top) - at;
+        char name[96];
+        char path[1024] = {};
+        if (info.share_mode != SM_EMPTY && proc_regionfilename(getpid(), at, path, sizeof path) > 0) {
+            const char* slash = std::strrchr(path, '/');
+            const char* base = slash ? slash + 1 : path;
+            const char* dash = std::strstr(base, ".metalarchive");
+            std::snprintf(name, sizeof name, "file %s", dash ? "*.metalarchive" : base);
+        } else if (g_low_va.size && at >= g_low_va.base && at < g_low_va.base + g_low_va.size) {
+            std::snprintf(name, sizeof name, "xmem low hold");
+        } else {
+            std::snprintf(name, sizeof name, "tag %u prot %d/%d", info.user_tag, info.protection, info.max_protection);
+        }
+        auto& k = kinds[name];
+        k.first += bytes;
+        ++k.second;
+        total += bytes;
+        gap_start = at + size;
+        at = gap_start;
+    }
+    std::vector<std::pair<uint64_t, std::string>> order;
+    for (const auto& [name, k] : kinds) order.emplace_back(k.first, name + " " + std::to_string(k.first >> 20) + " MiB in " +
+                                                                    std::to_string(k.second));
+    std::sort(order.rbegin(), order.rend());
+    std::string line;
+    for (size_t i = 0; i < order.size() && i < 10; ++i) line += (i ? "; " : "") + order[i].second;
+    RTLOG(INFO, "xmem: below 4 GiB when the title asks: %llu MiB mapped, %llu MiB free, largest gap %llu MiB; held for "
+                "it %llu MiB at %p (asked %llu); by kind: %s",
+          static_cast<unsigned long long>(total >> 20), static_cast<unsigned long long>(free_bytes >> 20),
+          static_cast<unsigned long long>(largest_gap >> 20), static_cast<unsigned long long>(g_low_va.size >> 20),
+          reinterpret_cast<void*>(g_low_va.base), static_cast<unsigned long long>(g_low_va.asked >> 20), line.c_str());
 }
 
 constexpr uint64_t kPageSlotLimit = uint64_t{1} << 21;
@@ -214,7 +405,7 @@ std::unordered_map<uint64_t, uint64_t> g_pages;  // live page number -> pool slo
 std::unordered_set<uint64_t> g_fresh;            // live pages never mapped, written or handed to the host as memory
 std::vector<uint64_t> g_free_ids;
 uint64_t g_next_id = 1;
-std::vector<uint64_t> g_free_slots;
+FreeSlots g_free_slots;
 uint64_t g_next_slot = 1;
 
 // A 32-bit reservation holds a run of pool slots in its address order, so the pages the title maps there can be
@@ -246,6 +437,32 @@ std::vector<std::pair<uint64_t, uint64_t>> g_free_runs;    // (first slot, slots
 uint64_t g_next_run_slot = 0;                              // bump allocation above the physical slots
 std::unordered_set<uint64_t> g_dirty_free;                 // free physical slots the title wrote (zeroed on reuse)
 uint64_t g_run_bytes = 0, g_runs_made = 0, g_runs_refused = 0, g_plain_commits = 0, g_plain_commit_bytes = 0;
+uint64_t g_contiguous_allocations = 0, g_scattered_allocations = 0;
+// Entry pool: time spent making title views of pool slots (commit_in_run) and zeroing reused slots, and how often.
+uint64_t g_view_ns = 0, g_views = 0, g_zero_ns = 0, g_zeroed_bytes = 0;
+uint64_t now_ns() {
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                     std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+void note_view_time(uint64_t ns) {
+    g_view_ns += ns;
+    const uint64_t n = ++g_views;
+    if (!(n & (n - 1)) && n >= 256)
+        RTLOG(INFO, "xmem: title pool: %llu commits made views of pool slots in %.1f ms; %.1f MiB of reused slots zeroed in "
+                    "%.1f ms",
+              static_cast<unsigned long long>(n), double(g_view_ns) / 1e6, double(g_zeroed_bytes) / 1048576.0,
+              double(g_zero_ns) / 1e6);
+}
+// LEONIDA_XMEM_CONTIG_SLACK_MB (256): how much committed memory may sit on the free list while a multi-page
+// allocation still takes fresh slots for a consecutive run instead of scattered free ones.
+uint64_t contiguous_slack_slots() {
+    static const uint64_t slots = [] {
+        const char* v = gta6rt_env_get("LEONIDA_XMEM_CONTIG_SLACK_MB");
+        const uint64_t mb = v && *v ? std::strtoull(v, nullptr, 10) : 256;
+        return (mb << 20) / rt::xmem::kPhysicalPageSize;
+    }();
+    return slots;
+}
 
 // Entry pool only: what changed in the title-address -> pool table, for a GPU layer that caches translations.
 // Every change bumps g_generation; a removal (unmap, remap, decommit, release) also records its title range.
@@ -345,9 +562,11 @@ bool ensure_pool() {
     g_next_run_slot = physical / rt::xmem::kPhysicalPageSize + 1;
     if (g_entry)
         RTLOG(INFO, "xmem: title pool: one memory entry of %llu GiB at %p (physical pages %llu GiB, virtual runs %llu GiB); "
-                    "title pages are views of it",
+                    "title pages are views of it; GTA6RT_VM_BASE_HINT %s%s",
               static_cast<unsigned long long>(size >> 30), base, static_cast<unsigned long long>(physical >> 30),
-              static_cast<unsigned long long>((size - physical) >> 30));
+              static_cast<unsigned long long>((size - physical) >> 30),
+              std::getenv("GTA6RT_VM_BASE_HINT") ? std::getenv("GTA6RT_VM_BASE_HINT") : "unset",
+              g_base_hint_defaulted ? " (the title pool's default)" : "");
     else
         RTLOG(INFO, "xmem: physical pool %llu GiB at %p", static_cast<unsigned long long>(physical >> 30), base);
     return true;
@@ -384,7 +603,12 @@ void release_slot(uint64_t slot, bool written = true) {
 
 // Entry pool: a slot taken from the free list holds what its last page held; zero it before it is handed out.
 void zero_if_dirty(uint64_t slot) {
-    if (g_entry && g_dirty_free.erase(slot)) std::memset(slot_address(slot), 0, rt::xmem::kPhysicalPageSize);
+    if (g_entry && g_dirty_free.erase(slot)) {
+        const uint64_t t0 = now_ns();
+        std::memset(slot_address(slot), 0, rt::xmem::kPhysicalPageSize);
+        g_zero_ns += now_ns() - t0;
+        g_zeroed_bytes += rt::xmem::kPhysicalPageSize;
+    }
 }
 
 // ---- entry pool: committed virtual memory as runs of pool slots
@@ -393,7 +617,10 @@ uint64_t take_run_slots(uint64_t slots) {
     for (auto it = g_free_runs.begin(); it != g_free_runs.end(); ++it) {
         if (it->second < slots) continue;
         const uint64_t first = it->first;
+        const uint64_t t0 = now_ns();
         std::memset(slot_address(first), 0, slots * rt::xmem::kPhysicalPageSize);
+        g_zero_ns += now_ns() - t0;
+        g_zeroed_bytes += slots * rt::xmem::kPhysicalPageSize;
         if (it->second == slots) g_free_runs.erase(it);
         else *it = {first + slots, it->second - slots};
         return first;
@@ -453,6 +680,7 @@ bool commit_in_run(uintptr_t address, uint64_t size, uint32_t vm_prot) {
     const uintptr_t lo = address & ~(kSmallPage - 1);
     const uintptr_t hi = std::min<uintptr_t>((address + size + kSmallPage - 1) & ~(kSmallPage - 1), base + run->size);
     if (lo >= hi) return false;
+    const uint64_t t0 = now_ns();
     uint8_t* host = slot_address(run->first_slot) + (lo - base);
     for (uintptr_t p = lo; p < hi; p += kSmallPage) {
         uint8_t& st = run->state[(p - base) / kSmallPage];
@@ -465,6 +693,7 @@ bool commit_in_run(uintptr_t address, uint64_t size, uint32_t vm_prot) {
     }
     for (uintptr_t p = lo; p < hi; p += kSmallPage) run->state[(p - base) / kSmallPage] = kViewBit;
     note_added();
+    note_view_time(now_ns() - t0);
     return true;
 }
 
@@ -665,7 +894,28 @@ void* reserve_region(void* address, uint64_t size, uint32_t type, uint64_t align
     gta6rt_status st;
     if (!address && range) {
         const uint64_t align = alignment > 1 ? alignment : kPage64k;
-        st = gta6rt_vm_reserve_range(range->lowest, range->highest_end, size, align, flags, &base);
+        st = GTA6RT_E_NO_MEMORY;
+        if (range->low32) {
+            report_low_va();
+            if (const uintptr_t at = take_low_va(size, align)) {
+                st = gta6rt_vm_reserve(reinterpret_cast<void*>(at), size, flags | GTA6RT_VM_FIXED, &base);
+                if (st == GTA6RT_OK)
+                    RTLOG(INFO, "xmem: 32-bit reservation of %llu bytes placed at %p, in the low range held since process "
+                                "start (%llu MiB of it left)",
+                          static_cast<unsigned long long>(size), reinterpret_cast<void*>(at),
+                          static_cast<unsigned long long>(g_low_va.size >> 20));
+                else
+                    RTLOG(WARN, "xmem: 32-bit reservation of %llu bytes could not be placed at %p (status %d) after the "
+                                "low range held since process start gave it back; searching below 4 GiB",
+                          static_cast<unsigned long long>(size), reinterpret_cast<void*>(at), int(st));
+            } else if (g_low_va.tried) {
+                RTLOG(WARN, "xmem: 32-bit reservation of %llu bytes: the low range held since process start has %llu MiB "
+                            "(LEONIDA_XMEM_LOW_HOLD_MB asked %llu); searching below 4 GiB",
+                      static_cast<unsigned long long>(size), static_cast<unsigned long long>(g_low_va.size >> 20),
+                      static_cast<unsigned long long>(g_low_va.asked >> 20));
+            }
+        }
+        if (st != GTA6RT_OK) st = gta6rt_vm_reserve_range(range->lowest, range->highest_end, size, align, flags, &base);
         if (st != GTA6RT_OK && range->low32) {
             const Low32Mode mode = low32_mode();
             const uint64_t lowest = gta6rt_vm_lowest_mappable();
@@ -1187,11 +1437,28 @@ int WINAPI XMemAllocatePhysicalPages(uint64_t attributes, uint64_t* page_count, 
     }
     std::vector<uint64_t> slots;
     slots.reserve(count);
-    for (uint64_t i = 0; i < count; ++i) {
+    if (g_entry && count > 1) {
+        // Consecutive slots, so a window the pages are mapped into in order is one pool stretch: a free run first,
+        // else fresh slots while the free list holds at most contiguous_slack_slots() of committed memory.
+        uint64_t first = g_free_slots.take_run(count);
+        if (!first && g_free_slots.size() <= contiguous_slack_slots() &&
+            (g_next_slot - 1 + count) * rt::xmem::kPhysicalPageSize <= g_pool.physical) {
+            first = g_next_slot;
+            g_next_slot += count;
+        }
+        const uint64_t n = first ? ++g_contiguous_allocations : ++g_scattered_allocations;
+        if (first)
+            for (uint64_t i = 0; i < count; ++i) slots.push_back(first + i);
+        if (!(n & (n - 1)) && n >= 64)
+            RTLOG(INFO, "xmem: title pool: multi-page physical allocations: %llu given consecutive slots, %llu scattered "
+                        "(free list %zu slots)",
+                  static_cast<unsigned long long>(g_contiguous_allocations),
+                  static_cast<unsigned long long>(g_scattered_allocations), g_free_slots.size());
+    }
+    for (uint64_t i = slots.size(); i < count; ++i) {
         uint64_t slot;
         if (!g_free_slots.empty()) {
-            slot = g_free_slots.back();
-            g_free_slots.pop_back();
+            slot = g_free_slots.take_any();
         } else {
             slot = g_next_slot++;
         }
@@ -1369,8 +1636,19 @@ int WINAPI XMemTransferMemory(uint32_t type, size_t size) {
     return 1;
 }
 
+// At process start, before any thread or framework maps memory: the low range for the title's 32-bit reservation, and
+// with the title pool on, GTA6RT_VM_BASE_HINT=0x2000000000 unless set (port/os places "anywhere" title reservations
+// there, far above the shader VAs Metal hands the pool's chunks: without it chunks collided with title memory, tpool-b).
 struct Registration {
-    Registration() { rt::xmem::copy_page_mappings_fn = &rt::xmem::copy_page_mappings; }
+    Registration() {
+        rt::xmem::copy_page_mappings_fn = &rt::xmem::copy_page_mappings;
+        hold_low_va();
+        if (entry_pool_default(std::getenv("GTA6RT_METAL_TITLE_POOL"), std::getenv("GTA6RT_GPU")) &&
+            !std::getenv("GTA6RT_VM_BASE_HINT")) {
+            setenv("GTA6RT_VM_BASE_HINT", "0x2000000000", 0);
+            g_base_hint_defaulted = true;
+        }
+    }
 } g_registration;
 
 }  // namespace
@@ -1532,7 +1810,16 @@ TitlePoolStats title_pool_stats() {
     s.plain_commit_bytes = g_plain_commit_bytes;
     s.generation = g_generation.load(std::memory_order_relaxed);
     s.removals = g_removals.size();
+    s.contiguous_allocations = g_contiguous_allocations;
+    s.scattered_allocations = g_scattered_allocations;
     return s;
+}
+
+bool title_pool_wanted() { return entry_pool_wanted(); }
+
+LowHoldInfo low_hold_info() {
+    const std::lock_guard lock(g_mutex);
+    return {reinterpret_cast<void*>(g_low_va.base), g_low_va.size, g_low_va.asked};
 }
 
 }  // namespace rt::xmem

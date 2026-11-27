@@ -57,6 +57,7 @@
 #include "../src/metal_present_planes.h"
 #include "../src/metal_bindless.h"
 #include "../src/metal_ledger.h"
+#include "../src/metal_rt_alias.h"
 #include "../src/metal_formats.h"
 #include "../src/metal_shaders.h"
 #include "pcache.h"
@@ -1672,6 +1673,7 @@ struct DeviceState {
     std::uint32_t f16_half_top_location = 29;
     std::atomic<std::uint64_t> host_imports{0};  // slot-133 windows over the title's pages
     std::atomic<std::uint64_t> uploads{0}, upload_bytes{0}, zeroed_textures{0};
+    leonida::metal_rt_alias::Pool rt_alias;  // slot-133 render targets on shared title pages
 
     // Waits for every upload the device queued (a window over title pages may be released by the title next).
     void idle_uploads() {
@@ -2029,7 +2031,7 @@ struct DeviceState {
     static std::uint64_t free_gap_from(std::uint64_t va, std::uint64_t need) {
         mach_vm_address_t at = va;
         std::uint64_t gap_start = va;
-        for (int i = 0; i < 256; ++i) {
+        for (int i = 0; i < 16384; ++i) {
             mach_vm_size_t size = 0;
             vm_region_basic_info_data_64_t info{};
             mach_msg_type_number_t n = VM_REGION_BASIC_INFO_COUNT_64;
@@ -2143,6 +2145,18 @@ struct DeviceState {
             if (!gap || gap <= b.shader_va + b.capacity) continue;
             const std::uint64_t limit = std::min<std::uint64_t>((2ull << 30) - external_spacer_bytes, 512ull << 20);
             const std::uint64_t shift = std::min(limit, (gap - b.shader_va - b.capacity + (64ull << 20) + 0xffff) & ~0xffffull);
+            // GPU VA only where the OS has placement-sparse buffers (no memory, nothing in Metal's allocated size);
+            // else a private untouched buffer, which Metal counts.
+            leonida::gpu::BufferDesc vd;
+            vd.size = (gap - b.shader_va - b.capacity + (64ull << 20) + 0xffff) & ~0xffffull;
+            vd.va_only = true;
+            vd.resident = false;
+            vd.label = "shader-VA spacer for blocks outside the arena (VA only)";
+            if (auto spacer = gpu->create_buffer(vd)) {
+                ++external_spacers;
+                external_set_aside.push_back(std::move(spacer));
+                continue;
+            }
             leonida::gpu::BufferDesc sd;
             sd.size = shift;
             sd.memory = leonida::gpu::MemoryKind::device_local;
@@ -2299,8 +2313,8 @@ struct DeviceState {
     // for addresses in [4 GiB, 0x7f0000000000), =all for every one. title_window_mutex held.
     std::vector<std::unique_ptr<leonida::gpu::Buffer>> in_place_windows;
     std::uint64_t in_place_window_bytes = 0;
-    // "alias" windows are read only for the GPU unless GTA6RT_METAL_IN_PLACE_ALIAS_UAV=1: an unordered-access view
-    // into one is written with no records (mhdr-b: with UAVs into them the title faulted in the story load).
+    // The "alias" windows (round 10 stopgap) are gone: the title pool backs those pages. alias_windows stays empty, so
+    // in_alias_window is false and the view writers' checks below change nothing.
     static inline thread_local bool uav_view = false;
     static inline thread_local bool alias_view = false;  // only buffer SRVs and CBVs make alias windows
     static bool alias_uavs() {
@@ -2322,8 +2336,8 @@ struct DeviceState {
         // GTA6RT_METAL_TITLE_WINDOWS_IN_PLACE: 1 = [4 GiB, 0x7f00'0000'0000), "all", "low" = [arena size, 4 GiB) only
         // (the title's own VirtualAlloc'd low memory; 1 and "all" ended runs in a SIGBUS: d3m-r5-e, d3m-s3-b, d3m-s8-f),
         // "soft" = only for the ambiguous V#s GTA6RT_METAL_VSHARP_TITLE_FIRST=soft takes as the title's.
-        // "alias": [4 GiB, 0x7f00'0000'0000) as 1, but on 16 KiB pages and through a host-owned mach_vm_remap view of
-        // the same pages, so the title's own mapping stays free to be protected, decommitted or remapped.
+        // "alias" (round 10's mach_vm_remap stopgap for the GPU-only stream window) is removed: the title pool backs
+        // those pages with no copy; it is refused below.
         static const int mode = [] {
             const char* v = std::getenv("GTA6RT_METAL_TITLE_WINDOWS_IN_PLACE");
             return !v || !*v || std::strcmp(v, "0") == 0 ? 0 : std::strcmp(v, "all") == 0 ? 2
@@ -2331,12 +2345,17 @@ struct DeviceState {
                                                            : std::strcmp(v, "soft") == 0 ? 4
                                                            : std::strcmp(v, "alias") == 0 ? 5 : 1;
         }();
+        if (mode == 5) {
+            if (first_diagnostic("title memory alias removed", 0))
+                std::fprintf(stderr, "[rt] d3d12-metal: GTA6RT_METAL_TITLE_WINDOWS_IN_PLACE=alias is removed (the title "
+                                     "pool backs these pages, GTA6RT_METAL_TITLE_POOL); no in-place windows\n");
+            return 0;
+        }
         if (!mode || !gpu || !context) return 0;
         if (mode == 4 && (!soft_in_place || va < arena.size)) return 0;
-        if ((mode == 1 || mode == 5) && (va < (1ull << 32) || va >= 0x7f0000000000ull)) return 0;
+        if (mode == 1 && (va < (1ull << 32) || va >= 0x7f0000000000ull)) return 0;
         if (mode == 3 && (va < arena.size || va >= (1ull << 32))) return 0;
-        const std::uint64_t host_page = gpu->caps().host_page_size ? gpu->caps().host_page_size : 4096;
-        const std::uint64_t page = mode == 5 ? std::max<std::uint64_t>(host_page, 16384) : host_page;
+        const std::uint64_t page = gpu->caps().host_page_size ? gpu->caps().host_page_size : 4096;
         const std::uint64_t start = va & ~(page - 1);
         if (start < lo || hi <= va) return 0;
         const std::uint64_t limit = hi & ~(page - 1);
@@ -2360,38 +2379,9 @@ struct DeviceState {
         d.cpu = reinterpret_cast<void*>(static_cast<std::uintptr_t>(start));
         d.size = end - start;
         d.label = "title memory in place";
-        mach_vm_address_t alias = 0;
-        if (mode == 5) {
-            if ((uav_view || !alias_view) && !alias_uavs()) return 0;
-            static const std::uint64_t cap = [] {
-                const char* v = std::getenv("GTA6RT_METAL_IN_PLACE_ALIAS_MB");
-                return (v && *v ? std::strtoull(v, nullptr, 10) : 1024ull) << 20;
-            }();
-            if (in_place_window_bytes + d.size > cap) {
-                if (first_diagnostic("title memory alias cap", 0))
-                    std::fprintf(stderr, "[rt] d3d12-metal: title memory read in place through aliases reached "
-                                         "GTA6RT_METAL_IN_PLACE_ALIAS_MB (%llu MiB in %zu windows); copies instead\n",
-                                 static_cast<unsigned long long>(cap >> 20), in_place_windows.size());
-                return 0;
-            }
-            vm_prot_t cur = VM_PROT_NONE, max = VM_PROT_NONE;
-            const kern_return_t kr = mach_vm_remap(mach_task_self(), &alias, d.size, page - 1, VM_FLAGS_ANYWHERE,
-                                                   mach_task_self(), start, FALSE, &cur, &max, VM_INHERIT_NONE);
-            if (kr != KERN_SUCCESS || !(cur & VM_PROT_READ) || (alias & (page - 1))) {
-                if (kr == KERN_SUCCESS) mach_vm_deallocate(mach_task_self(), alias, d.size);
-                if (first_diagnostic("title memory alias refused", 0))
-                    std::fprintf(stderr, "[rt] d3d12-metal: no host alias of the title's pages [0x%llx, +0x%llx) (kern %d, "
-                                         "prot %d); copies instead\n",
-                                 static_cast<unsigned long long>(start), static_cast<unsigned long long>(d.size), kr, cur);
-                return 0;
-            }
-            d.cpu = reinterpret_cast<void*>(static_cast<std::uintptr_t>(alias));
-            d.label = "title memory in place (alias)";
-        }
         std::string error;
         auto buffer = gpu->create_host_buffer(d, &error);
         if (!buffer || !buffer->host_gpu_address()) {
-            if (alias) mach_vm_deallocate(mach_task_self(), alias, d.size);
             if (first_diagnostic("title memory window in place refused", 0))
                 std::fprintf(stderr, "[rt] d3d12-metal: a window of the title's memory could not be wrapped in place "
                                      "(%s); copies instead\n",
@@ -2402,10 +2392,6 @@ struct DeviceState {
         context->add_va_range(shader, d.size, buffer.get(), 0);
         backing(buffer->host_gpu_address(), d.size, shader, true);
         leonida::title_va_aliases().add(start, d.size, shader);
-        if (alias) {
-            std::unique_lock lock(alias_window_mutex);
-            alias_windows[start] = start + d.size;
-        }
         leonida::metal_ledger::add_imported(d.size);
         in_place_window_bytes += d.size;
         in_place_windows.push_back(std::move(buffer));
@@ -2417,24 +2403,35 @@ struct DeviceState {
         return shader + (va - start);
     }
 
-    // GTA6RT_METAL_TITLE_POOL=1: title memory that xmem's title pool backs (shims_core/src/xmem.h: one Mach memory
-    // entry mapped once, title pages are views of it) is reached through bytesNoCopy buffers over the pool's host
-    // range, never over a title address, so the title may unmap, remap or protect its views while the GPU reads the
-    // pool. Chunk k covers pool bytes [k, k + 1) x title_pool_chunk_bytes (GTA6RT_METAL_TITLE_POOL_CHUNK_MB, 8 by
-    // default); a range that crosses a chunk's end takes the copy paths. A chunk is made when an address in it is first resolved, stays out of the device
-    // residency set and is named in every compute and render encoder from then on (set_encoder_resource). Its pages
-    // are wired from its first use until the device goes, whether touched or not (metal_test_titlepool), so the
-    // chunks are capped by GTA6RT_METAL_TITLE_POOL_MB (3072 by default). A chunk's shader-VA range is reserved in the
-    // process (no access), so no title address is also a pool shader VA; one whose range is taken is set aside and a
-    // spacer moves the next past it, as external_window does. title_window_mutex held.
+    // The title pool (default on; GTA6RT_METAL_TITLE_POOL=0: off): title memory that xmem's title pool backs
+    // (shims_core/src/xmem.h: one Mach memory entry mapped once, title pages are views of it) is reached through
+    // bytesNoCopy buffers over the pool's host range, never over a title address, so the title may unmap, remap or
+    // protect its views while the GPU reads the pool. Chunk k covers pool bytes [k, k + 1) x title_pool_chunk_bytes
+    // (GTA6RT_METAL_TITLE_POOL_CHUNK_MB, 1 by default: a chunk is wired whole, so wired memory stays near what is
+    // named); a range that crosses a chunk's end gets a span buffer of up to 32 MiB. A chunk is made when an address in
+    // it is first resolved and joins the device residency set. Its pages are wired from then until the device goes,
+    // whether touched or not (metal_test_titlepool), so the chunks are capped by
+    // GTA6RT_METAL_TITLE_POOL_MB (3072 by default). A chunk's shader-VA range is reserved in the process (no access),
+    // so no title address is also a pool shader VA; a range that is taken is held by a GPU-VA-only buffer and a
+    // VA-only spacer moves the next past it. title_window_mutex held.
     static bool title_pool_on() {
         static const bool on = [] {
             const char* v = std::getenv("GTA6RT_METAL_TITLE_POOL");
-            return v && std::strcmp(v, "1") == 0;
+            return !v || !*v || std::strcmp(v, "0") != 0;
         }();
         return on;
     }
-    std::uint64_t title_pool_chunk_bytes = 8ull << 20;  // GTA6RT_METAL_TITLE_POOL_CHUNK_MB
+    std::uint64_t title_pool_chunk_bytes = 1ull << 20;  // GTA6RT_METAL_TITLE_POOL_CHUNK_MB
+    static constexpr std::uint64_t kTitlePoolSpanBytes = 32ull << 20;  // the most a span buffer covers
+    // GTA6RT_METAL_TITLE_POOL_NAMING=encoder: chunks named in every encoder (useResources) instead of the device
+    // residency set; both wire a chunk whole until it goes, the set costs no CPU per encoder.
+    static bool title_pool_per_encoder() {
+        static const bool on = [] {
+            const char* v = std::getenv("GTA6RT_METAL_TITLE_POOL_NAMING");
+            return v && std::strcmp(v, "encoder") == 0;
+        }();
+        return on;
+    }
     struct TitlePoolChunk {
         std::unique_ptr<leonida::gpu::Buffer> buffer;
         std::uint64_t shader_va = 0;
@@ -2442,8 +2439,11 @@ struct DeviceState {
     };
     std::uint8_t* title_pool_base = nullptr;
     std::uint64_t title_pool_size = 0, title_pool_cap = 0, title_pool_wired = 0, title_pool_spacer_bytes = 0;
+    std::uint64_t title_pool_hold_bytes = 0, title_pool_probe_missed = 0;  // GPU-VA-only holds; chunks not at their probe
+    std::uint64_t title_pool_va_refused = 0;  // chunks refused for want of a shader-VA range free of title memory
+    double title_pool_chunk_ms = 0;  // in title_pool_chunk (finding or making chunks)
     std::vector<TitlePoolChunk> title_pool_chunks;
-    std::map<std::uint64_t, TitlePoolChunk> title_pool_spans;  // (first chunk << 4 | chunks) -> a buffer over them
+    std::map<std::uint64_t, TitlePoolChunk> title_pool_spans;  // (first chunk << 16 | chunks) -> a buffer over them
     std::vector<std::uint8_t> title_pool_covered;  // per title_pool_chunk_bytes block: inside some chunk buffer
     std::vector<std::uint8_t> title_pool_named_mib;  // per MiB of pool: some resolved range reaches it
     std::uint64_t title_pool_named_blocks = 0;
@@ -2454,6 +2454,7 @@ struct DeviceState {
     std::uint64_t title_pool_invalidated = 0, title_pool_syncs = 0;
     std::atomic<std::uint64_t> title_pool_seen{0};
     std::map<const void*, std::uint64_t> title_pool_heap_seen;  // console heap -> pool generation its empty slots saw
+    std::map<const void*, std::chrono::steady_clock::time_point> title_pool_heap_retry_at;  // when they were queued
     static double machine_wired_mib() {
         vm_statistics64_data_t vs{};
         mach_msg_type_number_t n = HOST_VM_INFO64_COUNT;
@@ -2465,19 +2466,22 @@ struct DeviceState {
     }
     // [va, va + bytes) as shader VAs of a pool chunk: true when none of it is title memory (the title-memory probe's
     // answer for every writable mapping there; the arena's own CPU mapping, which that probe takes for a host heap, is
-    // not; read-only mappings such as the file views the kernel places right above the arena are taken as no GPU
-    // memory), with its holes reserved (no access) so the title gets no memory there later. False, and the first refusals logged with what holds the range, otherwise.
+    // not; nor are Metal's own CPU mappings of its buffers (VM tag 100, IOAccelerator: with a small page zero they sit
+    // among the low shader VAs, and they refused every try in pdef-b); read-only mappings such as the file views the
+    // kernel places right above the arena are taken as no GPU memory), with its holes reserved (no access) so the
+    // title gets no memory there later. False, and the first refusals logged with what holds the range, otherwise.
     bool claim_shader_range(std::uint64_t va, std::uint64_t bytes) {
+        constexpr unsigned kIoAcceleratorTag = 100;
         const std::uint64_t end = va + bytes;
         std::vector<std::pair<std::uint64_t, std::uint64_t>> holes;
         for (std::uint64_t at = va; at < end;) {
             mach_vm_address_t region = at;
             mach_vm_size_t size = 0;
-            vm_region_basic_info_data_64_t info{};
-            mach_msg_type_number_t n = VM_REGION_BASIC_INFO_COUNT_64;
-            mach_port_t object = MACH_PORT_NULL;
-            if (mach_vm_region(mach_task_self(), &region, &size, VM_REGION_BASIC_INFO_64,
-                               reinterpret_cast<vm_region_info_t>(&info), &n, &object) != KERN_SUCCESS ||
+            natural_t depth = 0;
+            vm_region_submap_info_data_64_t info{};
+            mach_msg_type_number_t n = VM_REGION_SUBMAP_INFO_COUNT_64;
+            if (mach_vm_region_recurse(mach_task_self(), &region, &size, &depth,
+                                       reinterpret_cast<vm_region_recurse_info_t>(&info), &n) != KERN_SUCCESS ||
                 region >= end) {
                 holes.emplace_back(at, end);
                 break;
@@ -2487,16 +2491,17 @@ struct DeviceState {
             const auto arena_cpu = reinterpret_cast<std::uintptr_t>(arena.mapped);
             const bool layer_own = arena_cpu && region >= arena_cpu && region + size <= arena_cpu + arena.size;
             const bool read_only = !(info.max_protection & VM_PROT_WRITE) || !(info.protection & VM_PROT_WRITE);
+            const bool metal_own = info.user_tag == kIoAcceleratorTag;
             std::uint64_t lo = 0, hi = 0;
-            if (!layer_own && !read_only && leonida::title_va_aliases().title_memory(from, lo, hi)) {
+            if (!layer_own && !read_only && !metal_own && leonida::title_va_aliases().title_memory(from, lo, hi)) {
                 static std::atomic<int> logged{0};
                 if (logged.fetch_add(1, std::memory_order_relaxed) < 6)
                     std::fprintf(stderr, "[rt] d3d12-metal: title pool: shader VAs [0x%llx, 0x%llx) overlap title memory "
-                                         "[0x%llx, 0x%llx) (mapping at 0x%llx, %llu KiB, prot %d, shared %d)\n",
+                                         "[0x%llx, 0x%llx) (mapping at 0x%llx, %llu KiB, prot %d, tag %u, share mode %d)\n",
                                  static_cast<unsigned long long>(va), static_cast<unsigned long long>(end),
                                  static_cast<unsigned long long>(lo), static_cast<unsigned long long>(hi),
                                  static_cast<unsigned long long>(region), static_cast<unsigned long long>(size >> 10),
-                                 info.protection, int(info.shared));
+                                 info.protection, info.user_tag, int(info.share_mode));
                 return false;
             }
             at = region + size;
@@ -2508,10 +2513,13 @@ struct DeviceState {
         }
         return true;
     }
-    // Chunk k alone (span 1), or a buffer over chunks [k, k + span) for a range that crosses a chunk's end (span 2..8).
+    // Chunk k alone (span 1), or a buffer over chunks [k, k + span) for a range that crosses a chunk's end (at most
+    // kTitlePoolSpanBytes).
     TitlePoolChunk* title_pool_chunk(std::size_t k, std::size_t span = 1) {
-        if (k >= title_pool_chunks.size() || !span || span > 8) return nullptr;
-        TitlePoolChunk& chunk = span == 1 ? title_pool_chunks[k] : title_pool_spans[(std::uint64_t(k) << 4) | span];
+        if (k >= title_pool_chunks.size() || !span ||
+            span > std::max<std::uint64_t>(8, kTitlePoolSpanBytes / title_pool_chunk_bytes))
+            return nullptr;
+        TitlePoolChunk& chunk = span == 1 ? title_pool_chunks[k] : title_pool_spans[(std::uint64_t(k) << 16) | span];
         if (chunk.buffer) return &chunk;
         if (chunk.refused || title_pool_failed >= 8) return nullptr;
         if (!title_pool_cap) {
@@ -2535,51 +2543,90 @@ struct DeviceState {
         d.cpu = title_pool_base + start;
         d.size = bytes;
         d.label = "title pool chunk";
-        d.resident = false;
+        d.resident = !title_pool_per_encoder();
         for (int attempt = 0;; ++attempt) {
-            std::string error;
-            auto buffer = gpu->create_host_buffer(d, &error);
-            if (!buffer || !buffer->host_gpu_address()) {
-                chunk.refused = true;
-                ++title_pool_failed;
-                std::fprintf(stderr, "[rt] d3d12-metal: title pool: Metal refused chunk %zu (pool +0x%llx, %llu MiB): %s\n", k,
-                             static_cast<unsigned long long>(start), static_cast<unsigned long long>(bytes >> 20),
-                             error.c_str());
-                return nullptr;
+            // A GPU-VA-only probe of the chunk's size first (no pages, nothing in Metal's allocated size): Metal gives
+            // the buffer made right after it the probe's address (first fit, 64 of 64 in a probe), so a range that
+            // collides costs a VA-only buffer kept aside instead of a chunk.
+            std::uint64_t shader = 0;
+            bool upward = false;
+            leonida::gpu::BufferDesc pd;
+            pd.size = bytes;
+            pd.va_only = true;
+            pd.resident = false;
+            pd.label = "title pool shader-VA hold";
+            std::unique_ptr<leonida::gpu::Buffer> probe = gpu->create_buffer(pd);
+            if (probe && probe->host_gpu_address()) {
+                shader = probe->host_gpu_address() - arena.address;
+                upward = probe->host_gpu_address() > arena.address;
+                if (upward && claim_shader_range(shader, bytes)) probe.reset();
             }
-            const std::uint64_t shader = buffer->host_gpu_address() - arena.address;
-            const bool upward = buffer->host_gpu_address() > arena.address;
-            if (upward && claim_shader_range(shader, bytes)) {
-                chunk.buffer = std::move(buffer);
-                chunk.shader_va = shader;
-                break;
+            if (!probe) {
+                std::string error;
+                auto buffer = gpu->create_host_buffer(d, &error);
+                if (!buffer || !buffer->host_gpu_address()) {
+                    chunk.refused = true;
+                    ++title_pool_failed;
+                    std::fprintf(stderr, "[rt] d3d12-metal: title pool: Metal refused chunk %zu (pool +0x%llx, %llu MiB): %s\n", k,
+                                 static_cast<unsigned long long>(start), static_cast<unsigned long long>(bytes >> 20),
+                                 error.c_str());
+                    return nullptr;
+                }
+                const std::uint64_t at = buffer->host_gpu_address() - arena.address;
+                if (at != shader) {
+                    ++title_pool_probe_missed;
+                    shader = at;
+                    upward = buffer->host_gpu_address() > arena.address;
+                    if (!upward || !claim_shader_range(shader, bytes)) {
+                        title_pool_set_aside.push_back(std::move(buffer));
+                        buffer = nullptr;
+                    }
+                }
+                if (buffer) {
+                    chunk.buffer = std::move(buffer);
+                    chunk.shader_va = shader;
+                    break;
+                }
+            } else {
+                title_pool_hold_bytes += bytes;
+                title_pool_set_aside.push_back(std::move(probe));
             }
-            title_pool_set_aside.push_back(std::move(buffer));
-            if (attempt >= 31) {
+            if (attempt >= 63) {
                 chunk.refused = true;
-                ++title_pool_failed;
-                std::fprintf(stderr, "[rt] d3d12-metal: title pool: no free shader-VA range for chunk %zu after %d tries%s\n",
-                             k, attempt + 1, title_pool_failed >= 8 ? "; no more chunks are made, copies from now on" : "");
+                const std::uint64_t n = ++title_pool_va_refused;
+                if (n <= 8 || !(n & (n - 1)))
+                    std::fprintf(stderr, "[rt] d3d12-metal: title pool: no free shader-VA range for chunk %zu after %d tries "
+                                         "(%llu chunks refused so far)\n",
+                                 k, attempt + 1, static_cast<unsigned long long>(n));
                 return nullptr;
             }
             if (!upward || title_pool_spacer_bytes >= (2ull << 30)) continue;
-            const std::uint64_t gap = free_gap_from(shader, bytes + (256ull << 20));
-            if (!gap || gap <= shader + bytes) continue;
-            const std::uint64_t shift = std::min<std::uint64_t>(512ull << 20, (gap - shader - bytes + (64ull << 20) + 0xffff) & ~0xffffull);
+            std::uint64_t gap = free_gap_from(shader, bytes + (256ull << 20));
+            if (!gap || gap <= shader + bytes) gap = shader + bytes + (256ull << 20);
+            // A spacer past the occupied range: GPU VA only where the OS has placement-sparse buffers (no memory,
+            // nothing in Metal's allocated size), else a private buffer as before (counted, at most 2 GiB in all).
             leonida::gpu::BufferDesc sd;
-            sd.size = shift;
-            sd.memory = leonida::gpu::MemoryKind::device_local;
-            sd.usage = leonida::gpu::usage::copy;
-            sd.label = "shader-VA spacer for title pool chunks";
+            sd.size = (gap - shader - bytes + (64ull << 20) + 0xffff) & ~0xffffull;
+            sd.va_only = true;
             sd.resident = false;
-            if (auto spacer = gpu->create_buffer(sd)) {
-                title_pool_spacer_bytes += shift;
-                title_pool_set_aside.push_back(std::move(spacer));
+            sd.label = "shader-VA spacer for title pool chunks (VA only)";
+            auto spacer = gpu->create_buffer(sd);
+            if (spacer) {
+                title_pool_hold_bytes += sd.size;
+            } else {
+                sd.size = std::min<std::uint64_t>(512ull << 20, sd.size);
+                sd.va_only = false;
+                sd.memory = leonida::gpu::MemoryKind::device_local;
+                sd.usage = leonida::gpu::usage::copy;
+                sd.label = "shader-VA spacer for title pool chunks";
+                spacer = gpu->create_buffer(sd);
+                if (spacer) title_pool_spacer_bytes += sd.size;
             }
+            if (spacer) title_pool_set_aside.push_back(std::move(spacer));
         }
         context->add_va_range(chunk.shader_va, bytes, chunk.buffer.get(), 0);
         backing(chunk.buffer->host_gpu_address(), bytes, chunk.shader_va, true);
-        gta6rt::metal::set_encoder_resource(gpu.get(), chunk.buffer.get(), true);
+        if (title_pool_per_encoder()) gta6rt::metal::set_encoder_resource(gpu.get(), chunk.buffer.get(), true);
         for (std::uint64_t b = start / title_pool_chunk_bytes; b * title_pool_chunk_bytes < start + bytes; ++b) title_pool_covered[b] = 1;
         title_pool_wired += adds;
         leonida::metal_ledger::add_imported(adds);
@@ -2588,14 +2635,57 @@ struct DeviceState {
         for (const auto& [key, c] : title_pool_spans) made += c.buffer != nullptr;
         if (made <= 4 || !(made & (made - 1)))
             std::fprintf(stderr, "[rt] d3d12-metal: title pool: chunk %zu (pool +0x%llx, %llu MiB) at shader VA 0x%llx; %zu "
-                                 "chunks named per encoder, %llu MiB wired by them (cap %llu), %zu set aside, spacers %llu "
-                                 "MiB; machine wired %.0f MiB\n",
+                                 "chunks %s, %llu MiB wired by them (cap %llu), %zu set aside (GPU VA only "
+                                 "%llu MiB, %llu probes missed), spacers with memory %llu MiB; machine wired %.0f MiB\n",
                          k, static_cast<unsigned long long>(start), static_cast<unsigned long long>(bytes >> 20),
                          static_cast<unsigned long long>(chunk.shader_va), made,
+                         title_pool_per_encoder() ? "named per encoder" : "in the device residency set",
                          static_cast<unsigned long long>(title_pool_wired >> 20),
                          static_cast<unsigned long long>(title_pool_cap >> 20), title_pool_set_aside.size(),
+                         static_cast<unsigned long long>(title_pool_hold_bytes >> 20),
+                         static_cast<unsigned long long>(title_pool_probe_missed),
                          static_cast<unsigned long long>(title_pool_spacer_bytes >> 20), machine_wired_mib());
         return &chunk;
+    }
+    // A range whose title pages are not consecutive pool bytes (window pages from scattered slots) gets a copy window of
+    // its own budget, GTA6RT_METAL_TITLE_POOL_SCATTER_MB (64 by default), outside LEONIDA_TITLE_WINDOWS_MB: the window
+    // mirrors the title's pages before every submission, so it follows a remap as the title sees it.
+    std::uint64_t title_pool_scatter_bytes = 0, title_pool_scatter_windows = 0, title_pool_scatter_refused = 0;
+    bool title_pool_scatter_window(std::uint64_t va, std::uint64_t want, std::uint64_t title_hi, std::uint64_t& out) {
+        static const std::uint64_t cap = [] {
+            const char* v = std::getenv("GTA6RT_METAL_TITLE_POOL_SCATTER_MB");
+            return (v && *v ? std::strtoull(v, nullptr, 10) : 64ull) << 20;
+        }();
+        std::uint64_t lo = 0, hi = UINT64_MAX;
+        leonida::title_va_aliases().gap(va, lo, hi);
+        hi = std::min(hi, title_hi);
+        const std::uint64_t start = va & ~(kTitleWindowAlign - 1);
+        const std::uint64_t end = align_up(va + want, kTitleWindowAlign);
+        if (start < lo || end > hi || end - start > kTitleWindowMax || !readable_page(va)) return false;
+        const std::uint64_t size = end - start;
+        if (title_pool_scatter_bytes + size > cap) {
+            if (!title_pool_scatter_refused++)
+                std::fprintf(stderr, "[rt] d3d12-metal: title pool: GTA6RT_METAL_TITLE_POOL_SCATTER_MB (%llu MiB) reached: "
+                                     "ranges on scattered pool pages past it take the other paths\n",
+                             static_cast<unsigned long long>(cap >> 20));
+            return false;
+        }
+        const std::uint64_t main_cap = title_window_cap, main_bytes = title_window_bytes;
+        title_window_cap = main_bytes + size;
+        const std::uint64_t offset = make_title_window(start, size);
+        title_window_cap = main_cap;
+        title_window_bytes = main_bytes;
+        if (!offset || !leonida::title_va_aliases().add(start, size, offset)) return false;
+        title_pool_scatter_bytes += size;
+        const std::uint64_t n = ++title_pool_scatter_windows;
+        if (n <= 4 || !(n & (n - 1)))
+            std::fprintf(stderr, "[rt] d3d12-metal: title pool: title 0x%llx (%llu bytes) is on scattered pool pages: a "
+                                 "%llu KiB copy window (%llu such windows, %llu KiB of GTA6RT_METAL_TITLE_POOL_SCATTER_MB)\n",
+                         static_cast<unsigned long long>(va), static_cast<unsigned long long>(want),
+                         static_cast<unsigned long long>(size >> 10), static_cast<unsigned long long>(n),
+                         static_cast<unsigned long long>(title_pool_scatter_bytes >> 10));
+        out = offset + (va - start);
+        return true;
     }
     // True with `out` its shader VA when the pool backs [va, va + want) as one stretch that one chunk holds; the
     // alias made reaches from va to the end of that stretch, the chunk or the next alias. False: the copy paths follow.
@@ -2622,11 +2712,13 @@ struct DeviceState {
         if (offset >= title_pool_size) return false;
         if (run < want) {
             ++title_pool_scattered;
-            return false;
+            return title_pool_scatter_window(va, want, title_hi, out);
         }
         const std::size_t k = offset / title_pool_chunk_bytes;
         const std::size_t span = (offset + want - 1) / title_pool_chunk_bytes - k + 1;
+        const auto made_at = std::chrono::steady_clock::now();
         TitlePoolChunk* chunk = title_pool_chunk(k, span);
+        title_pool_chunk_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - made_at).count();
         if (!chunk) return false;
         std::uint64_t lo = 0, hi = UINT64_MAX;
         leonida::title_va_aliases().gap(va, lo, hi);
@@ -2649,7 +2741,7 @@ struct DeviceState {
             std::fprintf(stderr, "[rt] d3d12-metal: title pool: title 0x%llx (%llu bytes asked, %llu aliased) -> pool +0x%llx, "
                                  "shader VA 0x%llx (%llu ranges resolved, %llu MiB of pool named by them in 1 MiB blocks, "
                                  "%llu MiB wired, %llu on scattered pool pages, %llu cut short by another alias, %llu past "
-                                 "the cap, %llu invalidated)\n",
+                                 "the cap, %llu invalidated; %.1f ms in chunk making)\n",
                          static_cast<unsigned long long>(va), static_cast<unsigned long long>(want),
                          static_cast<unsigned long long>(n), static_cast<unsigned long long>(offset),
                          static_cast<unsigned long long>(shader), static_cast<unsigned long long>(resolved),
@@ -2658,7 +2750,7 @@ struct DeviceState {
                          static_cast<unsigned long long>(title_pool_scattered),
                          static_cast<unsigned long long>(title_pool_short),
                          static_cast<unsigned long long>(title_pool_capped),
-                         static_cast<unsigned long long>(title_pool_invalidated));
+                         static_cast<unsigned long long>(title_pool_invalidated), title_pool_chunk_ms);
         out = shader;
         return true;
     }
@@ -2686,6 +2778,94 @@ struct DeviceState {
         title_pool_seen.store(at, std::memory_order_relaxed);
         ++title_pool_syncs;
         return true;
+    }
+    // The live re-fix a console heap owes after a released backing or an alias invalidation can visit only the slots
+    // it can concern: those whose title V#s reach an alias that is gone from the table since the heap's last refresh
+    // ended, and those whose GPU copy names a released backing's range. Not when an invalidation came while that
+    // refresh fixed slots (a slot may have used an alias that is in neither table), at a heap's first refresh, or when
+    // the release log no longer reaches back: then every live V#. GTA6RT_METAL_REFIX_ALL=1: always every live V#.
+    using RefixRanges = std::vector<std::pair<std::uint64_t, std::uint64_t>>;
+    struct ConsoleHeap;
+    struct RefixState {
+        std::vector<leonida::TitleVaAliases::Mapping> aliases;  // the alias table as the heap's last refresh ended
+        std::uint64_t size = 0, invalidations = 0;
+        bool valid = false, dirty = true;
+    };
+    std::map<const void*, RefixState> refix_states;  // console_heap_mutex
+    std::uint64_t refix_partial = 0, refix_full = 0, refix_slots = 0, refix_visits = 0;
+    static bool refix_all() {
+        static const bool on = [] {
+            const char* v = std::getenv("GTA6RT_METAL_REFIX_ALL");
+            return v && std::strcmp(v, "1") == 0;
+        }();
+        return on;
+    }
+    static void merge_ranges(RefixRanges& r) {
+        std::sort(r.begin(), r.end());
+        std::size_t n = 0;
+        for (const auto& x : r) {
+            if (n && x.first <= r[n - 1].second) r[n - 1].second = std::max(r[n - 1].second, x.second);
+            else r[n++] = x;
+        }
+        r.resize(n);
+    }
+    bool refix_ranges(ConsoleHeap& heap, std::uint64_t generation, RefixRanges& in, RefixRanges& out) {
+        in.clear();
+        out.clear();
+        if (refix_all()) return false;
+        RefixState& st = refix_states[&heap];
+        if (!st.valid || st.dirty) return false;
+        constexpr std::uint64_t mask = (1ull << 48) - 1;
+        if (generation != heap.checked_generation) {
+            std::lock_guard lock(backing_mutex);
+            if (heap.checked_generation < released_log_dropped) return false;
+            for (auto it = released_log.rbegin(); it != released_log.rend() && it->first > heap.checked_generation; ++it) {
+                if (it->first > generation) continue;
+                const std::uint64_t lo = it->second.first & mask, bytes = it->second.second - it->second.first;
+                out.emplace_back(lo, lo + bytes);
+            }
+        }
+        auto& aliases = leonida::title_va_aliases();
+        if (aliases.invalidations() != st.invalidations) {
+            std::vector<leonida::TitleVaAliases::Mapping> now;
+            aliases.mappings(now);
+            std::size_t j = 0;
+            for (const auto& m : st.aliases) {
+                while (j < now.size() && now[j].title_va < m.title_va) ++j;
+                if (j < now.size() && now[j].title_va == m.title_va && now[j].end == m.end && now[j].shader_va == m.shader_va)
+                    continue;
+                in.emplace_back(m.title_va, m.end);
+            }
+        }
+        merge_ranges(in);
+        merge_ranges(out);
+        return true;
+    }
+    // As a resource heap's refresh ends: the alias table its slots were fixed against, and whether an invalidation
+    // came while they were (`fix_invalidations`: the count when the fixing started).
+    void refix_snapshot(ConsoleHeap& heap, std::uint64_t fix_invalidations) {
+        if (!heap.resource_heap || refix_all()) return;
+        auto& aliases = leonida::title_va_aliases();
+        RefixState& st = refix_states[&heap];
+        const std::uint64_t inv = aliases.invalidations(), size = aliases.size();
+        st.dirty = inv != fix_invalidations;
+        if (st.valid && inv == st.invalidations && size == st.size) return;
+        aliases.mappings(st.aliases);
+        if (aliases.invalidations() != inv) st.dirty = true;
+        st.invalidations = inv;
+        st.size = size;
+        st.valid = true;
+    }
+    static bool vsharp_meets(const std::uint32_t* v, const std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges) {
+        if ((v[3] >> 30) || !v[2]) return false;
+        const std::uint64_t base = std::uint64_t(v[0]) | (std::uint64_t(v[1] & 0xffff) << 32);
+        const std::uint32_t stride = (v[1] >> 16) & 0x3fffu;
+        const std::uint64_t span = std::max<std::uint64_t>(1, std::uint64_t(v[2]) * (stride ? stride : 1));
+        const std::uint64_t end = base > UINT64_MAX - span ? UINT64_MAX : base + span;
+        auto it = std::upper_bound(ranges.begin(), ranges.end(), base,
+                                   [](std::uint64_t a, const std::pair<std::uint64_t, std::uint64_t>& r) { return a < r.first; });
+        if (it != ranges.begin() && std::prev(it)->second > base) return true;
+        return it != ranges.end() && it->first < end;
     }
 
     // A stream pool's address (a CPU view paired with a GPU-only alias). Rule B
@@ -3192,9 +3372,18 @@ struct DeviceState {
         if (add) gpu_backings.insert(address, bytes, id);
         else {
             gpu_backings.erase(address, id);
+            const std::uint64_t shader = address - arena.address;
+            released_log.push_back({released_backings.load(std::memory_order_relaxed) + 1, {shader, shader + bytes}});
+            if (released_log.size() > 65536) {
+                released_log_dropped = released_log.front().first;
+                released_log.pop_front();
+            }
             released_backings.fetch_add(1, std::memory_order_release);
         }
     }
+    // Every released backing as (released_backings after it, [shader VA, end)); backing_mutex.
+    std::deque<std::pair<std::uint64_t, std::pair<std::uint64_t, std::uint64_t>>> released_log;
+    std::uint64_t released_log_dropped = 0;
 
     enum class VsharpPath { table, shadow, scratch };
     enum class VsharpResult { unchanged, rebased, empty };
@@ -3872,6 +4061,8 @@ struct DeviceState {
         std::uint64_t images[5] = {};  // by TitleImage
         std::map<std::string, std::uint64_t> refused_reasons;
         double ms = 0, pages_ms = 0, fix_ms = 0, retry_ms = 0;  // ms: all; the others its parts
+        std::uint64_t live_runs = 0, live_slots = 0;  // re-fixes of every live V#, since the last combine line
+        double live_ms = 0;
     };
     std::mutex console_heap_mutex;  // taken before title_window_mutex, shadow_mutex and descriptor_mutex
     std::vector<std::unique_ptr<ConsoleHeap>> console_heaps;
@@ -4278,7 +4469,15 @@ struct DeviceState {
             title_pool_sync();
             std::uint64_t& seen = title_pool_heap_seen[&heap];
             const std::uint64_t now = title_pool_seen.load(std::memory_order_relaxed);
-            if (seen != now && heap.resource_heap) {
+            // The pool table changes at nearly every submission while the title streams, and queueing every empty
+            // slot each time kept 1.1 M slots waiting (pdef-e): at most once per GTA6RT_METAL_TITLE_POOL_RETRY_MS (250).
+            static const auto retry_period = std::chrono::milliseconds([] {
+                const char* v = std::getenv("GTA6RT_METAL_TITLE_POOL_RETRY_MS");
+                return v && *v ? std::strtoll(v, nullptr, 10) : 250ll;
+            }());
+            auto& queued_at = title_pool_heap_retry_at[&heap];
+            if (seen != now && heap.resource_heap && t0 - queued_at >= retry_period) {
+                queued_at = t0;
                 seen = now;
                 for (std::size_t slot = heap.empty_slots.next_from(0); slot != SIZE_MAX;
                      slot = heap.empty_slots.next_from(slot + 1))
@@ -4302,6 +4501,7 @@ struct DeviceState {
             heap.pages->for_each_zeroed(zero);
         }
         const auto t1 = clock::now();
+        const std::uint64_t fix_invalidations = leonida::title_va_aliases().invalidations();
         heap.fix_start = t1;
         heap.fix_over = false;
         heap.fix_count = 0;
@@ -4312,18 +4512,49 @@ struct DeviceState {
         const auto generation = released_backings.load(std::memory_order_acquire);
         const auto alias_generation = leonida::title_va_aliases().invalidations();
         if (heap.resource_heap && (generation != heap.checked_generation || alias_generation != heap.alias_generation)) {
+            // Only the slots a gone alias or a released backing can concern (refix_ranges); else every live V#.
+            RefixRanges gone, released;
+            const bool partial = refix_ranges(heap, generation, gone, released);
             heap.alias_generation = alias_generation;
             heap.checked_generation = generation;
             refresh_free_ranges.clear();
             vsharp_memo_clear(heap);
             // Even an unchanged title slot may name a buffer released since the last submission.
             // Walk the host-RAM V# bitset instead of reading every slot of `heap.copy` (which may be uncached WC VRAM).
+            const auto live_start = clock::now();
+            std::uint64_t visits = 0, fixed = 0;
             heap.live_vsharps.for_each([&](std::size_t slot) {
+                ++visits;
+                if (partial) {
+                    const auto* w = reinterpret_cast<const std::uint32_t*>(heap.previous + slot * kDescriptorSize);
+                    const auto* c = reinterpret_cast<const std::uint32_t*>(heap.copy + slot * kDescriptorSize);
+                    if (!vsharp_meets(w, gone) && !vsharp_meets(w + 4, gone) && !vsharp_meets(c, released) &&
+                        !vsharp_meets(c + 4, released))
+                        return;
+                }
+                ++fixed;
+                ++heap.live_slots;
                 if (!fix_console_slot(heap, slot) && !heap.retry[slot]) {
                     heap.retry[slot] = 1;
                     heap.retries.push_back(uint32_t(slot));
                 }
             });
+            {
+                const std::uint64_t n = ++(partial ? refix_partial : refix_full);
+                refix_visits += visits;
+                refix_slots += fixed;
+                if (!(n & (n - 1)))
+                    std::fprintf(stderr, "[rt] d3d12-metal: live re-fix %s: %llu of %llu live V#s re-fixed (%zu gone alias "
+                                         "ranges, %zu released backing ranges; %llu limited and %llu full re-fixes so far, "
+                                         "%llu of %llu slot visits re-fixed)\n",
+                                 partial ? "limited to gone aliases and released backings" : "of every live V#",
+                                 static_cast<unsigned long long>(fixed), static_cast<unsigned long long>(visits),
+                                 gone.size(), released.size(), static_cast<unsigned long long>(refix_partial),
+                                 static_cast<unsigned long long>(refix_full), static_cast<unsigned long long>(refix_slots),
+                                 static_cast<unsigned long long>(refix_visits));
+            }
+            ++heap.live_runs;
+            heap.live_ms += ms(live_start, clock::now());
         }
         const auto t2 = clock::now();
         // A settled zero can acquire GPU backing without a CPU map event. Probe at most eight in
@@ -4345,15 +4576,174 @@ struct DeviceState {
             }
         }
         if (!heap.retries.empty()) retry_console_slots(heap);
+        refix_snapshot(heap, fix_invalidations);
         const auto t3 = clock::now();
         heap.pages_ms += ms(t0, t1);
         heap.fix_ms += ms(t1, t2);
         heap.retry_ms += ms(t2, t3);
     }
 
+    // GTA6RT_METAL_HEAP_COMBINE (1 by default, 0: every submission refreshes): a submission only needs the heap copies
+    // to hold every title write made before it arrived. Arrivals and refresh starts are ordered under
+    // console_refresh_order_mutex, so a refresh numbered past the arrival's count started after it and saw all such
+    // writes; a submission that finds one of those completed when it gets console_heap_mutex returns without its own.
+    // With several submitting threads (fr10-h: phases at 140-225% of the wall time) the waiters behind one refresh
+    // then share the next one instead of running one each.
+    static bool console_heap_combine() {
+        static const bool on = [] {
+            const char* v = std::getenv("GTA6RT_METAL_HEAP_COMBINE");
+            return !v || *v != '0';
+        }();
+        return on;
+    }
+    // GTA6RT_METAL_HEAP_COMBINE_VERIFY=N (off by default): every Nth arrival snapshots each scanned resource heap's title
+    // bytes before it arrives; holding console_heap_mutex afterwards, a slot whose snapshot still equals the title's
+    // bytes but not what its arena slot was made from is stale. Counted for arrivals a later refresh covered and, as the
+    // control (rewrites back to an earlier value give the same count there), for arrivals that refreshed themselves.
+    static std::uint64_t console_heap_combine_verify() {
+        static const std::uint64_t every = [] {
+            const char* v = std::getenv("GTA6RT_METAL_HEAP_COMBINE_VERIFY");
+            return v && *v ? std::strtoull(v, nullptr, 10) : 0ull;
+        }();
+        return every;
+    }
+    std::mutex console_refresh_order_mutex;
+    std::uint64_t console_refresh_started = 0;    // console_refresh_order_mutex
+    std::uint64_t console_refresh_completed = 0;  // console_heap_mutex
+    struct CombineStats {
+        std::uint64_t arrivals = 0, refreshes = 0, covered = 0;
+        double wait_ms = 0, wait_max_ms = 0, refresh_ms = 0;
+        std::uint64_t verify_covered = 0, verify_covered_stale = 0, verify_control = 0, verify_control_stale = 0;
+        std::uint64_t verify_slots = 0, verify_unreadable = 0;
+        std::chrono::steady_clock::time_point log_time{};
+    } combine_stats;  // console_heap_mutex
+    std::atomic<std::uint64_t> combine_arrivals{0};
+
+    struct CombineSnapshot {
+        const ConsoleHeap* heap;
+        std::vector<std::uint8_t> bytes;
+        std::vector<std::uint8_t> readable;  // per 4 KiB page
+    };
+    void combine_snapshot(std::vector<CombineSnapshot>& out) {
+        struct Target {
+            const ConsoleHeap* heap;
+            std::uint64_t va;
+            std::size_t bytes;
+        };
+        std::vector<Target> targets;
+        {
+            std::lock_guard lock(console_heap_mutex);
+            for (const auto& heap : console_heaps)
+                if (!heap->imported && heap->resource_heap && console_heap_scan())
+                    targets.push_back({heap.get(), heap->console_va, std::size_t(heap->bytes)});
+        }
+        constexpr std::size_t kPage = 4096;
+        for (const auto& t : targets) {
+            const auto* title = reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(t.va));
+            CombineSnapshot s{t.heap, std::vector<std::uint8_t>(t.bytes), std::vector<std::uint8_t>((t.bytes + kPage - 1) / kPage)};
+            for (std::size_t p = 0; p < t.bytes; p += kPage)
+                s.readable[p / kPage] = rthost::guarded_copy(s.bytes.data() + p, title + p, std::min(kPage, t.bytes - p));
+            out.push_back(std::move(s));
+        }
+    }
+    std::uint64_t combine_stale(const std::vector<CombineSnapshot>& snaps) {  // console_heap_mutex held
+        constexpr std::size_t kPage = 4096;
+        std::uint64_t stale = 0;
+        std::uint8_t now[kPage];
+        for (const auto& s : snaps) {
+            const ConsoleHeap* heap = nullptr;
+            for (const auto& h : console_heaps)
+                if (h.get() == s.heap) heap = h.get();
+            if (!heap) continue;
+            const std::size_t bytes = std::min(s.bytes.size(), std::size_t(heap->bytes));
+            const auto* title = reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(heap->console_va));
+            for (std::size_t p = 0; p < bytes; p += kPage) {
+                const std::size_t n = std::min(kPage, bytes - p);
+                if (!s.readable[p / kPage] || !rthost::guarded_copy(now, title + p, n)) {
+                    ++combine_stats.verify_unreadable;
+                    continue;
+                }
+                const std::uint8_t* snap = s.bytes.data() + p;
+                if (!std::memcmp(snap, heap->previous + p, n)) continue;
+                for (std::size_t at = 0; at + kDescriptorSize <= n; at += kDescriptorSize) {
+                    ++combine_stats.verify_slots;
+                    if (!std::memcmp(snap + at, now + at, kDescriptorSize) &&
+                        std::memcmp(snap + at, heap->previous + p + at, kDescriptorSize))
+                        ++stale;
+                }
+            }
+        }
+        return stale;
+    }
+
     // Before every submission, ahead of the slot-133 shadows.
     void refresh_console_heaps() {
+        using clock = std::chrono::steady_clock;
+        const bool combine = console_heap_combine();
+        const std::uint64_t verify = console_heap_combine_verify();
+        std::vector<CombineSnapshot> snaps;
+        if (verify && combine_arrivals.fetch_add(1, std::memory_order_relaxed) % verify == verify - 1)
+            combine_snapshot(snaps);
+        std::uint64_t need = 0;
+        {
+            std::lock_guard order(console_refresh_order_mutex);
+            need = console_refresh_started + 1;
+        }
+        const auto arrived = clock::now();
         std::lock_guard lock(console_heap_mutex);
+        const auto entered = clock::now();
+        auto& cs = combine_stats;
+        ++cs.arrivals;
+        const double waited = std::chrono::duration<double, std::milli>(entered - arrived).count();
+        cs.wait_ms += waited;
+        cs.wait_max_ms = std::max(cs.wait_max_ms, waited);
+        const auto log_combine = [&](clock::time_point now) {
+            if (cs.log_time == clock::time_point{}) cs.log_time = now;
+            if (now - cs.log_time < std::chrono::seconds(10)) return;
+            const double n = double(std::max<std::uint64_t>(1, cs.arrivals));
+            std::uint64_t live_runs = 0, live_slots = 0;
+            double live_ms = 0;
+            for (const auto& heap : console_heaps) {
+                live_runs += heap->live_runs, live_slots += heap->live_slots, live_ms += heap->live_ms;
+                heap->live_runs = heap->live_slots = 0;
+                heap->live_ms = 0;
+            }
+            std::fprintf(stderr, "[rt] d3d12: console heap live V# re-fixes (a backing released or an alias invalidated): "
+                                 "%llu runs, %llu slots, %.1f ms in all (%.3f ms a refresh)\n",
+                         static_cast<unsigned long long>(live_runs), static_cast<unsigned long long>(live_slots), live_ms,
+                         live_ms / double(std::max<std::uint64_t>(1, cs.refreshes)));
+            std::fprintf(stderr,
+                         "[rt] d3d12: console heap refreshes (%s): %llu submissions, %llu refreshes, %llu covered by a "
+                         "refresh that started after them; lock wait %.3f ms a submission (%.1f max), refresh %.3f ms; "
+                         "verify: %llu covered %llu stale slots, %llu control %llu stale, %llu slots compared, %llu pages "
+                         "unreadable\n",
+                         combine ? "combined" : "one a submission", static_cast<unsigned long long>(cs.arrivals),
+                         static_cast<unsigned long long>(cs.refreshes), static_cast<unsigned long long>(cs.covered),
+                         cs.wait_ms / n, cs.wait_max_ms, cs.refresh_ms / double(std::max<std::uint64_t>(1, cs.refreshes)),
+                         static_cast<unsigned long long>(cs.verify_covered),
+                         static_cast<unsigned long long>(cs.verify_covered_stale),
+                         static_cast<unsigned long long>(cs.verify_control),
+                         static_cast<unsigned long long>(cs.verify_control_stale),
+                         static_cast<unsigned long long>(cs.verify_slots),
+                         static_cast<unsigned long long>(cs.verify_unreadable));
+            cs = CombineStats{};
+            cs.log_time = now;
+        };
+        if (combine && console_refresh_completed >= need) {
+            ++cs.covered;
+            if (!snaps.empty()) {
+                ++cs.verify_covered;
+                cs.verify_covered_stale += combine_stale(snaps);
+            }
+            log_combine(clock::now());
+            return;
+        }
+        std::uint64_t number = 0;
+        {
+            std::lock_guard order(console_refresh_order_mutex);
+            number = ++console_refresh_started;
+        }
+        ++cs.refreshes;
         for (const auto& heap : console_heaps) {
             const auto start = std::chrono::steady_clock::now();
             refresh_console_heap(*heap);
@@ -4407,6 +4797,14 @@ struct DeviceState {
             for (auto& n : heap->images) n = 0;
             heap->ms = heap->pages_ms = heap->fix_ms = heap->retry_ms = 0;
         }
+        console_refresh_completed = number;
+        const auto done = clock::now();
+        cs.refresh_ms += std::chrono::duration<double, std::milli>(done - entered).count();
+        if (!snaps.empty()) {
+            ++cs.verify_control;
+            cs.verify_control_stale += combine_stale(snaps);
+        }
+        log_combine(done);
     }
 
     // The heap's pages imported as host memory (see above): true with `heap` filled in, false when they cannot be
@@ -5803,6 +6201,7 @@ public:
     const Resource* storage_image() const { return storage_; }
 
     ~Resource() override {
+        if (alias_watch_) device_.rt_alias.remove(this);
         {
             std::lock_guard guard(device_.mapped_texture_mutex);
             if (device_.mapped_textures.erase(this)) --device_.map_count;
@@ -5852,7 +6251,10 @@ public:
         }
     }
     leonida::ResourceId id() const { return resource_id(this); }
-    leonida::gpu::Texture* image() const { return texture_.get(); }
+    leonida::gpu::Texture* image() const {
+        if (alias_watch_ && deferred_.load(std::memory_order_acquire)) const_cast<Resource*>(this)->back_title_texture();
+        return texture_.get();
+    }
     leonida::gpu::Texture* descriptor_image() const { return texture_.get(); }
     leonida::gpu::Texture* bound_image() const { return texture_.get(); }
     bool host_initialized_image() const { return false; }
@@ -5890,7 +6292,7 @@ public:
         {
             std::lock_guard lock(back_mutex_);
             if (!deferred_.load(std::memory_order_relaxed)) return texture_ != nullptr;
-            if (!(layout && make_in_place(*layout, cpu)) && !make_deferred_texture()) return false;
+            if (!(layout && !alias_watch_ && make_in_place(*layout, cpu)) && !make_deferred_texture()) return false;
             binding_.texture = texture_.get();
             device_.context->add_resource(id(), binding_);
             leonida::metal_ledger::add_deferred(deferred_bytes_, -1);
@@ -6191,8 +6593,22 @@ public:
             const char* v = std::getenv("GTA6RT_METAL_DEFER_TITLE_TEXTURES");
             return !v || std::strcmp(v, "0") != 0;
         }();
-        const bool defer = defer_titles && shared_ &&
-                           (origin == TitleImageOrigin::placed || origin == TitleImageOrigin::pending_stream);
+        const bool alias_candidate = origin == TitleImageOrigin::placed && gpu_written && !cpu_visible() &&
+                                     leonida::metal_rt_alias::watching() &&
+                                     (d.dimension == gpu::TextureDimension::tex2d ||
+                                      d.dimension == gpu::TextureDimension::tex2d_array) &&
+                                     (d.usage & (gpu::usage::render_target | gpu::usage::depth_stencil));
+        if (alias_candidate) {
+            alias_watch_ = std::make_unique<leonida::metal_rt_alias::Watch>();
+            std::snprintf(alias_watch_->shape, sizeof alias_watch_->shape, "%llux%u DXGI %d mips %u layers %u",
+                          static_cast<unsigned long long>(desc_.Width), desc_.Height, int(desc_.Format),
+                          unsigned(desc_.MipLevels), unsigned(desc_.DepthOrArraySize));
+            alias_uav_rt_ = uav_clear_target;
+            binding_.alias_watch = alias_watch_.get();
+        }
+        const bool defer = (defer_titles && shared_ &&
+                            (origin == TitleImageOrigin::placed || origin == TitleImageOrigin::pending_stream)) ||
+                           (alias_candidate && leonida::metal_rt_alias::enabled());
         if (defer) {
             deferred_desc_ = d;
             deferred_label_ = d.label;
@@ -6249,8 +6665,26 @@ public:
             binding_.ensure = &Resource::ensure_backed_thunk;
         }
         device_.context->add_resource(id(), binding_);
-        if (gpu_written && !(heap_flags_ & D3D12_HEAP_FLAG_CREATE_NOT_ZEROED)) device_.zero_texture(texture_.get(), binding_);
+        if (gpu_written && texture_ && !(heap_flags_ & D3D12_HEAP_FLAG_CREATE_NOT_ZEROED))
+            device_.zero_texture(texture_.get(), binding_);
         return S_OK;
+    }
+
+    // Where the title placed this render target (register_title_texture): what metal_rt_alias groups it by.
+    void note_title_pages(std::uint64_t cpu, std::uint64_t span) {
+        if (!alias_watch_ || !cpu || !span) return;
+        leonida::metal_rt_alias::Pool::Candidate c;
+        c.cpu = cpu;
+        c.span = span;
+        const auto info = device_.gpu->texture_allocation_info(texture_ ? texture_->desc() : deferred_desc_);
+        c.size = info.size ? info.size : deferred_bytes_;
+        c.alignment = std::max<std::uint64_t>(1, info.alignment);
+        c.watch = alias_watch_.get();
+        c.depth = binding_.depth_stencil;
+        c.msaa = binding_.samples > 1;
+        c.width = binding_.width, c.height = binding_.height, c.layers = binding_.array_layers;
+        c.mips = binding_.mip_levels, c.format = binding_.format;
+        device_.rt_alias.add(this, std::move(c));
     }
 
 public:
@@ -6496,6 +6930,7 @@ private:
     }
 
     bool make_deferred_texture() {
+        if (alias_watch_) return make_alias_texture();
         auto t = device_.gpu->create_texture(deferred_desc_);
         if (!t) {
             std::fprintf(stderr, "[rt] d3d12-metal: deferred title texture refused by Metal: DXGI %d %llux%ux%u mips %u\n",
@@ -6506,6 +6941,55 @@ private:
         texture_ = std::shared_ptr<leonida::gpu::Texture>(std::move(t));
         ledger_bytes_ = texture_->size();
         leonida::metal_ledger::add(ledger_, ledger_bytes_);
+        return true;
+    }
+
+    // A render target metal_rt_alias groups: placed in the extent of its aliases, else a private texture zeroed as a
+    // committed one is.
+    bool make_alias_texture() {
+        namespace gpu = leonida::gpu;
+        std::uint64_t offset = 0;
+        auto extent = device_.rt_alias.place(
+            this,
+            [&](std::uint64_t bytes) {
+                gpu::HeapDesc hd;
+                hd.size = bytes;
+                hd.memory = gpu::MemoryKind::device_local;
+                hd.label = "render-target alias extent";
+                return device_.gpu->create_heap(hd);
+            },
+            offset);
+        if (extent) {
+            if (auto t = device_.gpu->create_placed_texture(extent->heap.get(), offset, deferred_desc_)) {
+                texture_ = std::shared_ptr<gpu::Texture>(std::move(t));
+                alias_extent_ = std::move(extent);
+                return true;
+            }
+            device_.rt_alias.unplace(this);
+            if (first_diagnostic("placed render target refused", int(desc_.Format)))
+                std::fprintf(stderr, "[rt] d3d12-metal: rt-alias: Metal refused a placed texture DXGI %d %llux%u at "
+                                     "+0x%llx; a private texture instead\n",
+                             int(desc_.Format), static_cast<unsigned long long>(desc_.Width), desc_.Height,
+                             static_cast<unsigned long long>(offset));
+        }
+        auto t = device_.gpu->create_texture(deferred_desc_);
+        if (!t && alias_uav_rt_) {
+            deferred_desc_.usage &= ~gpu::usage::render_target;
+            t = device_.gpu->create_texture(deferred_desc_);
+        }
+        if (!t) {
+            std::fprintf(stderr, "[rt] d3d12-metal: render target refused by Metal: DXGI %d %llux%u\n",
+                         int(desc_.Format), static_cast<unsigned long long>(desc_.Width), desc_.Height);
+            return false;
+        }
+        texture_ = std::shared_ptr<gpu::Texture>(std::move(t));
+        ledger_bytes_ = texture_->size();
+        leonida::metal_ledger::add(ledger_, ledger_bytes_);
+        binding_.texture = texture_.get();
+        if (!(heap_flags_ & D3D12_HEAP_FLAG_CREATE_NOT_ZEROED)) {
+            device_.zero_texture(texture_.get(), binding_);
+            device_.idle_uploads();
+        }
         return true;
     }
 
@@ -6590,6 +7074,9 @@ private:
     mutable std::mutex back_mutex_;
     mutable std::vector<PendingView> pending_views_;
     std::unique_ptr<leonida::gpu::Buffer> in_place_buffer_;
+    std::unique_ptr<leonida::metal_rt_alias::Watch> alias_watch_;
+    std::shared_ptr<leonida::metal_rt_alias::Extent> alias_extent_;
+    bool alias_uav_rt_ = false;
     std::uint64_t host_window_bytes_ = 0;
     const leonida::gpu::Buffer* external_buffer_ = nullptr;  // a range of an external block (arena full)
     std::uint64_t external_offset_ = 0, external_bytes_ = 0;
@@ -8553,6 +9040,10 @@ struct TitleTexture {
     std::uintptr_t map_slot = 0;  // where Map stored the pointer it gave the title (ppData)
     bool bink = false;            // a plane of a movie's frame-buffer sets (BinkGroup): visited by set, not every pass
     std::uint32_t bink_tries = 0;
+    bool over_budget = false;     // GTA6RT_METAL_TITLE_BACK_MB reached when it was to get its Metal texture
+    std::uint64_t short_tail = 0; // bytes at the end of the layout the title has not mapped (read as zeros)
+    std::uint32_t resident_mip = 0;  // the first level whose bytes are mapped (a texture streamed in part)
+    std::uint64_t readable_span() const { return layout.layout.size - std::min(short_tail, layout.layout.size); }
 };
 
 // The layout of a slot-133 texture as the title's own XG computer for its shape says (title_xg_layouts): how the title
@@ -8661,6 +9152,67 @@ void DeviceState::drain_titles_gone() {
     titles_gone_pending.store(false, std::memory_order_release);
 }
 
+// GTA6RT_METAL_TEXTURE_CENSUS=1: title T#s that name no texture are sampled for the registry census
+// (log_texture_census). GTA6RT_METAL_FILL_TSHARP_TEXTURES=1: a deferred texture a title-written T# names is queued,
+// and the registry fills it from its title memory with the layout it knows (a slot-133 texture's XG layout included),
+// up to GTA6RT_METAL_FILL_TSHARP_MB (default 1024) of Metal textures made that way.
+bool texture_census_on() {
+    static const bool on = [] {
+        const char* v = std::getenv("GTA6RT_METAL_TEXTURE_CENSUS");
+        return v && *v == '1';
+    }();
+    return on;
+}
+bool fill_tsharp_textures() {
+    static const bool on = [] {
+        const char* v = std::getenv("GTA6RT_METAL_FILL_TSHARP_TEXTURES");
+        return v && *v == '1';
+    }();
+    return on;
+}
+struct TsharpNotes {
+    std::mutex mutex;
+    std::vector<std::uint64_t> misses;  // sampled T# addresses with no texture
+    std::uint64_t miss_count = 0;
+    std::vector<leonida::gfx10::ImageWords> orphans;  // GTA6RT_METAL_TSHARP_TEXTURES: T#s to make a texture for
+    std::set<std::uint64_t> orphan_addresses;
+    std::vector<std::uint64_t> wanted;  // registry addresses of deferred textures a T# named
+    std::uint64_t wanted_count = 0;
+};
+TsharpNotes& tsharp_notes() {
+    static TsharpNotes n;
+    return n;
+}
+// GTA6RT_METAL_TSHARP_TEXTURES=1: a T# the title wrote itself that names its own memory in the title windows
+// (0x70'0000'0000 .. 0x80'0000'0000) where no texture was created or viewed gets a texture made from the T# (its
+// format, extent, mips, layers and swizzle mode) over that memory (Device::make_orphan_textures); the T# binds at
+// its slot's next retry.
+bool tsharp_textures_on() {
+    static const bool on = [] {
+        const char* v = std::getenv("GTA6RT_METAL_TSHARP_TEXTURES");
+        return v && *v == '1';
+    }();
+    return on;
+}
+void note_tsharp_miss(std::uint64_t address, const leonida::gfx10::ImageWords& words) {
+    if ((address >> 36) != 7) return;
+    if (!texture_census_on() && !tsharp_textures_on()) return;
+    TsharpNotes& n = tsharp_notes();
+    std::lock_guard lock(n.mutex);
+    const std::uint64_t k = n.miss_count++;
+    if (n.misses.size() < 4096) n.misses.push_back(address);
+    else n.misses[k % 4096] = address;
+    if (tsharp_textures_on() && n.orphans.size() < 65536 && n.orphan_addresses.insert(address).second)
+        n.orphans.push_back(words);
+}
+void note_tsharp_wanted(const void* title_address) {
+    if (!fill_tsharp_textures() || !title_address) return;
+    TsharpNotes& n = tsharp_notes();
+    std::lock_guard lock(n.mutex);
+    ++n.wanted_count;
+    n.wanted.push_back(reinterpret_cast<std::uintptr_t>(title_address));
+}
+
 // The T# of a view: what the shader gets to know about it, in the structure the console's shaders read.
 // False (with a log) for a view set 0 cannot show yet.
 // A T# the title wrote into a console descriptor heap itself (DeviceState::fix_console_slots). Translated shaders
@@ -8703,6 +9255,7 @@ TitleImage bind_title_image(DeviceState& device, const leonida::gfx10::ImageWord
         }
         if (!owner) {
             if (why) *why = "no texture at T# address";
+            note_tsharp_miss(image.address, words);
             return TitleImage::unknown;
         }
         const Resource& r = *owner;
@@ -8738,6 +9291,7 @@ TitleImage bind_title_image(DeviceState& device, const leonida::gfx10::ImageWord
             v.uint_backed = r.uint_backed();
             if (r.defer_view(v)) {
                 r.note_shader_view();
+                note_tsharp_wanted(r.title_address());
                 return TitleImage::bound;
             }
         }
@@ -9284,8 +9838,10 @@ public:
             config.builders = builders ? unsigned(std::strtoul(builders, nullptr, 10)) : 2u;
             // GTA6RT_METAL_SHADER_DEBUG_OVERLAY (only with GTA6RT_METAL_GPU_DEBUG: its shaders write the debug buffer)
             // first, then GTA6RT_METAL_SHADER_OVERLAY (':'-separated, the first listed winning; "off": none; default
-            // the mesh shaders packed or split under Metal's threadgroup limit, d3d12_metal/tools/mesh_tg_pack.py +
-            // msl_overlay.py, then the uint-output worker's integer-output pixel variants when that file exists).
+            // the thread-memory kernels, shaderc_msl round 9 (merge_typed_reads, loop_cap), then the mesh shaders whose
+            // staged outputs are thread variables, shaderc_msl/tools/mesh_out_private.py, then the mesh shaders packed
+            // or split under Metal's threadgroup limit, d3d12_metal/tools/mesh_tg_pack.py + msl_overlay.py, then the
+            // uint-output worker's integer-output pixel variants; each only when its file exists).
             if (const char* d = std::getenv("GTA6RT_METAL_SHADER_DEBUG_OVERLAY"); d && *d) {
                 if (state_.context->gpu_debug()) config.overlays.push_back(d);
                 else std::fprintf(stderr, "[rt] d3d12-metal: GTA6RT_METAL_SHADER_DEBUG_OVERLAY ignored without "
@@ -9293,7 +9849,9 @@ public:
             }
             const bool overlays_set = std::getenv("GTA6RT_METAL_SHADER_OVERLAY") && *std::getenv("GTA6RT_METAL_SHADER_OVERLAY");
             const std::string overlays = env("GTA6RT_METAL_SHADER_OVERLAY",
-                                             (root + "/build/d3d12_metal-msl-overrides/manifest.tsv:" + root +
+                                             (root + "/build/tmem-x86_64/overlay.tsv:" + root +
+                                              "/build/mcc-x86_64/overlay.tsv:" + root +
+                                              "/build/d3d12_metal-msl-overrides/manifest.tsv:" + root +
                                               "/build/uintps-x86_64/overlay.tsv").c_str());
             for (std::size_t at = 0; overlays != "off" && at <= overlays.size();) {
                 const std::size_t colon = std::min(overlays.find(':', at), overlays.size());
@@ -9598,7 +10156,36 @@ public:
                          static_cast<unsigned long long>(spacers), L::mib(std::int64_t(spacer_bytes)),
                          static_cast<unsigned long long>(refused), L::mib(std::int64_t(bs.table_bytes)));
         }
+        if (leonida::metal_rt_alias::watching()) report_rt_alias(seconds);
         report_title_classes(seconds);
+    }
+
+    void report_rt_alias(double seconds) {
+        namespace L = leonida::metal_ledger;
+        namespace A = leonida::metal_rt_alias;
+        const A::Stats a = state_.rt_alias.stats();
+        auto& c = A::counters();
+        const auto n = [](const std::atomic<std::uint64_t>& v) {
+            return static_cast<unsigned long long>(v.load(std::memory_order_relaxed));
+        };
+        const auto u = [](std::uint64_t v) { return static_cast<unsigned long long>(v); };
+        const auto m = [](std::uint64_t v) { return L::mib(std::int64_t(v)); };
+        std::fprintf(stderr,
+                     "[rt] gpu-memory aliases t=%.0fs (%s%s): render targets on title pages %llu (%.0f MiB; used so far %llu %.0f MiB; unmapped %llu, "
+                     "on more than one run %llu; depth %llu %.0f MiB, MSAA %llu %.0f MiB, depth/MSAA never read %llu "
+                     "%.0f MiB; UNORM/sRGB-style twins %llu %.0f MiB); alias groups %llu, laid out now %.0f MiB; placed %llu "
+                     "(%.0f MiB of textures) in %llu extents of %.0f MiB over %.0f MiB of title memory (late %llu, no room "
+                     "%llu %.0f MiB, private %llu %.0f MiB, moved %llu, tombstones %llu); uses read %llu write %llu fresh "
+                     "%llu common %llu written-before-barrier %llu; reads after hand-over %llu, before any write %llu; loads after hand-over %llu, "
+                     "before any write %llu; fresh hand-overs %llu; poisoned %llu, zeroed at first use %llu\n",
+                     seconds, A::enabled() ? "on" : "census", A::poison() ? ", poison" : "", u(a.candidates),
+                     m(a.candidate_bytes), u(a.used), m(a.used_bytes), u(a.unmapped), u(a.split), u(a.depth), m(a.depth_bytes), u(a.msaa),
+                     m(a.msaa_bytes), u(a.unread_depth_msaa), m(a.unread_depth_msaa_bytes), u(a.twins), m(a.twin_bytes),
+                     u(a.groups), m(a.estimate_bytes), u(a.placed), m(a.placed_bytes), u(a.extents), m(a.extent_bytes),
+                     m(a.extent_title_bytes), u(a.late), u(a.no_room), m(a.no_room_bytes), u(a.refused),
+                     m(a.refused_bytes), u(a.moved), u(a.tombstones), n(c.uses[0]), n(c.uses[1]), n(c.uses[2]),
+                     n(c.uses[3]), n(c.uses[4]), n(c.reads_after_handover), n(c.reads_before_write), n(c.loads_after_handover),
+                     n(c.loads_before_write), n(c.fresh_handovers), n(c.poisoned), n(c.zeroed));
     }
 
     // The registry by what Metal can do with each texture in place, as the Vulkan path's line: a buffer-backed
@@ -10097,6 +10684,7 @@ public:
                 if (title_layout(d, layout, why)) entry->span = layout.layout.size;
             }
             retire_overlapped_title_textures(address, entry->span, "a slot-133 texture");
+            if (entry->gpu_written) texture->note_title_pages(entry->cpu, entry->span);
             auto& slot = state_.title_textures[address];
             if (slot && slot->owned) retire_title_texture(*slot);
             max_title_span_ = std::max(max_title_span_, entry->span);
@@ -10147,11 +10735,14 @@ public:
         // erased by drain_titles_gone after the pass. Every walk below visits a snapshot, never an iterator into the
         // registry, and skips an entry without a resource.
         const auto entries = leonida::title_texture_snapshot(state_.title_textures);
+        if (fill_tsharp_textures()) take_tsharp_wanted();
+        if (tsharp_textures_on()) make_orphan_textures();
         title_pass_ = true;
         std::uint64_t checked = 0, filled = 0, fill_pass_ns = 0;
         bool bink_visit = false;
         const auto visit = [&](TitleTexture& t) {
             if (t.bink && !bink_visit) return;
+            if (t.over_budget) return;
             if (t.resource && t.resource->in_place()) return;
             // A slot-133 texture's guessed layout (no slot-70 view yet) is only used once the title maps it.
             if (t.gpu_written || !t.layout_known || !t.resource ||
@@ -10176,7 +10767,7 @@ public:
             const auto* bytes = reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(t.cpu));
             const auto timed_hash = [&](std::uint64_t& out, bool all = false) {
                 const auto start = clock::now();
-                const bool ok = hash_guarded(bytes, std::size_t(span), out, all);
+                const bool ok = hash_guarded(bytes, std::size_t(t.readable_span()), out, all);
                 stats.hash_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - start).count();
                 return ok;
             };
@@ -11086,11 +11677,103 @@ private:
         const bool mapped = t.mapped && refresh_mapped_pages();
         const auto commit = mapped ? leonida::kernel_writes::state().committer.load(std::memory_order_acquire) : nullptr;
         const bool waited = t.memory.pending();
+        const std::uint64_t span = t.layout.layout.size;
+        if (pool_readable_on() && waited && pool_covers(t.cpu, span)) t.memory.retry();
         // The answer is kept (generation 0) until a map change over the texture, a write into it or the periodic
         // retry of refresh_title_textures asks again.
         return t.memory.check(0, guard && !mapped,
-                              [&] { return probe_title_memory(t.cpu, t.layout.layout.size, waited, commit); },
+                              [&] {
+                                  t.short_tail = 0;
+                                  t.resident_mip = 0;
+                                  if (probe_title_memory(t.cpu, span, waited, commit)) return true;
+                                  if (!pool_readable_on()) return false;
+                                  if (pool_covers(t.cpu, span)) {
+                                      ++pool_readable_;
+                                      return true;
+                                  }
+                                  // The title maps whole 64 KiB pages; when the last page of our layout's span is not
+                                  // mapped, the bytes there are taken as zeros (the smallest mips, at most).
+                                  const std::uint64_t prefix = readable_prefix(t.cpu, span);
+                                  if (prefix >= span / 2 && prefix + (64u << 10) >= span) {
+                                      t.short_tail = span - prefix;
+                                      ++short_tail_;
+                                      return true;
+                                  }
+                                  // Streamed in part: addrlib lays the mip tail and the small mips out first, so the
+                                  // title maps the pages of the levels it has (the T#'s MIN_LOD keeps the sampler on
+                                  // them). The levels wholly in the mapped prefix are filled, the others left zero.
+                                  const auto& plane = t.layout.layout.plane[0];
+                                  const std::uint32_t mips = t.layout.layout.mips;
+                                  if (t.layout.array > 1 || t.layout.layout.dimension == rt::xg_xs::kTexture3D || !mips)
+                                      return false;
+                                  std::uint32_t first = mips;
+                                  for (std::uint32_t i = mips; i-- > 0;) {
+                                      if (plane.mips[i].offset + plane.mips[i].size > prefix) break;
+                                      first = i;
+                                  }
+                                  if (first >= mips) return false;
+                                  t.short_tail = span - prefix;
+                                  t.resident_mip = first;
+                                  ++partial_resident_;
+                                  return true;
+                              },
                               guard && !mapped);
+    }
+
+    // GTA6RT_METAL_TEXTURE_POOL_READABLE=1: a title texture whose every byte the title pool backs (its pages are
+    // mapped views of pool slots) is readable whatever the probe of its title range said.
+    static bool pool_readable_on() {
+        static const bool on = [] {
+            const char* v = std::getenv("GTA6RT_METAL_TEXTURE_POOL_READABLE");
+            return v && *v == '1';
+        }();
+        return on;
+    }
+    static bool pool_covers(std::uint64_t va, std::uint64_t bytes) {
+        if (!va || !bytes) return false;
+        for (std::uint64_t at = va; at < va + bytes;) {
+            void* host = nullptr;
+            std::uint64_t run = 0;
+            if (!rt::xmem::title_pool_view(at, &host, &run) || !run) return false;
+            at += run;
+        }
+        return true;
+    }
+    std::uint64_t pool_readable_ = 0, short_tail_ = 0, partial_resident_ = 0;  // under title_texture_mutex
+    static std::uint64_t readable_prefix(std::uint64_t va, std::uint64_t bytes) {
+        std::uint64_t at = va;
+        while (at < va + bytes) {
+            MEMORY_BASIC_INFORMATION m{};
+            if (!VirtualQuery(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(at)), &m, sizeof m) ||
+                m.State != MEM_COMMIT || (m.Protect & (PAGE_NOACCESS | PAGE_GUARD)) || !(m.Protect & 0xff))
+                break;
+            const std::uint64_t end = reinterpret_cast<std::uintptr_t>(m.BaseAddress) + m.RegionSize;
+            if (end <= at) break;
+            at = end;
+        }
+        return std::min(at, va + bytes) - va;
+    }
+
+    // GTA6RT_METAL_TITLE_BACK_MB (0, the default: no limit): Metal textures made for deferred title textures at their
+    // fill, in bytes; past it a texture stays deferred (over_budget) and is not visited again.
+    std::uint64_t title_back_bytes_ = 0, title_back_refused_ = 0, title_back_refused_bytes_ = 0;
+    bool title_back_allowed(TitleTexture& t) {
+        static const std::uint64_t budget = [] {
+            const char* v = std::getenv("GTA6RT_METAL_TITLE_BACK_MB");
+            return (v && *v ? std::strtoull(v, nullptr, 10) : 0ull) << 20;
+        }();
+        if (!budget || !t.unbound_bytes) return true;
+        if (title_back_bytes_ + t.unbound_bytes > budget) {
+            if (!t.over_budget) {
+                ++title_back_refused_;
+                title_back_refused_bytes_ += t.unbound_bytes;
+            }
+            t.over_budget = true;
+            t.stale = false;
+            return false;
+        }
+        title_back_bytes_ += t.unbound_bytes;
+        return true;
     }
 
     // LEONIDA_TITLE_VIEW_REFRESH_MS (0 by default: at every view): a texture's bytes are checked when a slot-70 view of
@@ -11100,6 +11783,7 @@ private:
     void refresh_title_texture(TitleTexture& t) {
         // LEONIDA_TITLE_FILL_ASYNC=1: a view neither hashes nor fills. A texture never filled or known stale goes to
         // the fill worker; later changes are found by the periodic pass and the write journal, as before.
+        if (t.over_budget) return;
         if (title_fill_async()) {
             if (!t.hashed || t.stale) queue_title_fill(t.address);
             return;
@@ -11117,7 +11801,7 @@ private:
         std::uint64_t hash = 0;
         if (!title_texture_readable(t)) return;
         if (!hash_guarded(reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(t.cpu)),
-                          std::size_t(t.layout.layout.size), hash)) {
+                          std::size_t(t.readable_span()), hash)) {
             t.memory.defer();
             return;
         }
@@ -11141,6 +11825,7 @@ private:
             ++t.fills;
             return 0;
         }
+        if (!title_back_allowed(t)) return 0;
         if (!staged && !t.unbound_bytes && !t.resource->staged_title())
             for (UINT sub = 0; sub < mips * slices; ++sub)
                 if (!t.resource->host_copy_now(sub)) {
@@ -11150,7 +11835,8 @@ private:
         const std::uint64_t span = layout.layout.size;
         if (!title_texture_readable(t)) return 0;
         title_tiled_.resize(std::size_t(span));
-        if (!copy_guarded(title_tiled_.data(), reinterpret_cast<const std::uint8_t*>(t.cpu), std::size_t(span),
+        if (t.short_tail) std::memset(title_tiled_.data() + t.readable_span(), 0, std::size_t(span - t.readable_span()));
+        if (!copy_guarded(title_tiled_.data(), reinterpret_cast<const std::uint8_t*>(t.cpu), std::size_t(t.readable_span()),
                           title_memory_write_combined(t.cpu))) {
             // The section changed after VirtualQuery. Preserve the last complete upload and retry.
             t.memory.defer();
@@ -11172,8 +11858,8 @@ private:
             t.set_resource(t.resource);
         }
         std::uint64_t hash = 0;
-        hash_guarded(title_tiled_.data(), title_tiled_.size(), hash);
-        t.full_hashed = t.every_byte() && hash_guarded(title_tiled_.data(), title_tiled_.size(), t.full_hash, true);
+        hash_guarded(title_tiled_.data(), std::size_t(t.readable_span()), hash);
+        t.full_hashed = t.every_byte() && hash_guarded(title_tiled_.data(), std::size_t(t.readable_span()), t.full_hash, true);
         const bool volume = layout.layout.dimension == rt::xg_xs::kTexture3D;
         const bool trace_pool = leonida::dstorage::trace_enabled() && leonida::title_gpu_views::other_view(t.cpu);
         bool nonzero = false;
@@ -11187,7 +11873,7 @@ private:
             if (!ok) log_once("staged title texture upload failed, format", int(t.resource->format()));
         } else {
             for (std::uint32_t slice = 0; slice < slices && ok; ++slice) {
-                for (std::uint32_t level = 0; level < mips && ok; ++level) {
+                for (std::uint32_t level = t.resident_mip; level < mips && ok; ++level) {
                     const auto& mip = layout.layout.plane[0].mips[level];
                     const std::uint32_t row_pitch = mip.width_elements * layout.format.bytes;
                     const std::uint32_t slice_pitch = row_pitch * mip.height_elements;
@@ -11261,6 +11947,282 @@ private:
         return refuse_title_view("SRV refused for the texture", d, address);
     }
 
+    std::uint64_t tsharp_fill_bytes_ = 0, tsharp_fill_queued_ = 0;  // under title_texture_mutex, likewise below
+    int unreadable_logged_ = 0;
+    std::array<std::uint64_t, 3> tsharp_fill_by_layout_{};          // view, XG, guessed
+    std::map<std::string, std::uint64_t> tsharp_fill_skipped_;
+
+    static std::uint64_t tsharp_fill_budget() {
+        static const std::uint64_t bytes = [] {
+            const char* v = std::getenv("GTA6RT_METAL_FILL_TSHARP_MB");
+            return (v && *v ? std::strtoull(v, nullptr, 10) : 1024ull) << 20;
+        }();
+        return bytes;
+    }
+
+    std::uint64_t orphan_made_ = 0, orphan_bytes_ = 0;  // under title_texture_mutex
+    std::map<std::string, std::uint64_t> orphan_skipped_;
+
+    static DXGI_FORMAT dxgi_of_gfx10(std::uint32_t code) {
+        static const std::array<DXGI_FORMAT, 512> table = [] {
+            std::array<DXGI_FORMAT, 512> t{};
+            for (UINT f = 1; f <= UINT(DXGI_FORMAT_B4G4R4A4_UNORM); ++f) {
+                const Format v = vulkan_format(DXGI_FORMAT(f), false);
+                if (v.format == VK_FORMAT_UNDEFINED || v.typeless || v.aspects != VK_IMAGE_ASPECT_COLOR_BIT) continue;
+                const std::uint32_t g = leonida::gfx10::format_from_vulkan(v.format);
+                if (g && g < t.size() && t[g] == DXGI_FORMAT_UNKNOWN) t[g] = DXGI_FORMAT(f);
+            }
+            return t;
+        }();
+        return code < table.size() ? table[code] : DXGI_FORMAT_UNKNOWN;
+    }
+
+    // A texture made from a title-written T# over its title memory (GTA6RT_METAL_TSHARP_TEXTURES), at most
+    // GTA6RT_METAL_TSHARP_TEXTURES_MB (512 by default) of title bytes. Caller holds title_texture_mutex.
+    void make_orphan_textures() {
+        static const std::uint64_t budget = [] {
+            const char* v = std::getenv("GTA6RT_METAL_TSHARP_TEXTURES_MB");
+            return (v && *v ? std::strtoull(v, nullptr, 10) : 512ull) << 20;
+        }();
+        std::vector<leonida::gfx10::ImageWords> orphans;
+        {
+            TsharpNotes& n = tsharp_notes();
+            std::lock_guard lock(n.mutex);
+            orphans.swap(n.orphans);
+        }
+        namespace g = leonida::gfx10;
+        namespace xg = rt::xg_xs;
+        for (const auto& words : orphans) {
+            const auto skip = [&](const char* why) { ++orphan_skipped_[why]; };
+            g::Image image{};
+            if (!g::decode(words, image)) { skip("not a T#"); continue; }
+            if (state_.title_textures.count(image.address)) { skip("a texture is registered there now"); continue; }
+            if (g::multisampled(image.type)) { skip("multisampled"); continue; }
+            const DXGI_FORMAT format = dxgi_of_gfx10(image.format);
+            if (format == DXGI_FORMAT_UNKNOWN) { skip("format"); continue; }
+            xg::ResourceDesc d{};
+            const bool volume = image.type == g::ImageType::image_3d;
+            const bool line = image.type == g::ImageType::image_1d || image.type == g::ImageType::image_1d_array;
+            d.dimension = volume ? xg::kTexture3D : line ? xg::kTexture1D : xg::kTexture2D;
+            d.width = image.width;
+            d.height = line ? 1 : image.height;
+            d.depth_or_array = std::uint16_t(volume ? image.depth : image.first_layer + image.layer_count);
+            d.mips = std::uint16_t(std::max(1u, image.resource_mips));
+            d.format = std::uint32_t(format);
+            d.samples = 1;
+            d.layout = xg::kSwizzled | ((words[3] >> 20) & 0x1f);
+            xg::Texture layout;
+            const char* why = nullptr;
+            if (!title_layout(d, layout, why)) { skip(why ? why : "layout"); continue; }
+            const std::uint64_t span = layout.layout.size;
+            if (orphan_bytes_ + span > budget) { skip("over the budget"); continue; }
+            if (!pool_covers(image.address, span)) { skip("title pool does not back all of it"); continue; }
+            {
+                auto it = state_.title_textures.lower_bound(image.address + span);
+                bool overlaps = false;
+                if (it != state_.title_textures.begin()) {
+                    --it;
+                    overlaps = it->first + std::max<std::uint64_t>(it->second->span, 1) > image.address;
+                }
+                if (overlaps) { skip("overlaps a registered texture"); continue; }
+            }
+            std::array<std::uint32_t, 14> desc{};
+            std::memcpy(desc.data(), &d, sizeof(d));
+            desc[2] = desc[3] = 0;
+            D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+            srv.Format = format;
+            srv.ViewDimension = volume ? D3D12_SRV_DIMENSION_TEXTURE3D : D3D12_SRV_DIMENSION_TEXTURE2D;
+            srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            TitleTexture* t = make_title_texture(d, desc, srv, image.address, {});
+            if (!t) { skip("not made (see the slot-70 refusals)"); continue; }
+            orphan_bytes_ += span;
+            if (++orphan_made_ <= 16)
+                std::fprintf(stderr,
+                             "[rt] d3d12-metal: texture made for a title T# at 0x%llx: %ux%ux%u mips %u DXGI %d swizzle "
+                             "mode %u, %llu bytes\n",
+                             static_cast<unsigned long long>(image.address), image.width, image.height,
+                             unsigned(d.depth_or_array), unsigned(d.mips), int(format), (words[3] >> 20) & 0x1f,
+                             static_cast<unsigned long long>(span));
+        }
+    }
+
+    // The deferred textures title T#s named since the last pass are marked stale, so the pass fills them (visit).
+    void take_tsharp_wanted() {
+        std::vector<std::uint64_t> wanted;
+        {
+            TsharpNotes& n = tsharp_notes();
+            std::lock_guard lock(n.mutex);
+            wanted.swap(n.wanted);
+        }
+        for (const std::uint64_t address : wanted) {
+            auto it = state_.title_textures.find(address);
+            if (it == state_.title_textures.end())
+                if (const std::uint64_t other = leonida::title_gpu_views::other_view(address))
+                    it = state_.title_textures.find(other);
+            const char* skip = nullptr;
+            if (it == state_.title_textures.end() || !it->second->resource) {
+                skip = "not in the registry";
+            } else {
+                TitleTexture& t = *it->second;
+                const std::uint64_t bytes = t.resource->unbound_bytes();
+                if (t.gpu_written) skip = "GPU-written";
+                else if (!t.layout_known) skip = "layout unknown";
+                else if (!bytes) skip = "has its Metal texture";
+                else if (t.stale) skip = "already stale";
+                else if (tsharp_fill_bytes_ + bytes > tsharp_fill_budget()) skip = "over the budget";
+                if (!skip) {
+                    t.stale = true;
+                    tsharp_fill_bytes_ += bytes;
+                    ++tsharp_fill_queued_;
+                    ++tsharp_fill_by_layout_[t.layout_from_xg ? 1 : t.layout_guessed ? 2 : 0];
+                    continue;
+                }
+            }
+            ++tsharp_fill_skipped_[skip];
+        }
+    }
+
+    static std::string title_region(std::uint64_t a) {
+        char text[24];
+        std::snprintf(text, sizeof text, "0x%llx", static_cast<unsigned long long>(a >> 32));
+        return text;
+    }
+
+    // GTA6RT_METAL_TEXTURE_CENSUS=1, every census: the registry's sampled textures by what stands between them and
+    // the shader (state, layout source, 4 GiB region of the address, T# views, and for those waiting for readable
+    // memory what VirtualQuery and the title pool say of their first byte), then the sampled T# addresses that named
+    // no texture. Caller holds title_texture_mutex.
+    void log_texture_census() {
+        if (!texture_census_on()) return;
+        struct Row {
+            std::uint64_t n = 0, bytes = 0;
+        };
+        std::map<std::string, Row> rows;
+        for (const auto& [address, e] : state_.title_textures) {
+            const TitleTexture& t = *e;
+            if (!t.resource || t.gpu_written) continue;
+            const Resource& r = *t.resource;
+            const char* state = r.in_place() ? "in-place" : t.fills ? "filled" : r.unbound_bytes() ? "deferred" : "empty";
+            const char* layout = !t.layout_known ? "none" : t.layout_from_xg ? "xg" : t.layout_guessed ? "guess" : "view";
+            const std::uint64_t span = t.layout_known ? t.layout.layout.size : t.span;
+            std::string memory = "not-pending";
+            if (t.memory.pending()) {
+                MEMORY_BASIC_INFORMATION mbi{};
+                const bool q = VirtualQuery(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(t.cpu)), &mbi,
+                                            sizeof mbi) != 0;
+                void* host = nullptr;
+                std::uint64_t run = 0;
+                const bool pool = rt::xmem::title_pool_view(t.cpu, &host, &run);
+                const bool fresh = leonida::texture_memory_readable(t.cpu, span);
+                char text[128];
+                std::snprintf(text, sizeof text, "pending(state 0x%lx prot 0x%lx, pool %s, probe now %s)",
+                              q ? (unsigned long)mbi.State : 0ul, q ? (unsigned long)mbi.Protect : 0ul,
+                              !pool ? "no" : run >= span ? "one run" : pool_covers(t.cpu, span) ? "all" : "part",
+                              fresh ? "readable" : "not readable");
+                memory = text;
+                if (!fresh && unreadable_logged_ < 6) {
+                    ++unreadable_logged_;
+                    std::uint64_t at = t.cpu;
+                    MEMORY_BASIC_INFORMATION m{};
+                    for (; at < t.cpu + span; at += 4096) {
+                        if (!VirtualQuery(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(at)), &m, sizeof m) ||
+                            m.State != MEM_COMMIT || (m.Protect & (PAGE_NOACCESS | PAGE_GUARD)) || !(m.Protect & 0xff))
+                            break;
+                    }
+                    void* h = nullptr;
+                    std::uint64_t r2 = 0;
+                    const bool p2 = at < t.cpu + span && rt::xmem::title_pool_view(at, &h, &r2);
+                    std::fprintf(stderr,
+                                 "[rt] texture census: 0x%llx (%llu bytes) not readable at +0x%llx: state 0x%lx protect 0x%lx "
+                                 "region 0x%llx+0x%llx; pool %s there\n",
+                                 static_cast<unsigned long long>(t.cpu), static_cast<unsigned long long>(span),
+                                 static_cast<unsigned long long>(at - t.cpu), (unsigned long)m.State,
+                                 (unsigned long)m.Protect, static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(m.BaseAddress)),
+                                 static_cast<unsigned long long>(m.RegionSize), p2 ? "backs it" : "does not back it");
+                }
+            }
+            char key[256];
+            std::snprintf(key, sizeof key, "%s %s %s %s T#%s %s", t.owned ? "made" : "133", state, layout,
+                          title_region(address).c_str(), r.shader_views() ? "y" : "n", memory.c_str());
+            Row& row = rows[key];
+            ++row.n;
+            row.bytes += span;
+        }
+        std::vector<std::pair<std::string, Row>> sorted(rows.begin(), rows.end());
+        std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) { return a.second.bytes > b.second.bytes; });
+        std::string text;
+        for (std::size_t i = 0; i < sorted.size() && i < 28; ++i) {
+            char line[320];
+            std::snprintf(line, sizeof line, "%s[%s] %llu %.1f MiB", i ? "; " : "", sorted[i].first.c_str(),
+                          static_cast<unsigned long long>(sorted[i].second.n), double(sorted[i].second.bytes) / 1048576.0);
+            text += line;
+        }
+        std::fprintf(stderr, "[rt] texture census: %zu kinds: %s\n", sorted.size(), text.c_str());
+        std::vector<std::uint64_t> misses;
+        std::uint64_t miss_count = 0;
+        {
+            TsharpNotes& n = tsharp_notes();
+            std::lock_guard lock(n.mutex);
+            misses = n.misses;
+            miss_count = n.miss_count;
+        }
+        std::map<std::string, std::uint64_t> buckets;
+        for (const std::uint64_t a : misses) {
+            const char* where = "no registry entry over it";
+            auto it = state_.title_textures.upper_bound(a);
+            if (it != state_.title_textures.begin()) {
+                --it;
+                const std::uint64_t span = std::max<std::uint64_t>(it->second->span, 1);
+                if (a < it->first + span) where = it->second->resource ? "inside a registered texture" : "inside a gone texture";
+            }
+            void* host = nullptr;
+            std::uint64_t run = 0;
+            const bool pool = rt::xmem::title_pool_view(a, &host, &run);
+            char key[160];
+            std::snprintf(key, sizeof key, "%s %s, pool %s", title_region(a).c_str(), where, pool ? "yes" : "no");
+            ++buckets[key];
+        }
+        std::string miss_text;
+        for (const auto& [key, n] : buckets) {
+            char line[200];
+            std::snprintf(line, sizeof line, "%s[%s] %llu", miss_text.empty() ? "" : "; ", key.c_str(),
+                          static_cast<unsigned long long>(n));
+            miss_text += line;
+        }
+        std::fprintf(stderr, "[rt] texture census: T#s naming no texture %llu (sample %zu): %s\n",
+                     static_cast<unsigned long long>(miss_count), misses.size(), miss_text.c_str());
+        if (tsharp_textures_on()) {
+            std::string skipped;
+            for (const auto& [why, n] : orphan_skipped_)
+                skipped += (skipped.empty() ? "" : ", ") + why + " " + std::to_string(n);
+            std::fprintf(stderr, "[rt] texture census: textures made for title T#s %llu (%.0f MiB of title memory); not "
+                                 "made: %s\n",
+                         static_cast<unsigned long long>(orphan_made_), double(orphan_bytes_) / 1048576.0,
+                         skipped.c_str());
+        }
+        std::fprintf(stderr,
+                     "[rt] texture census: readable through the title pool %llu, with an unmapped last page %llu, streamed "
+                     "in part %llu; Metal textures made at a fill %.0f MiB, "
+                     "refused past GTA6RT_METAL_TITLE_BACK_MB %llu (%.0f MiB)\n",
+                     static_cast<unsigned long long>(pool_readable_), static_cast<unsigned long long>(short_tail_),
+                     static_cast<unsigned long long>(partial_resident_),
+                     double(title_back_bytes_) / 1048576.0,
+                     static_cast<unsigned long long>(title_back_refused_), double(title_back_refused_bytes_) / 1048576.0);
+        if (fill_tsharp_textures()) {
+            std::string skipped;
+            for (const auto& [why, n] : tsharp_fill_skipped_)
+                skipped += (skipped.empty() ? "" : ", ") + why + " " + std::to_string(n);
+            std::fprintf(stderr,
+                         "[rt] texture census: T#-named deferred textures queued for a fill %llu (%.0f MiB of %.0f; "
+                         "layout from a view %llu, XG %llu, guessed %llu); not queued: %s\n",
+                         static_cast<unsigned long long>(tsharp_fill_queued_), double(tsharp_fill_bytes_) / 1048576.0,
+                         double(tsharp_fill_budget()) / 1048576.0,
+                         static_cast<unsigned long long>(tsharp_fill_by_layout_[0]),
+                         static_cast<unsigned long long>(tsharp_fill_by_layout_[1]),
+                         static_cast<unsigned long long>(tsharp_fill_by_layout_[2]), skipped.c_str());
+        }
+    }
+
     // One line of what slot 70 was asked for, and one of what the refresh did since the last line (NOTES: step 4).
     void log_title_census(const char* when) {
         TitleTextureStats& s = title_stats_;
@@ -11319,6 +12281,7 @@ private:
             maps += text;
         }
         if (!maps.empty()) std::fprintf(stderr, "[rt] d3d12: title textures mapped: %s\n", maps.c_str());
+        if (std::strcmp(when, "refresh") == 0) log_texture_census();
         for (const BinkGroup& g : bink_groups_)
             std::fprintf(stderr,
                          "[rt] d3d12: movie frame buffers 0x%llx: set index %d, %llu switches, %llu set visits, %llu passes "

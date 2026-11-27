@@ -83,6 +83,7 @@ struct MetalBinding {
     // registers the binding again; false when it cannot be made.
     void* owner = nullptr;
     bool (*ensure)(void*) = nullptr;
+    const void* alias_watch = nullptr;  // a render target that may share a placement heap (metal_rt_alias.h)
 };
 
 // A pipeline whose Metal object is made at first use: `ensure(owner)` (the PSO) makes it and registers it again
@@ -264,6 +265,10 @@ public:
     void note_work(Work w, Fate f, const char* why = nullptr);
     // Counts since the last call, per presented frame, and the top skip reasons; empty when nothing was seen.
     std::string take_work_report(std::uint64_t presents);
+    // Compute passes replay skipped, by pipeline: why (fate, and for a pipeline not ready its compile state: queued,
+    // compiling, no library yet) and whether it is direct or indirect. take_work_report prints them, all of them since
+    // the last report and the count of pipelines ever skipped (GTA6RT_METAL_SKIP_REPORT=0: off).
+    void note_compute_skip(const char* pipeline, bool indirect, Fate f, const char* state);
 
     // The latest progress value each queue signalled, so a present (on its own queue) waits for the work before it.
     void note_submitted(gpu::Fence* progress, std::uint64_t value);
@@ -328,6 +333,9 @@ private:
     std::array<std::uint64_t, kWork> work_seen_{};
     std::mutex work_mutex_;
     std::map<std::string, std::uint64_t> work_why_;
+    std::mutex skip_mutex_;
+    std::map<std::string, std::uint64_t> skips_;
+    std::map<std::string, std::uint64_t> skipped_ever_;
     std::atomic<std::int64_t> last_compute_skip_ns_{0};
     struct Unproduced {
         std::uint64_t hi;
@@ -404,6 +412,10 @@ public:
     // The colour to show this present (null: none) and its exposure; the mode (0 off, 1 under the UI, 2 alone).
     gpu::Texture* present_source(float& exposure);
     int present_mode() const { return present_mode_; }
+    std::uint64_t upscaled_frames() {
+        std::lock_guard lock(mutex_);
+        return upscaled_frames_;
+    }
 
 private:
     struct Pass {
@@ -441,8 +453,17 @@ private:
     bool latched_ = false, logging_ = false;
     Target hdr_, gbuffer_[8], gbuffer_depth_;
     std::uint32_t gbuffer_count_ = 0;
+    struct Mrt {
+        ResourceId first = 0;
+        std::uint32_t count = 0;
+        std::uint64_t calls = 0;
+    };
+    std::vector<Mrt> mrts_;
+    Target exposure_target_;
+    std::uint64_t gbuffer_calls_ = 0;
     std::string hdr_by_, gbuffer_by_;
     std::vector<Pass> passes_;
+    std::size_t max_passes_ = 600;
     std::unique_ptr<gpu::Texture> copy_;
     bool copy_valid_ = false;
     std::uint64_t copy_frame_ = 0;

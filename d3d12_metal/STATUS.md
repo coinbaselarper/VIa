@@ -1,5 +1,469 @@
 # port/d3d12_metal status (round 7)
 
+## Round 11, pool-default worker (2026-11-27 06:07-07:22): the title pool is the Metal default; pool wiring = what is named; boot with the tier fixed; spacers cost nothing
+
+Tree `build/pooldef-x86_64` (`-build1..12.log`), launcher `build/pooldef-x86_64/run_world.sh` (s7_world_run.sh with this
+tree's run dir, the tmem probe lock, cap 14,848 when no prepare_shaders/ninja/clang runs at the start, else 13,312,
+`GTA6RT_METAL_CB_ABORT_MS=2000`, memory report every 5 s, and a 1 s vm_stat watch that ends the run past 10,240 MiB
+machine wired: `run/logs/<run>.wired.tsv`). Runs pdef-a..f, pdef-boot2..5, pdef-off, pdef-vk, each alone (slot + lock),
+hidden window, imported save, load 3-8 at the starts. **0 failed command buffers, 0 GPU page faults; gpuEvent-gta6rt 9
+before and 9 after every run (13 runs).** M = printed by a log, a tool or a probe; I = inferred.
+
+### What changed (defaults now; switches restore the old behaviour)
+
+- **xmem** (`shims_core/src/xmem.cpp/.h`): the title pool is on when `GTA6RT_GPU=metal` (`GTA6RT_METAL_TITLE_POOL=0`
+  off, `=1` forces it on any path); with it `GTA6RT_VM_BASE_HINT=0x2000000000` unless set (tpool-b: without it chunks
+  collided with title memory). Free physical slots are a bitmap: a multi-page allocation takes a consecutive run where
+  one is free (else fresh slots while <= `LEONIDA_XMEM_CONTIG_SLACK_MB`, 256, sits on the free list), any other the
+  lowest free slot. **A range below 4 GiB is held from process start** (`LEONIDA_XMEM_LOW_HOLD_MB`, 256 on the Metal
+  path, 0 elsewhere) and the title's 32-bit reservation is placed in it; once per run a line says what holds the low
+  4 GiB when the title asks (`xmem: below 4 GiB when the title asks`). New tests in `test_xmem_pool.cpp` (consecutive
+  slots after fragmentation; a 32-bit reservation lands in the held range): shims_core_test 101/101 with the pool off,
+  on (`=1`) and Metal-default.
+- **port/metal**: `BufferDesc::va_only`: a placement-sparse private buffer (macOS 26+) with no pages: GPU VA only.
+  Probe (M): a 1 GiB one costs +0 MiB `currentAllocatedSize`, +1 MiB footprint, +2 MiB machine wired, and moves the next
+  buffer's GPU address by 1 GiB; a bytesNoCopy "hold" costs +1,024 MiB allocated size, a private spacer +1,040.
+  `metal_test_titlepool` gained `va_holds` (and Metal hands the buffer made right after a released probe the probe's
+  address: 16 of 16 there, 64 of 64 in a probe with interleaved allocations): PASS; memory, hostmem: PASS.
+- **Device shim** (`title_pool_*`, `claim_shader_range`, `refresh_console_heap`'s live re-fix, `backing`'s release
+  branch, `title_window_in_place`, `external_window`'s spacer, the overlay string):
+  - chunks of **1 MiB** (`GTA6RT_METAL_TITLE_POOL_CHUNK_MB`) in the **device residency set** instead of named in every
+    encoder (`GTA6RT_METAL_TITLE_POOL_NAMING=encoder`: the old way; both wire a chunk whole until it goes, the set costs
+    no CPU per encoder); span buffers up to 32 MiB.
+  - a chunk's shader VA is probed with a VA-only buffer first; a colliding range keeps that VA-only buffer and a
+    VA-only spacer skips the occupied range (the private spacer is only the fallback before macOS 26). Same for
+    `external_window`'s spacers. Metal's own CPU mappings (VM tag 100) no longer count as title memory in
+    `claim_shader_range` (pdef-b: they refused every try and, after 8 failures, the pool stopped making chunks); a
+    refused range now refuses that chunk only, after 64 tries.
+  - ranges on scattered pool pages get a copy window from their own budget (`GTA6RT_METAL_TITLE_POOL_SCATTER_MB`, 64).
+  - the pool's empty-slot requeue runs at most every `GTA6RT_METAL_TITLE_POOL_RETRY_MS` (250).
+  - **live re-fix limited** (`GTA6RT_METAL_REFIX_ALL=1`: every live V# as before): after a released backing or an
+    alias invalidation only the slots whose title V# reaches an alias that is gone since the heap's last refresh (diff
+    of the alias table against a snapshot taken as that refresh ended) or whose GPU copy names a released backing
+    (`backing` logs released shader ranges). Every live V# when an invalidation came while slots were being fixed, at
+    a heap's first refresh, or when the log no longer reaches back.
+  - default shader overlays: tmem, mcc, msl-overrides, uint (lead 06:15).
+  - `GTA6RT_METAL_TITLE_WINDOWS_IN_PLACE=alias` is removed (one line says so; the pool backs those pages).
+
+### Measured (M)
+
+| run | binary, settings | story load | world entry: footprint / machine wired (MiB) | world+60 s | pool | end |
+|---|---|---:|---|---|---|---|
+| tpool-h (round 10) | old pool, 8 MiB chunks per encoder, `PCACHE=0` | 24.3 s | 10,695 / 9,069 | - | 2,704 MiB wired for 1,524 named, 806 scattered, spacers 1,745 MiB | cap, world+9 s |
+| pdef-a | 4 MiB per encoder, **tier on** | 29.3 s | 12,033 / 10,124 | - | 1,916 MiB wired at 512 chunks | wired watch 10,409 at world+~2 s |
+| pdef-b | 1 MiB residency set, before the claim fix | 25.3 s | 10,973 / 6,666 | 14,500 peak / 8,490 | **chunk making stopped** after ~130 chunks (VA refusals) | watchdog, world+83 s |
+| **pdef-c** | final pool, tier off (`PCACHE=0`) | 25.4 s | **10,783 / 8,126** | **14,002 / 9,934** | **1,674 MiB wired = 1,674 named** (8,192 ranges), 45 scattered, 0 refused, spacers with memory 0 | wired watch 10,490 at world+63 s |
+| pdef-d | pdef-c + `REFIX_ALL=1` | 24.8 s | | | | watchdog, world+29 s |
+| pdef-e | + shared sources of 07:08 (rt-alias on), pool | 23.3 s | ~6,800-7,300 (vm_stat) | world+20 s 8,600-9,000 | 1,738 MiB for 1,738 named, 145 scattered | watchdog |
+| pdef-off | same binary as pdef-e, `GTA6RT_METAL_TITLE_POOL=0` | **14.7 s** | ~5,100-5,300 | world+28 s 6,560 | - | watchdog |
+| pdef-f | + requeue limit | 23.9 s | | world+20 s 9,400 | | watchdog |
+| pdef-vk | `GTA6RT_GPU=vulkan` (plain pool) | 34.4 s | world at +92.6 s, peak 11,126 | | - | watchdog 130 s, no error |
+
+- **1. Wired.** Pool wiring now equals what descriptors name (1 MiB granularity): 1,674 MiB at world entry in pdef-c
+  against 2,704 MiB in tpool-h (-1.0 GiB, with more ranges resolved), machine wired 8.1 vs 9.1 GiB at world entry.
+  Spacers with memory 0 MiB (tpool-h 1,745 MiB in Metal's allocated size); VA-only holds 1-9 GiB of GPU VA, 0 MiB
+  allocated. **Still over the limit later:** in every pool run the graphics ledger steps +1.4 GiB 6-9 s into the world
+  (pdef-c +85 -> +91 s: graphics 3,740 -> 5,118 MiB, Metal allocated 6,416 -> 7,228, machine wired 8,071 -> 9,970), with
+  the tmem overlay loaded (8 rows), and pdef-c reached 10,490 MiB at world+63 s. With the tier on (pdef-a) the world
+  entry itself is 10.1-10.4 GiB. Not done: releasing chunks no live descriptor uses. Root views resolved in
+  `d3d12_com.cpp` and `metal_replay.cpp` hit the alias table directly, so no count in the device shim sees every holder
+  of a chunk's shader VA; releasing on such a count would leave recorded root views pointing at freed GPU VA (I). Nor
+  per-pass residency: shaders index the heap bindlessly, so a pass reaches every live descriptor.
+- **2. Story load: not fixed.** The live re-fix is not where it goes. In the story-load window pdef-c re-fixed 72,857
+  slots in 28.6 ms (limited) and pdef-d 1.41 M slots in 515 ms (all), and both loads took 25 s. In the world the limit
+  cuts the re-fix from 1.2-1.5 s to 0.03-0.32 s per 10 s (64 limited against 3-4 full re-fixes). The pool's whole cost
+  is 23.3-23.9 s against 14.7 s (pdef-e/-f vs pdef-off, same binary): +2.5 s before session 0xa, +6.2 s in the second
+  part. Measured parts: chunk making 1.04 s in all; fewer than 256 commits into virtual runs and fewer than 64
+  multi-page physical allocations (no line), so xmem's views are not it; the requeue limit changed nothing (23.9 s).
+  What differs in the heap line: the retry list holds 0.8-1.1 M slots waiting with the pool against ~20 k without,
+  and a refresh costs 5.1-5.6 ms against 4.2 ms (I: more descriptors resolve, so more fixing and more textures; the
+  world frame is 1.6-1.8 against 2.8-3.0 frames/s, `heaps` 10-12 ms a submission against 6). Next: a profile of the
+  story load with the pool on.
+- **3. Scattered ranges:** 806 (tpool-h) -> 45 (pdef-c) / 145 (pdef-e) at 8,192 ranges. The consecutive-run path for
+  multi-page allocations ran fewer than 64 times; the drop is the lowest-first reuse of free slots. The rest get copy
+  windows: at most 64 windows, 19 MiB, the 64 MiB budget never reached.
+- **4. Boot with the tier on: 5 of 5** (pdef-a to the world, pdef-boot2..5 past the reservation to "landing"; fr10-c..g
+  stopped there 5 of 5). What fills the low 4 GiB (pdef-a, M): **4,095 MiB mapped, 0 MiB free: Metal's binary-archive
+  shards 3,277 MiB in 144 mappings**, the arena's VA reservation 382 MiB, the xmem hold 256 MiB, ICU data 148 MiB, a
+  metallib 28 MiB; in the boot runs 13 MiB were left free besides the hold. The reservation is placed at 0xf4700000
+  inside the hold (0xf0000000, 256 MiB).
+- **5. Defaults.** Pool on for `GTA6RT_GPU=metal`; Vulkan unchanged: the plain pool (`xmem: physical pool 8 GiB`), no
+  low hold, no base hint; shims_core_test 101/101; pdef-vk loaded the story (34.4 s; tpool-vk 40.0 s) and ran 38 s in
+  the world to the watchdog with no error (that run still had the low hold; it is Metal-only since). The only change
+  on the Vulkan path: free physical slots are reused lowest first instead of last in, first out (not observable).
+
+### Milestone images (one each; the lit-frame worker reached all three earlier, 06:07-06:45)
+
+1. G-buffer with albedo: `/Users/a/Desktop/Projects/GTA-VI/port/run/present/pdef-c-gbuffer-albedo.png` (pdef-c, upscaled
+   frame 62, target 0: 21.9% of texels non-zero; frame 2: 17.3%, depth and target 1 79.9%; tpool-h 11.1 / 63.4%).
+   Palms, a textured wooden dock with a lifebuoy, beach sand, a fence, an apartment block. Wrong: the stilt houses and
+   most walls and roofs are black (no material texture), a sheet of stretched polygons crosses the top left, and a
+   magenta line runs along a fence.
+2. Lit scene colour: `/Users/a/Desktop/Projects/GTA-VI/port/run/present/pdef-b-lit-scene-colour.png` (pdef-b, upscaled
+   frame 152; the first non-zero colour was frame 32): sky, clouds, open water, a far coast in haze. Wrong: almost no
+   geometry (that run's pool stopped making chunks), a blown-out sky. pdef-c frame 62 (`pdef-c-scene/scene_00062_colour.png`)
+   has the lit houses but is over-exposed white (mean 210) with black shadow streaks.
+3. Presented window frame: `/Users/a/Desktop/Projects/GTA-VI/port/run/present/pdef-b-world-present.png` (pdef-b, present
+   2101, 1920x1080): the HUD (health, armour, $407 / $2,480) over sky and the far coast. Wrong: the lower half is white,
+   the clouds posterized, no near geometry.
+
+### Next (ranked)
+
+1. Story load with the pool (+8.6 s): profile it; the retry list (0.8-1.1 M waiting) and the per-refresh fixing are
+   the first suspects.
+2. The +1.4 GiB graphics step at world+6-9 s (tmem overlay loaded) and the tier's world-entry cost: with both the
+   machine passes 10 GiB wired within a minute of the world.
+3. Chunk release needs a hook where every alias hit happens (`TitleVaAliases`, read-only for me) or a translation
+   table the shader reads (spike/ref-native-victory-macos finding 2).
+
+## Round 11, frame-cpu worker (2026-11-27 06:07-07:22): the heap lock is no longer what sets the frame; the tier boots, ends the compute skips and with them the irradiance runaway
+
+Tree `build/fcpu-x86_64` (`-build1..7.log`), launcher `build/fcpu-x86_64/run_fr.sh` + `run_world.sh` (gates' launcher
+with this tree's private run dir, an own archive that starts empty, the tmem probe lock, `cache/tools/fault_stop.sh`
+beside the run, and a machine-wired watch every 2 s that ends a run past 10 GiB). Runs `fcpu-a..h`, each alone (slot
+polled), hidden window, imported save, **pipeline tier on** (the default), overlays tmem:mcc:msl-overrides:uintps (lead
+06:15), `GTA6RT_METAL_CB_ABORT_MS=2000`, cap 14,848 MiB (no heavy job at any start but e2: 13,312), load 2.9-8.1.
+**0 GPU page faults, 0 command-buffer failures; gpuEvent-gta6rt 9 before and 9 after every run.** M = measured, I = inferred.
+
+| run | what | world at | end |
+|---|---|---:|---|
+| fcpu-a | combining on, verify 1/64 (biased, below), `DISPATCH_TIMING=lib_cs_013` 1 s every 20 s | 71.8 s | watchdog, world+143 s |
+| fcpu-b | combining **off** (old code), nothing else | 71.5 s | footprint cap, world+46 s |
+| fcpu-c | `LEONIDA_REFRESH_PER_FRAME=2` (ceiling probe) | 79.0 s | **CB abort** (lib_cs_01460..01468 > 1.5 s), world+6 s |
+| fcpu-d/-e/-e2/-f | (title pool on by default in the live xmem from 06:33, unnoticed) | 78-84 s | my wired stop, 10.25-10.47 GiB, world+1-6 s |
+| fcpu-g | pool off; combining + verify 1/16; `FORCE_SKIP` of 5 irradiance passes; timing | 70.8 s | watchdog, world+82 s |
+| fcpu-h | pool off; rect fix (5) on, then opt-in; clean | 72.3 s | watchdog, world+157 s |
+| fcpu-i | pool off; final build, all defaults (rect fix default on, direct draws only) | 74.8 s | watchdog, world+60 s |
+
+### 1. The console-heap lock (`shims/d3d12_metal_device.cpp`, `refresh_console_heaps` and its lock)
+
+- **Built: combining, default on (`GTA6RT_METAL_HEAP_COMBINE=0` = one refresh a submission).** Arrivals and refresh
+  starts are ordered under a small mutex; a submission that, once it holds `console_heap_mutex`, finds a refresh
+  completed that *started after it arrived* returns without its own. That refresh saw every title write made before
+  the submission, which is all the per-submission contract promised (the GPU reads the arena copy in place, so a later
+  refresh could always overtake). Exact by construction; nothing in `refresh_console_heap` changed.
+- **Verify (`GTA6RT_METAL_HEAP_COMBINE_VERIFY=N`, in-title shadow compare):** every Nth arrival snapshots the title's
+  heap bytes *before* it arrives; holding the lock afterwards, a slot whose snapshot still equals the title's bytes but
+  not the bytes its arena slot was made from is stale. fcpu-g (M): **27 covered samples, 0 stale slots**; control
+  (arrivals that refreshed themselves) ~480 samples, 3 stale slots in one window (a slot rewritten back to an older
+  value after the scan: the detector's noise floor); 0.09-0.33 M slots compared a window. fcpu-a's 1/64 verify took its
+  snapshot under the heap lock, which made every sampled arrival refresh itself (0 covered samples; fixed for fcpu-g).
+- **What it buys (M): little.** Covered 5-9% of submissions (fcpu-a world+30: 1,116 submissions in 10 s, 1,031
+  refreshes, 85 covered; world+120: 1,330 / 1,253 / 77). With two submitting threads the waiter behind a refresh always
+  needs the next one, so combining pays only from three (I: the 5-9% are the moments a third arrived). Frames/s did not move (table in 4).
+- **Lock at world+30 (fcpu-a, M):** refresh 5.2 ms inside the lock, wait 5.7 ms a submission (max 179 ms), lock busy
+  ~54%; world+60..+120: refresh 3.2-3.4 ms, wait 2.8-3.4 ms, busy ~40%. Inside a refresh at world+30 (heap line):
+  pages 0.60, fixing changed slots 3.9-4.9 (220-235 KiB, ~7,000 slots a refresh), retries 0.51 (the T# budget).
+  Live V# re-fixes (new counters, fcpu-g/-h): see 4.
+- **Options not taken, and why:**
+  - *Refresh once per frame / per N ms + a check of 16 entries per bound table* (VIctory's design): our shaders read
+    the arena copy bindlessly (`kHeapIndexReach` = 2^21 slots), so no bound-table set bounds what a submission reads;
+    and stale descriptors are not harmless here: **fcpu-c (per-frame heaps) ended 6 s into the world on the CB abort**
+    (lib_cs_01460..01468 / 02069.. command buffers past 1.5 s). The 16-entry check only works once shaders stop reading
+    the arena copy raw (ref-native-victory-macos finding 2/3).
+  - *Reader/writer split:* nothing reads under `console_heap_mutex` on the hot path (only the gpu-debug console
+    source); the waits are refresh behind refresh, which combining already merges.
+  - *Sharding per heap:* one resource heap (38 MiB) does all the work; the sampler heap is imported. Nothing to shard.
+  - r9-heapcopy replay tool: not rerun; it checks `refresh_console_heap`'s scan/fix result per refresh, which this
+    change does not touch (only which submissions call it). The in-title verify above is the check that applies.
+- **Where the frame goes now (M, fcpu-a/-g, tier on):** frame 290-340 ms. GPU any-queue busy 54-56% at world+30
+  (168-185 ms a frame, direct queue 152-165), 68-70% from world+60 (196-201 ms a frame, direct 177-182). Heap lock
+  40-54% busy. Neither saturates; the GPU share is the larger and grows, so the next frame-rate step is GPU-side
+  (direct-queue passes), not the heap.
+
+### 2. The irradiance-cache lists
+
+- **With the tier on nothing in that family is skipped, and the lists stay bounded (M):** fcpu-a, `lib_cs_01368`
+  GatherCopy 37 groups a dispatch at world+3 s, 48-74 through world+130 s (0.05 ms); `lib_cs_01396` 490-980;
+  `lib_cs_01377` 37-74. fr10-h (tier off, 177 compute passes skipped a frame): 56,307 -> 919,216 in 11 s. So the
+  runaway needs a skipped pass, and a warm run makes it run.
+- Bisect (fcpu-g, `GTA6RT_METAL_FORCE_SKIP=lib_cs_01331,01333,01335,01352,01365`, the family's 1-thread passes): the
+  lists did **not** grow; `lib_cs_01368`'s records became empty (0 groups), so one of these builds its dispatch
+  arguments and none is the reset. Which pass resets the counter is still not named (not among those five).
+- **Skip report (new, default on, `GTA6RT_METAL_SKIP_REPORT=0` off):** every 10 s, `[rt] d3d12-metal compute skipped by
+  pipeline`: each skipped pipeline, direct/indirect, why, and for "compiling" its compile state (queued / compiling /
+  no pipeline object). A skipped pass whose pipeline waits in the compile queue is now moved up to demand priority
+  (`MetalDevice::precompile`), as the backend's own NotReady path does for draws; replay never reached that path.
+- Not done: a log line on the indirect group clamp. The clamp exists on the GPU (`groups_prepass`, port/metal,
+  `GTA6RT_METAL_INDIRECT_CS_GROUPS` = 2^20) and is not in my files; a log line needs a readback there.
+
+### 3. "Still compiling" skips with the tier on (M, fcpu-a)
+
+- Compute passes skipped as compiling: 0.2 a frame at world+0..10, then **0 from world+21**; one burst of 60 pipelines
+  at world+41..51 (an 83-present window, a scene change: all `queued`), then none. Draws: 12.4 a frame indirect mesh
+  "compiling" in world+21..31 (a burst of 30 first uses at world+20), **0 at world+31..41**. pcache at world+30:
+  "0 of all first uses not ready yet; compiles running 0, queued 0".
+- **What was missing from the tier:** its prebuild list. 173 world pipelines in fcpu-a were "created at use" (161 from
+  the archive, 15 compiled, 1 failed): the studio-shot PBR lighting set (`vs_classfied_fullScreen` x
+  `PS_STUDIOSHOT_PBR_MATERIAL_*`, ~30), hair-strand G-buffer, blur/text/UI, trail-map grass, cascade-shadow mesh
+  variants, `lib_cs_03152/01189/01206/01099`. Fixed with the cache worker's tools: `tier_refresh.sh 300` -> 3,172 world
+  pipelines, 199 new (`build/pc7/lists/world-new.specs`), tier manifest 3,210 entries; `prepare_shaders` over a
+  catalog with the tmem overlay folded in (`build/pc7/catalog-r11-tmem.tsv` = catalog-r9-mcc + tmem): **199 ok (183
+  already in the archive, 16 built), 0 failed** (`build/pc7/prep-world-r11-a.*`). The translator's 7 thread-memory
+  pipelines: 7 ok (`prep-world-tmem-a.*`).
+- Not compile skips but still lost every frame (M, world+30): indirect mesh split64 "Metal refused the pipeline"
+  (threadgroup memory 36,336 B) 20-24 a frame and (29,888 + 31,968 B) 4 a frame, although the mcc overlay was listed
+  first (mcc / draw-mesh owner); DXGI format 17 vertex input 1 a frame; conservative raster 0.2-1 a frame.
+- Boot with the tier on: every boot of this tree (10 of 10) passed the 32-bit reservation (0xe68e0000 in fcpu-a: close
+  to the top). Its own archive started empty; fr10-c..g carried a 4 GB own archive. The pool-default worker holds a
+  low range for it now.
+
+### 4. Frames/s and the per-frame breakdown (M; pool off; per frame = per-submission values x submissions / frames)
+
+| | fcpu-b +30 s (combining off) | fcpu-a +30 s | fcpu-h +30 s | fcpu-a +120 s | fcpu-h +120 s |
+|---|---:|---:|---:|---:|---:|
+| frames/s (5 s windows) | 2.8-3.0 | 3.0-3.2 | 3.0-3.2 | 3.4-3.6 | 3.2-3.6 |
+| submissions/s | 103-107 | 108-114 | 111-115 | 128-136 | 126-131 |
+| submit CPU, ms a frame (summed over threads): heaps / shadows / textures / replay | 267-306 / 68 / 51-52 / 44-45 | 354-394 / 58-59 / 34-39 / 38-40 | 237-291 / 57-64 / 37-41 / 38-41 | 235-237 / 52-57 / 34-36 / 33 | 196-238 / 52-60 / 33-37 / 31-35 |
+| heap refresh inside the lock / lock wait, ms a submission | (not split) | 5.2 / 5.7 | 4.7 / 2.6 | 3.2 / 3.1 | 3.3 / 2.6 |
+| of it, live V# re-fixes (all live V#s after a release/invalidation) | | | 0.73 ms a refresh (7 runs / 10 s, ~475k slots each) | | 0.76 ms (14 runs) |
+| GPU any queue busy, ms a frame (%) / direct queue | | 168 (54%) / 153 | 181 (56%) / 163 | 198 (69%) / 178 | 192 (65%) / 172 |
+
+- Load 3-8 at the starts, nothing else heavy running in these windows; pool off (`physical pool 8 GiB`), tier on.
+  fcpu-a's `heaps` includes its verify snapshots (38 MiB copied under the heap lock every 64th arrival in that build)
+  and 1 s dispatch-timing windows; fcpu-h is the clean run. fcpu-b has neither but its old code splits nothing.
+  The live V# re-fixes are 0.73-1.19 ms of every refresh on average and every one of the ~100-180 ms "heaps (max)"
+  spikes (pool-default worker owns that block: re-fixing only slots under an invalidated range is the next cut).
+- fcpu-h ran with the rect fix (5): 0 dropped submissions (fcpu-a: 405), wired max 8.6 GiB (fcpu-a 8.9), frame rate
+  unchanged.
+
+### 5. Found on the way (M)
+
+- **~1 held ExecuteCommandLists a frame was dropped whole** with the tier on: `rect cpu_rewrite: vertex buffer is not
+  CPU visible` (port/metal) fails the encoder, the list does not close, the whole submission is lost (fcpu-a 405 in 130
+  s of world; fcpu-b 119). `metal_replay.cpp` `bind_draw_state` now skips such a direct rect-list draw alone (fate
+  "vertex buffer unknown"), default on, `GTA6RT_METAL_RECT_SKIP_ALONE=0` = old behaviour. fcpu-h and fcpu-i (final
+  build): 0 dropped, 1 direct rect-list draw a frame skipped alone, 0 GPU errors, wired max 8.6 / 7.4 GiB. port/metal owner: the CPU expansion should read a GPU-only vertex buffer some other way, and a per-draw
+  failure should not fail the encoder.
+- My 06:44 note blamed the rect fix for the 10.25-10.47 GiB wired stops of fcpu-d/-e/-e2/-f; wrong (07:01
+  correction): the title pool had become the default in the shared xmem; with `GTA6RT_METAL_TITLE_POOL=0` wired peaks
+  at 8.4-8.6 GiB.
+- Presented world frame from fcpu-a (pool off: no G-buffer geometry, so not a milestone of mine; the lit-frame worker
+  holds the three milestone PNGs): `/Users/a/Desktop/Projects/GTA-VI/port/run/present/fcpu-a/present_002101.png`,
+  world+~90 s: sky, clouds, sea and a flat coast under the HUD (money, minimap, a phone message), washed out to white
+  like lit-c's frame; no buildings (the pool is off).
+
+### Switches added
+
+`GTA6RT_METAL_HEAP_COMBINE` (default on), `GTA6RT_METAL_HEAP_COMBINE_VERIFY=N` (off), `GTA6RT_METAL_SKIP_REPORT`
+(default on), `GTA6RT_METAL_FORCE_SKIP=name,...` (debug, off), `GTA6RT_METAL_RECT_SKIP_ALONE` (default on). Log lines
+every 10 s: `console heap refreshes (combined)`, `console heap live V# re-fixes`, `compute skipped by pipeline`.
+
+### Next (ranked)
+
+1. GPU: the direct queue is 153-182 ms of a 290-330 ms frame and grows; time the world's direct-queue passes
+   (`GTA6RT_METAL_DISPATCH_TIMING=all` for compute; render passes have no timer yet).
+2. Heap: re-fix only the live V#s an invalidated / released range reaches (0.7-1.2 ms a refresh plus the spikes); then
+   the changed-slot fixes (~7,000 slots, 2-4 ms a refresh) are what is left; the 16-entry design needs shaders that
+   stop reading the arena copy raw.
+3. Name the irradiance counter reset (not the five 1-thread passes); with the tier on it runs, so this is only for
+   cold starts.
+4. split64 mesh rows still refused for threadgroup memory (20-24 draws a frame) with the mcc overlay first.
+
+
+## Round 11, rt-alias worker (2026-11-27 06:07-07:15): slot-133 render targets share placement heaps — render targets 2,073 -> 1,007 MiB, machine wired at world entry -1.3 GiB; on by default
+
+Tree `build/rtal-x86_64` (`-build1..7.log`), launcher `build/rtal-x86_64/run_world.sh` (s7_world_run.sh with this tree,
+the tmem probe lock, a memory report every 10 s), wired watch `build/rtal-x86_64/wired_guard.sh` (kills the run past
+10 GiB machine wired). Every run alone (slot + probe lock), hidden window, imported save, `GTA6RT_METAL_CB_ABORT_MS=2000`,
+`GTA6RT_METAL_ARCHIVE_TIERS=off`, tmem+mcc+overrides+uint overlay (lead 06:15), cap 14,848 for world runs (no
+prepare_shaders/build running at their start; load 5-8). **0 GPU errors, 0 failed command buffers, gpuEvent-gta6rt 9
+before / 9 after every run (7 runs).** M = printed by a log or a tool, I = inferred.
+
+### What is built (`src/metal_rt_alias.h`, device shim, replay)
+
+- **Lifetimes from the title's own placement (the Vulkan path's patch 10, ported):** at registration
+  (`register_title_texture` -> `Resource::note_title_pages`) a slot-133 GPU-written 2D target's title bytes are resolved
+  to VM-object runs (`mach_vm_page_info` per 64 KiB). Two targets whose runs overlap by >= 64 KiB (or half the smaller)
+  alias: the console cannot hold both, so the title never has both live. Candidates: slot-133, GPU-written (RT, depth
+  or UAV-with-RT usage), 2D/2D array, not CPU-visible; colour, **depth (Metal places depth in heaps, unlike MoltenVK)**
+  and MSAA alike.
+- The Metal texture waits for its first use (replay `ensure`, a UAV view, or `image()`), as deferred title textures do
+  (SRVs written meanwhile are bound then). The first use of a group lays out an extent from every registered unplaced
+  target connected to it by aliasing, largest first, each at the lowest offset where it overlaps only its aliases;
+  one `MTLHeapTypePlacement` heap (untracked; the backend's barriers already order placed resources) per extent, charged
+  to "render targets". Later targets fit into their aliases' extent or seed their own. Freed members stay in the layout
+  as tombstones, so a non-alias never lands on memory whose GPU work may still run. A target Metal refuses to place
+  gets a private texture zeroed as before.
+- **Load actions / hand-over check (replay, `note_alias_uses`):** every command's use of an aliased target is noted
+  before it is recorded: draws, clears, copies, resolves (direct uses); transitions/enhanced barriers (to a read state
+  = read, to UAV = write, **out of a write state = it was written**, which covers compute writes through descriptors;
+  discard / from-undefined / aliasing barrier = fresh). A target is "not its own" after an overlapping alias wrote
+  since its last write. A non-fresh use then (a draw that loads, a UAV pass, a read) is counted; at a target's first
+  use it is zeroed (a committed target starts zeroed), otherwise nothing is copied (console semantics).
+  `GTA6RT_METAL_RT_ALIAS_POISON=1` clears such a target to **magenta** (depth 0.5, stencil 0x5a) before the use instead,
+  so a wrong assumption shows in the frame.
+- Report line with every memory report: `[rt] gpu-memory aliases t=..`: candidates, used, depth/MSAA, never-read
+  depth/MSAA, UNORM/sRGB twins, alias groups and the largest-first layout now, placed / extents / title bytes, uses,
+  reads and loads after a hand-over or before any write, fresh hand-overs, poisoned, zeroed.
+- Switches: **on by default** since 07:09; `GTA6RT_METAL_RT_ALIAS=0` private textures as before, `=census` only
+  registers and counts; `GTA6RT_METAL_RT_ALIAS_POISON=1`.
+
+### Runs (M)
+
+| run | binary | settings | world at | end | render targets (ledger) | footprint world entry -> +151 s | machine wired world entry / max (gov.) |
+|---|---|---|---:|---|---:|---|---|
+| rtal-census | build3 | census, menus/movie 65 s | - | watchdog | 2,072 | - | - |
+| rtal-on-a | build4 | on, menus/movie | - | watchdog | 1,005 | - | - |
+| rtal-poison-a | build5 | on + poison, menus/movie | - | watchdog | - | - | - |
+| rtal-world-a | build5 | on, first hand-over model | +86 s | watchdog, 65 s of world | 1,030 | 9,445 -> 11,860 | 5,140 / 6,130 (pool path older) |
+| **rtal-world-off** | build6 | `GTA6RT_METAL_RT_ALIAS` unset (then off), pool on (new default) | +92 s | watchdog, 59 s of world | **2,073** | **10,466 -> 13,562** | **8,250 / 9,579** |
+| **rtal-world-pz** | build6 (same) | on + poison | +91 s | watchdog, 60 s of world | **1,007** | **9,468 -> 12,730** | **6,932 / 8,817** (watch: 9,547 peak) |
+| rtal-world-def | build7 | nothing set (default on) | +82 s | watchdog, 69 s of world | 1,017 | 9,574 -> 12,368 | 6,900 / 8,746 (watch: 9,001 peak) |
+
+- **A/B, same binary (off vs pz):** render targets -1,066 MiB; footprint at world entry -998 MiB, at +151 s -832 MiB;
+  graphics ledger at world entry 3,585 -> 2,498 MiB; machine wired at world entry -1,318 MiB. Layout (pz, t=125 s): 999
+  targets (1,279 MiB of textures) in 389 extents of 781 MiB over 626 MiB of title memory; 0 refused, 0 "no room", 0
+  pages moved. The design note's estimate was -0.8 to -1.1 GiB.
+- No world run ended on the cap (13.6 GiB at most); all three world runs ran to the 150 s watchdog.
+- rtal-world-a's binary predates the pool-default worker's changes (pool path imported 770 MiB vs 2,588), so it is not
+  in the A/B.
+
+### Proof that the title's use allows it (M)
+
+- **Menus (frame hashes):** every present dump up to the movie (frames 1-1051, every 30th) is byte-identical between
+  census (= today's textures) and alias on, and between census and **alias on + poison**. Movie frames differ by index
+  in every run (timing), viewed: intact. Only 3 slot-133 targets are used before the world, so this is a weak test.
+- **World (poison run, 60 s of world):** reads after a hand-over 0, loads after a hand-over 0, reads before any write 0;
+  **3,518 hand-overs, every one started with a clear, discard or barrier from undefined**; 34 first uses were draws
+  without a clear (poisoned there; zeroed in the default mode: 38 in rtal-world-def). No flat magenta in any G-buffer
+  dump (`run/present/rtal-world-pz-scene/scene_*`; gbuffer1/gbuffer3's own purple normals/material colours are in the
+  off run too) or presented frame. Default-mode run (def): the same 0/0/0, 4,460 fresh hand-overs.
+- Not proven: shader reads through descriptors with no barrier at all are not seen; scene colour was 0 in these dumps
+  (lighting pipelines still compiling, lit-frame worker's 06:40 note), so lit output under aliasing has not been looked
+  at; the first model (rtal-world-a) counted 564 "loads after hand-over" because it took a transition *to* RT as a
+  write and missed writes before a barrier; corrected before pz/def.
+
+### The other two items
+
+- **Memoryless depth/MSAA:** not built. Measured candidates: MSAA 1 target (0 MiB); depth/MSAA targets never read in
+  60-69 s of world: 9-10 targets, 41-43 MiB (332 depth targets, 226 MiB in all). Memoryless needs proof at creation
+  that a target never outlives a pass, which nothing gives us; at most ~0.04 GiB, and the depth targets now share heaps.
+- **UNORM/sRGB pairs:** none on the Metal path: 0 slot-133 targets share pages with another of the same shape and a
+  different format (census "twins 0" in every run), and other UNORM/sRGB views are Metal texture views
+  (`pixel_format_view`), not second textures. Nothing to drop.
+
+### Files
+
+`d3d12_metal/src/metal_rt_alias.h` (new); `src/metal_context.h` (`MetalBinding::alias_watch`); `src/metal_replay.cpp`
+(`Replay::run` one call, `note_alias_uses`, `clear_alias_target`); `shims/d3d12_metal_device.cpp` (`Resource::create_texture`
+candidate branch, `image()`, `back_title_texture` (no in-place for candidates), `make_deferred_texture` ->
+`make_alias_texture`, `note_title_pages`, destructor, members; `DeviceState::rt_alias`; one call in
+`register_title_texture`; `report_rt_alias`). port/metal unchanged (its `create_heap` / `create_placed_texture` were
+enough). Logs `run/logs/rtal-*.log` (+ `.wired`, `.wired.trace`), dumps `run/present/rtal-*`.
+
+### Next
+
+1. Look at a lit frame with aliasing on vs `GTA6RT_METAL_RT_ALIAS=0` once the lighting pipelines are warm (poison on).
+2. Tighter packing: 781 MiB of extents for 626 MiB of title memory (Metal's textures are larger than the console's);
+   the transient pool is the bulk.
+3. The ~320 MiB of render targets that are committed (not slot-133) cannot alias by title pages; a frame-graph view
+   of D3D12 placed heaps would be needed.
+
+## Round 11, lit-frame worker (2026-11-27 06:07-06:45): albedo, a lit scene colour and the presented world frame; what stops each
+
+Tree `build/lit-x86_64` (`-build1..12.log`; its `build.ninja` compiles `metal_replay.cpp` with `-include mach/mach.h`
+because the live `metal_rt_alias.h` does not compile there, see the requests file 06:21), private launcher
+`build/lit-x86_64/run_world.sh` (tpool's, plus the tmem probe lock, the cap picked by the lead's rule, and a machine-wired
+watch that ends the run). Runs `lit-a..e`, each alone (slot polled), hidden window, imported save (the title loads it at
+boot), `GTA6RT_METAL_TITLE_POOL=1 GTA6RT_VM_BASE_HINT=0x2000000000 GTA6RT_METAL_TITLE_POOL_CHUNK_MB=4`, the tmem + mcc +
+msl-overrides + uint overlays, 14,848 MiB cap (no heavy job at any start), `GTA6RT_METAL_CB_ABORT_MS=2000`, load 3.6-6.6.
+**0 command-buffer failures, 0 GPU page faults; gpuEvent-gta6rt in /Library/Logs/DiagnosticReports 9 before and 9 after
+every run.** M = measured (log, dump), I = inferred.
+
+**Every run was ended by my machine-wired watch, not by the footprint cap (M):** lit-a 10,350 MiB at world+~17 s, lit-b
+10,261 at world+~9 s (pipeline prebuild on), lit-c 10,423 at world+~24 s, lit-d **11,240** at world+~10 s (the 1 s poll
+saw it 1 GiB late; the watch now polls 4 times a second and stops at 9,728), lit-e 9,932 before the world
+(13,312 cap, a build was running; fill budgets 320/128 MiB, pool cap 1,280 MiB: no dump). In each, wired is 7.9-9.0 GiB at world
+entry and then the graphics ledger steps +1.4-1.9 GiB within a few seconds (lit-c: 3,781 -> 5,694 MiB, wired 7,942 ->
+9,974), with the tmem overlay loaded (8 rows replace the store's). That step, plus the pool chunks (1.0-2.3 GiB wired),
+is what limits every world run to its first ~15 s now.
+
+### Milestone images (one per milestone, the first reached)
+
+1. **G-buffer with albedo:** `/Users/a/Desktop/Projects/GTA-VI/port/run/present/lit-c-gbuffer-albedo.png` (lit-c,
+   upscaled frame 6, target 0 `f29` R8G8B8A8_SRGB 1280x720): **18.2% of texels non-zero** (tpool-h: 11.1%). Textured:
+   palms, bushes, the wooden dock, one wall's siding, a far apartment block, sand. **Wrong:** house walls, roofs,
+   ground and water are still black (their textures are streamed in part and get no Metal texture within the budget,
+   below); the sand has magenta blotches (one of the textures made from a title T#, layout not verified).
+2. **Lit scene colour:** `/Users/a/Desktop/Projects/GTA-VI/port/run/present/lit-a-first-lit-scene-colour.png` (lit-a,
+   upscaled frame 10, `f10` 1280x720): 91.8% non-zero: sky and clouds, the stilt houses, poles, decks, with cast
+   shadows. **Wrong:** grossly over-exposed (channel means 500-1,000, max 65,300 = the fp16 limit; the probe's own tone
+   map saturates), surfaces lit as near-white since most albedo is missing, a black rectangle top left (a tile block
+   with no light). Same in lit-c frames 4-12 (94.8-95.9% non-zero, means 170-600).
+3. **Presented window frame of the world:** `/Users/a/Desktop/Projects/GTA-VI/port/run/present/lit-c-first-world-present.png`
+   (lit-c present 1845, 1920x1080, after MetalFX, the title's post chain and the UI): the same lot through the whole
+   chain, **washed out to white/pale blue** (the over-exposure above survives tone mapping); 100% of pixels non-black.
+
+### 1. Why the albedo is black (M, `GTA6RT_METAL_TEXTURE_CENSUS=1`, lit-b/c/d in the world)
+
+- **The bulk is slot-133 textures streamed in part:** ~1,900-2,000 slot-133 textures, **3.8-4.0 GiB of console layout**,
+  layout given by a slot-70 view, named by T#s, never filled: they "wait for readable memory" because only the first
+  64-128 KiB of their range is mapped. Examples: 0x785fa10000 (1,441,792 B) mapped to +0x10000; 0x7800010000
+  (5,636,096 B) to +0x20000; the rest is reserved (VirtualQuery `MEM_RESERVE`, and the title pool backs none of it).
+  addrlib lays the mip tail and the small mips out first (offset 0) and mip 0 last, so the title has mapped the pages
+  of the levels it has streamed (partial residency; I: the T#'s MIN_LOD keeps sampling on them, and the layer's views
+  already honour MIN_LOD). This is not a backing problem: **the pool route found 0 textures to unlock** (VirtualQuery
+  and `title_pool_view` agree everywhere; the GPU-only window is mapped read/write for the layer already).
+- A few (4-8 a run) 8 MiB textures miss only their last page: our layout's span is 0x7F8000, the title mapped 127
+  pages (I: our mip-tail size differs from the console's by 32 KiB).
+- **T#s that name no texture in the title windows** (0x78-0x7a): 64,000-70,000 a run; of 4,096 sampled, ~2,800 name pool
+  memory no texture was created or viewed over (textures the title knows only by T#s it writes itself) and ~1,300
+  point inside a registered texture's range.
+- Images made for slot-70 views: ~17,000 filled (~470 MiB) — these are what was textured before.
+- Not the cause: null descriptors from slot 70 (tpool-h: 20,129 "no address" views of 94,866: the title passes address 0) are a minority;
+  sampler and swizzle were not found at fault (not checked per draw: the material T#s come from a bindless table
+  indexed by a material constant, `s_load_dwordx8 s[44:51], s[18:19], s41` in `PS_DeferredTextured_c5fd36bb`).
+
+### 2. Changes (all opt-in; off = the previous paths) — `shims/d3d12_metal_device.cpp` registry, `src/metal_context.*`, `src/metal_present.cpp`
+
+- `GTA6RT_METAL_TEXTURE_CENSUS=1`: every 10 s, the registry by state / layout source / 4 GiB region / T# views / why a
+  waiting texture waits (VirtualQuery and pool at its first byte, a fresh probe, the first unreadable offset for 6),
+  the sampled T# addresses with no texture, and the counters below (`log_texture_census`).
+- `GTA6RT_METAL_TEXTURE_POOL_READABLE=1` (`title_texture_readable`): a texture the pool backs entirely is readable; one
+  whose last page (< 64 KiB) is unmapped is read with zeros there; **one streamed in part fills the levels wholly in its
+  mapped prefix** (`TitleTexture::resident_mip`, `short_tail`; the fill skips the levels above). Measured: 876 textures
+  streamed in part made fillable in lit-d (0 through the pool route, 4-8 with a missing last page).
+- `GTA6RT_METAL_FILL_TSHARP_TEXTURES=1` (+`_MB`): a deferred texture a title-written T# names is queued for a fill
+  (`bind_title_image` -> `take_tsharp_wanted`): 167-249 queued until the budget, 3,400-4,000 more over it.
+- `GTA6RT_METAL_TSHARP_TEXTURES=1` (+`_MB`, default 512): a T# in the title windows over pool memory with no texture
+  gets a texture made from the T# (format, extent, mips, layers, word-3 swizzle mode) and filled (`make_orphan_textures`).
+  1,362-1,454 made (83-85 MiB); 10,000+ refused as overlapping a registered texture. **All decoded swizzle mode 0
+  (linear): not verified against the console; possibly the sand's blotches.**
+- `GTA6RT_METAL_TITLE_BACK_MB`: cap on Metal textures made for deferred title textures at their fill (over: the texture
+  stays deferred and is not visited again). lit-c 384 MiB used, 343 textures (508 MiB) refused; lit-d 512 used, 914
+  (1,743 MiB) refused.
+- Scene probe: `GTA6RT_METAL_SCENE_PASSES` (pass-log length, default 600 as before); the G-buffer is now the render-size
+  target set with the most draws in the frame (it used to be the last set with the most targets, which picked a
+  full-screen pass or an alpha prepass in lit-a); a 1x1 target drawn by a `*Exposure*` pass is read back with the dump
+  (`exposure1x1`; lit-e, the only run with it, ended before the world). `GTA6RT_METAL_WORLD_PRESENT_DUMP=dir,every,count`: presented frames once the
+  probe has seen an upscaled frame, with the share of non-black pixels.
+
+### 3. One frame's passes, G-buffer to present (M, lit-c upscaled frames 2/6/12, 3,000-pass log)
+
+- Order: G-buffer (~5,000 mesh draws into `f29|f28|f28|f28|f34|f28` + D32S8) -> cascade shadows (640x2560) -> ... ->
+  **TiledLighting 180 rect-list draws (`TL_PS_PBR_*`) + SSSResolve 12** into the `f10` colour and an `f42` target ->
+  AlbedoFreeLuminance downsample -> `PS_CompositeIndirectDrawBlend` (TileGridDefaultPass) -> luminance downsamples ->
+  **`PS_ResetExposure` into a 1x1 `f2` target every frame** (`PS_CalculateExposure` ran once, frame 2) -> bilateral grid
+  -> MetalFX (input = the `f10` colour, ffxDispatch log) -> `PS_CompositeNMB` into `f24` 1920x1080 -> CopyDithering.
+- **Why the earlier dumps had scene colour 0:** the lighting pipelines were still compiling in the first world frames
+  with `GTA6RT_METAL_PCACHE=0` (lit-c frame 2: TiledLighting 180 draws, 0 recorded; frame 6 on: 180 of 180; composite
+  recorded from frame 6). With the prebuild on (lit-b) the run hit the wired watch at world entry, so not measured.
+- Not resolved: the over-exposure (colour means in the hundreds: the exposure ResetExposure writes, or the light units;
+  the new `exposure1x1` readback is the next look), `gbuffer5` all 0 with alpha 1, the red-dominant noisy normal target
+  (`f28`, mean r 0.51 g 0.26 b 0.25: encoding not decoded), the black tile block top left.
+
+### Next (ranked)
+
+1. Memory before anything else: the +1.4-1.9 GiB graphics-ledger step at world+5-10 s (still there with the tmem
+   overlay) and the pool chunks put every run at 10 GiB wired by world+15 s.
+2. Streamed-in-part textures at their resident size: a Metal texture of the resident levels only (views offset by the
+   dropped levels, re-made when the title maps more), or Metal sparse textures mapped per level; full-size textures for
+   3.8 GiB of layout do not fit.
+3. Verify the swizzle mode of title-built T#s (word 3 bits 20-24 read 0 for every one) before trusting
+   `GTA6RT_METAL_TSHARP_TEXTURES`.
+4. Exposure: read the 1x1 target (`exposure1x1`) and the ResetExposure constants.
+
 ## Round 10, title-pool worker (2026-11-27 05:00-06:10): zero-copy GPU backing of title memory (`GTA6RT_METAL_TITLE_POOL=1`) — the G-buffer and depth get the world's geometry with no copy and no 64 MiB budget
 
 Tree `build/tpool-x86_64` (`-build1..10.log`), private launcher `build/tpool-x86_64/run_world.sh` (s7_world_run.sh with
