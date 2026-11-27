@@ -15,6 +15,17 @@ Preliminary (this section is rewritten at the end of the task). Translator copy 
 2,048 groups, best of 5, load 3-5): `--fold-waterfalls` on `+MS_VS_PropFoliageDeferred_7cf79608_Wrapped~8`: 382 -> 262
 switch cases, zero-heap path 5.84 -> 4.48 us a group, 0 of all output words differ (3 inputs).
 
+## Round 13, compute-speed worker (port/d3d12_metal, 2026-11-27 11:20-13:10): the mspeed passes on library compute kernels
+
+Details: `d3d12_metal/STATUS.md`, round 13 compute-speed (continued). New files here: `tools/cspeed_overlay.py`
+(compute rows from the store recipe + merge_typed_reads / fp_inline / hash_memo / simd_votes / ...),
+`tools/cspeed_ab.mm` (`--shared-writes`), `tools/cspeed_capcfg.py`, `tools/cspeed_encprobe.mm`. Measured: on captured
+inputs every variant is bit-identical (0 words differ; verdicts for 01903/01905/01919/01921/01315, none for
+00977/00974/01267: they write nothing on those inputs); chain_segments / round_counts_simd / barrier_tg_only do not
+apply to these kernels; in the world the "all" variant (merge + fp_inline + hash_memo) makes 01905 +48%, 01903 +50%,
+00977 +29..56% slower a dispatch, the rest within run-to-run spread. So merge_typed_reads is a memory pass, not a speed
+pass, on compute; nothing default. Overlay of 3 verified, not slower rows: `build/cspeed-x86_64/overlay.tsv`.
+
 ## Round 12, mesh-speed worker (2026-11-27 09:06-11:20): exact MSL passes on the translated mesh and pixel shaders; world G-buffer geometry -30%, fragment -58% a frame (same binary, pass timer)
 
 Tree `port/build/mspeed-x86_64`. M = measured (probe, tool or title log), I = inferred. Offline GPU jobs through

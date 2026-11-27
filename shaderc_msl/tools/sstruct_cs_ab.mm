@@ -212,6 +212,24 @@ int main(int argc, char** argv) {
             nonzero += res[0][i] != 0 && res[0][i] != 0xDEADBEEFu;
         }
         std::printf("RESULT words %zu differ %zu changed_by_A %zu nonzero_A %zu\n", res[0].size(), diff, changed, nonzero);
+        {
+            size_t tex_words = 0;
+            for (size_t s : sizes) tex_words += s;
+            Run r0;
+            setup(r0, cfg, seed);
+            const size_t heap_words = r0.heap.length / 4;
+            const size_t sink_lo = tex_words + heap_words - 64, sink_hi = tex_words + heap_words;
+            size_t outside = 0, shown = 0, changed_out = 0;
+            for (size_t i = 0; i < res[0].size(); ++i) {
+                const bool sink = i >= sink_lo && i < sink_hi;
+                if (!sink && res[0][i] != before[i]) ++changed_out;
+                if (res[0][i] == res[1][i] || sink) continue;
+                ++outside;
+                if (shown++ < 8) std::printf("DIFF %zu A %08x B %08x\n", i, res[0][i], res[1][i]);
+            }
+            std::printf("SINK texture words %zu heap words %zu; differ outside the sink %zu; changed_by_A outside the sink %zu\n",
+                        tex_words, heap_words, outside, changed_out);
+        }
         if (reps) {
             for (int k = 0; k < 2; ++k) {
                 Run r;

@@ -14,6 +14,7 @@ corpus translation against the fork's on the offline mesh probe (outputs bit-com
   sstruct.py manifest OUT.txt OVERLAY.tsv... MANIFEST...          pipelines of MANIFESTs that use an overlay's rows
   sstruct.py pert WORK NAME --edit "OLD=>NEW" [--trace-input fol_a] [--flags=...]
                                                                   exactness on an edited program (fork A vs fork B)
+  sstruct.py abcap WORK library/NAME [--flags=...] [--reps N]     compute A/B on the title captures (cspeed_ab)
   sstruct.py div WORK NAME SPEC.json INPUTNAME                    input with lane-varying descriptor words: SPEC's
                                                                   heap, table filled with the keys a trace saw
   sstruct.py overlay OUT [NAME...] [--names-file F] [--flags=...] overlay rows (mspeed/cspeed layout) of the fork
@@ -179,7 +180,7 @@ def safe_cs(msl):
 CS_AB = os.path.join(TREE, "probe", "gta6rt_sstruct_cs_ab")
 
 
-def ab_cs(work, name, flags, seeds, groups, threads, reps):
+def ab_cs(work, name, flags, seeds, groups, threads, reps, layout="safe"):
     os.makedirs(work, exist_ok=True)
     tag = hashlib.sha256(name.encode()).hexdigest()[:10]
     fork_dir = os.path.join(work, "spv-" + tag)
@@ -204,14 +205,17 @@ def ab_cs(work, name, flags, seeds, groups, threads, reps):
     for seed in seeds:
         cfg = os.path.join(work, "%s.seed%d.json" % (tag, seed))
         r = subprocess.run([sys.executable, "-I", os.path.join(HERE, "tmem_abcfg.py"), libs["a"][1], cfg, "--seed", str(seed),
-                            "--groups", groups, "--threads", threads, "--layout", "safe"], capture_output=True, text=True)
+                            "--groups", groups, "--threads", threads, "--layout", layout, "--heap-mib", "32"],
+                           capture_output=True, text=True)
         if r.returncode != 0:
             raise RuntimeError("abcfg: " + r.stderr[-400:])
         r = subprocess.run([SLOT, CS_AB, libs["a"][0], libs["b"][0], cfg, "--time", str(reps)], capture_output=True, text=True)
         line = {"rc": r.returncode}
         for l in r.stdout.splitlines():
-            if l.startswith("RESULT"):
-                line["result"] = l
+            if l.startswith(("RESULT", "SINK")):
+                line.setdefault("result", []).append(l)
+            elif l.startswith("DIFF"):
+                line.setdefault("diff", []).append(l)
             elif l.startswith("TIME"):
                 line.setdefault("time", []).append(l)
             elif "error" in l:
@@ -559,6 +563,49 @@ def prebuild_manifest(out, overlays, sources):
     return len(lines), len(names)
 
 
+CSPEED_AB = os.path.join(TREE, "probe", "gta6rt_sstruct_cspeed_ab")
+CAPS = os.path.join(PORT, "build", "cspeed-x86_64", "cap2")
+
+
+def ab_cs_cap(work, name, flags, reps, shared_writes=True):
+    """Compute A/B on the compute-speed worker's title captures (GTA6RT_METAL_CS_CAPTURE files, cspeed_capcfg.py,
+    cspeed_ab.mm): A = corpus + CS_PASSES, B = fork + CS_PASSES, every writable texture and the heap compared."""
+    os.makedirs(work, exist_ok=True)
+    tag = hashlib.sha256(name.encode()).hexdigest()[:10]
+    fork_dir = os.path.join(work, "spv-" + tag)
+    translate(fork_dir, [name], flags)
+    head, rows = P.manifest_rows()
+    row = rows[name]
+    ra = build_cs(work, CORPUS, name, row, CS_PASSES)
+    rb = build_cs(work, fork_dir, name, row, CS_PASSES)
+    res = {"name": name, "flags": flags, "lib_a": ra["metallib"], "lib_b": rb["metallib"], "caps": {}}
+    msl_a = os.path.join(work, tag + ".a.metal")
+    open(msl_a, "w").write(msl_of(ra))
+    caps = sorted(f for f in os.listdir(CAPS) if f.startswith(name.replace("/", "_") + "_") and f.endswith(".cap"))
+    for c in caps:
+        prefix = os.path.join(work, "%s.%s" % (tag, c[:-4]))
+        r = subprocess.run([sys.executable, "-I", os.path.join(HERE, "cspeed_capcfg.py"), msl_a, os.path.join(CAPS, c), prefix],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            res["caps"][c] = {"error": "capcfg: " + (r.stdout + r.stderr)[-300:]}
+            continue
+        cmd = [SLOT, CSPEED_AB, ra["metallib"], rb["metallib"], prefix + ".json", "--time", str(reps)]
+        if shared_writes:
+            cmd.append("--shared-writes")
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        out = {"rc": r.returncode, "lines": [l for l in r.stdout.splitlines() if l.startswith(("RESULT", "TIME", "DETERMINISM", "RUN"))
+                                              or "error" in l.lower()][:12]}
+        res["caps"][c] = out
+        for ext in (".heap", ".table"):
+            try:
+                os.remove(prefix + ext)
+            except OSError:
+                pass
+        if r.returncode != 0:
+            break
+    return res
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("cmd")
@@ -573,6 +620,7 @@ def main():
     ap.add_argument("--trace-input", default=None, help="pert: fill the table with the keys A looks up on this input")
     ap.add_argument("--cs-groups", default="4,4,1")
     ap.add_argument("--cs-threads", default="8,8,1")
+    ap.add_argument("--cs-layout", default="safe", choices=["safe", "small"])
     a = ap.parse_args()
     flags = [f for f in a.flags.split(",") if f]
     if a.cmd == "spv":
@@ -580,8 +628,11 @@ def main():
     elif a.cmd == "lib":
         for n in a.rest[2:]:
             print(json.dumps(build_lib(a.rest[0], a.rest[1], n)))
+    elif a.cmd == "abcap":
+        print(json.dumps(ab_cs_cap(a.rest[0], a.rest[1], flags, a.reps)))
     elif a.cmd == "abcs":
-        r = ab_cs(a.rest[0], a.rest[1], flags, [int(x) for x in a.seeds.split(",")], a.cs_groups, a.cs_threads, a.reps)
+        r = ab_cs(a.rest[0], a.rest[1], flags, [int(x) for x in a.seeds.split(",")], a.cs_groups, a.cs_threads, a.reps,
+                  a.cs_layout)
         print(json.dumps(r))
     elif a.cmd == "overlay":
         names = list(a.rest[1:])

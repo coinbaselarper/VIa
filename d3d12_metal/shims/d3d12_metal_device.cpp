@@ -10099,15 +10099,15 @@ void note_tsharp_wanted(const void* title_address) {
 // these words, as write_image_descriptor does. Every field the layer does not encode (tiling, compression,
 // performance hints) only makes the key differ, so a title-built T# still finds its texture. Checked against the
 // texture first: a view of mips, layers or a dimension it lacks would be an invalid Vulkan view.
-// GTA6RT_METAL_TSHARP_2D_LAYERS=1: a title-built T# of a 1D or 2D (not array) type is decoded with word 4's array
-// fields (DEPTH, BASE_ARRAY) cleared. A sample through such a T# carries no slice, and the title keeps other data
+// GTA6RT_METAL_TSHARP_2D_LAYERS (on; =0 off): a title-built T# of a 1D or 2D (not array) type is decoded with word 4's
+// array fields (DEPTH, BASE_ARRAY) cleared. A sample through such a T# carries no slice, and the title keeps other data
 // there (measured: 2, 0x47521000, 0xc518dc00 on 2D BC7/BC1 T#s), which gfx10::decode reads as a layer range: "T# names
 // layers the texture lacks", or no T# at all when that range runs backwards. The words stay the lookup key.
 std::atomic<std::uint64_t> g_tsharp_2d_layers_cleared{0};
 bool decode_title_tsharp(const leonida::gfx10::ImageWords& words, leonida::gfx10::Image& image) {
     static const bool on = [] {
         const char* v = std::getenv("GTA6RT_METAL_TSHARP_2D_LAYERS");
-        return v && *v == '1';
+        return !v || std::strcmp(v, "0") != 0;
     }();
     const std::uint32_t type = words[3] >> 28;
     constexpr std::uint32_t kArrayFields = 0x1fffu | (0x1fffu << 16);
@@ -12302,14 +12302,15 @@ private:
         return true;
     }
 
-    // GTA6RT_METAL_TSHARP_WORKER=1: textures for title-built T#s are made (make_orphan_textures) and given their first
-    // fill on a worker of ours instead of in the submitting thread's refresh pass (1.5 ms a pass there), in slices of
+    // GTA6RT_METAL_TSHARP_WORKER (on; =0 off): textures for title-built T#s are made (make_orphan_textures) and given
+    // their first fill on a worker of ours instead of in the submitting thread's refresh pass (1.5 ms a pass there), in
+    // slices of
     // GTA6RT_METAL_TSHARP_SLICE_US (4000) with the registry lock released between them. Their Metal textures are shared,
     // so a fill is a CPU write of the worker's (no queue work).
     static bool tsharp_worker_on() {
         static const bool on = [] {
             const char* v = std::getenv("GTA6RT_METAL_TSHARP_WORKER");
-            return v && *v == '1';
+            return !v || std::strcmp(v, "0") != 0;
         }();
         return on;
     }
@@ -13262,7 +13263,7 @@ private:
         const auto limit = slice.count() ? slice : pass_budget;
         static const bool inside_ok = [] {
             const char* v = std::getenv("GTA6RT_METAL_TSHARP_INSIDE");
-            return v && *v == '1';
+            return !v || std::strcmp(v, "0") != 0;
         }();
         const auto start = std::chrono::steady_clock::now();
         for (std::size_t i = 0; i < orphans.size(); ++i) {
@@ -13346,9 +13347,9 @@ private:
                 return true;
             };
             // Textures made for earlier T#s over these bytes go (the title reuses its pool); any other registered
-            // texture there keeps them. GTA6RT_METAL_TSHARP_INSIDE=1: a registered title-filled texture that starts
-            // below the T#'s address does not keep its bytes from it; the title's own T# there says its used levels
-            // end before it (the title packs streamed textures behind the resident levels of another).
+            // texture there keeps them. GTA6RT_METAL_TSHARP_INSIDE (on; =0 off): a registered title-filled texture
+            // that starts below the T#'s address does not keep its bytes from it; the title's own T# there says its
+            // used levels end before it (the title packs streamed textures where another's unused levels lie).
             std::vector<std::uint64_t> older;
             bool inside = false;
             const auto blocked = [&]() -> const char* {
@@ -13440,12 +13441,12 @@ private:
         return false;
     }
 
-    // GTA6RT_METAL_TSHARP_ZERO_CHECK=1: the first 64 KiB of the largest level a T# names, read from the title's memory,
-    // are all zero.
+    // GTA6RT_METAL_TSHARP_ZERO_CHECK (on; =0 off): the first 64 KiB of the largest level a T# names, read from the
+    // title's memory, are all zero.
     bool base_floor_bytes_zero(const rt::xg_xs::Texture& layout, std::uint32_t level, std::uint64_t address) {
         static const bool on = [] {
             const char* v = std::getenv("GTA6RT_METAL_TSHARP_ZERO_CHECK");
-            return v && *v == '1';
+            return !v || std::strcmp(v, "0") != 0;
         }();
         if (!on || level >= layout.layout.mips) return false;
         const auto& mip = layout.layout.plane[0].mips[level];

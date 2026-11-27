@@ -514,6 +514,11 @@ gta6rt_status gta6rt_vm_release(void* allocation_base) {
     return GTA6RT_OK;
 }
 
+namespace {
+bool query_locked();
+gta6rt_status kernel_query(uintptr_t page, uintptr_t next, gta6rt_vm_region* out);
+} // namespace
+
 gta6rt_status gta6rt_vm_query(const void* addr, gta6rt_vm_region* out) {
     if (!out) return GTA6RT_E_INVALID_ARG;
     memset(out, 0, sizeof *out);
@@ -539,9 +544,25 @@ gta6rt_status gta6rt_vm_query(const void* addr, gta6rt_vm_region* out) {
         }
         auto nit = g_regions->upper_bound(page);
         if (nit != g_regions->end()) next = nit->first;
+        if (query_locked()) return kernel_query(page, next, out);
     }
-    // Memory outside the region table is asked of the kernel without the vm lock: under contention the lock held
-    // across mach_vm_region serialised every VirtualQuery caller (3x fewer queries a second with 6 threads).
+    return kernel_query(page, next, out);
+}
+
+namespace {
+
+// Memory outside the region table is asked of the kernel without the vm lock: under contention the lock held
+// across mach_vm_region serialised every VirtualQuery caller (3x fewer queries a second with 6 threads).
+// GTA6RT_OS_VM_QUERY_LOCKED=1 keeps the lock across it (the old behaviour).
+bool query_locked() {
+    static const bool on = [] {
+        const char* e = getenv("GTA6RT_OS_VM_QUERY_LOCKED");
+        return e && *e == '1';
+    }();
+    return on;
+}
+
+gta6rt_status kernel_query(uintptr_t page, uintptr_t next, gta6rt_vm_region* out) {
     {
         mach_vm_address_t ra = page;
         mach_vm_size_t rs = 0;
@@ -574,6 +595,8 @@ gta6rt_status gta6rt_vm_query(const void* addr, gta6rt_vm_region* out) {
         return page >= 0x800000000000ull ? GTA6RT_E_INVALID_ARG : GTA6RT_OK;
     }
 }
+
+} // namespace
 
 gta6rt_status gta6rt_vm_alias(void* dst, const void* src, size_t size, uint32_t prot) {
     if (!size || ((uintptr_t)dst | (uintptr_t)src | size) & (host_page() - 1)) return GTA6RT_E_INVALID_ARG;
