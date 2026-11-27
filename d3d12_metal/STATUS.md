@@ -1,5 +1,115 @@
 # port/d3d12_metal status (round 7)
 
+## Round 9, draw/mesh worker (2026-11-27 03:45-04:55): why the G-buffer mesh draws draw nothing, named for one draw; no geometry yet
+
+Tree `build/d3m-s4-x86_64` (`-build47..55.log`), runs `d3m-s9-a..k` with `tools/s7_world_run.sh` (private run dir),
+each alone on the machine (slot polled, 2 collisions backed off), load 2.3-8, hidden window, B from +100 s, the lead's
+13 GiB footprint cap, stop at the first GPU error. **0 GPU timeouts, 0 GPU page faults, 0 failed command buffers in 11
+runs; gpuEvent-gta6rt reports in /Library/Logs/DiagnosticReports: 9 before, 9 after (0 new).** Measured = printed by a
+log, the ISA or a tool; inferred = reasoning.
+
+### 1. One draw, named (measured): `_MS_VS_TransformD_c5fd36bb_Wrapped` (G-buffer, with `PS_DeferredTextured_*`)
+
+- **What the shader does** (RDNA2 ISA, `spike/s2-make-game/work/shaders/dxbc/disasm/_MS_VS_TransformD_c5fd36bb_Wrapped.s`
+  lines 21-46, 171-190): `s_load_dwordx4 s[32:35], s[44:45], 0x80` with s44 = s17 = user data 9 (a descriptor table)
+  loads the **meshlet-header V#**; each meshlet's 16-byte record gives vertex count = `(dword3 & 0x7f) + 1` and
+  primitive count = `((dword3 >> 7) & 0x7f) + 1` (`s_and_b32 0x7f`, `s_bfe_u32 0x70007`, `+1`; per lane
+  `buffer_load_dwordx2 ... offset:12`). A header that reads 0 therefore gives 1 vertex and 1 primitive.
+- **On the GPU** (debug variant, registers at the output-count message, d3m-s9-b/-d/-i): m0 = 0x1001 (1 vertex,
+  1 primitive), s[32:35] = `00000000 00000000 00000000 30014fac` (a raw-buffer V# with base 0 and 0 records), the
+  primitive's three indices 0,0,0 (a point-sized degenerate triangle), positions finite and inside the clip volume
+  (e.g. `(7.207 16.43 0.1496 29.29)`); the paired instrumented `PS_DeferredTextured_*` variants count **0 pixel
+  invocations**. Over all instrumented variants of the family: 11,071 groups, 11,622 primitives (d3m-s9-d), i.e. ~1
+  primitive per meshlet. Culling, depth state, viewport and pass are not the cause: the backend's mesh pipeline line
+  for that draw reads `rts 6 (f29..), depth f20 test 1 write 1 func 7, cull 3 front_ccw 1 depth_clip 1, viewport
+  0,0 1280x720 [0,1], scissor 0,0-1280,720, pass 1280x720, object 1 mesh 128x1x1`; a degenerate triangle covers no
+  sample whatever the state.
+- **Where the null header comes from** (record-time copies, new, `GpuDebug::note_table_slot`): when replay records
+  each indirect mesh draw of the base variant, the 16 bytes at user data 9 + 0x80 in the arena copy *and* in the
+  title's own descriptor heap: **354 of 354 null** (`00000000 00000000 00000000 30014fac` in both; d3m-s9-i). So the
+  GPU reads exactly what the title's heap holds when the draw is submitted — not a stale arena copy, not a ring reuse,
+  not a layer rewrite. With every `Create*View` that wrote no-records recorded and followed through `CopyDescriptors`/
+  `CopyDescriptorsSimple`, **none** of these slots traces back to a layer view of unbacked memory (0 provenance
+  hits), so the title writes that null raw-buffer descriptor into the slot with its own code (or copies it there with
+  its own memcpy; inferred: the meshlet-header buffer it would name does not exist yet for those draws; what the title
+  waits for is not identified).
+- **The other variants** (85% of the family's records have a non-null header V# at record time, d3m-s9-d/-e): the V#
+  is a slot-70 "SRV of placed memory" of the title's 185 MiB 32-bit region (e.g. title 0xef006300, stride 16, 22
+  records) rewritten to its slot-133 window's shader VA (0x1b1f6300; the same holds for the stride-96 buffer in
+  s[36:39]: the title asks for 0xf6b8af00 = 1400 x 96 B, the V# carries 0x2208af00). The CPU reads at that title
+  address `00000000 00000000 3f800000 3f800000 | bf800000 x4`: dword 3 = 1.0f, whose low 14 bits are 0, so also
+  1 vertex / 1 primitive per meshlet (inferred from the CPU view; the GPU-side read of those variants was not captured:
+  the world phase ended at the 13 GiB cap 6-15 s in, before they ran, d3m-s9-j/-k).
+- So: **the G-buffer mesh draws rasterise nothing because every meshlet they emit is one degenerate triangle: the
+  meshlet header they read is a null V# the title wrote (base variant) or 16-byte records whose packed counts are 0
+  (other variants).** Indirect arguments are fine (no count buffer, no record past the caps; the records with groups carry
+  1-18 x 1 x 1, the rest are zero, as GPU culling leaves them), the producer guard records them, the render pass and targets are the G-buffer's.
+
+### 2. Fixed on the way (measured)
+
+- **Arena keep-out by our own VA reservation.** The shared title-memory probe took each 1 MiB chunk the module
+  reserves at registration for a guest allocation (`gta6rt_vm_query` answers RESERVE for a no-access mapping:
+  `title memory probe: 0x66c0000 is in a guest allocation [0x6600000, 0x6700000)`), so the arena kept out of 1 MiB
+  "title" ranges (`41.35 MiB free (title 21.00 MiB ... longest gap 1.00 MiB)`) and from world entry refused every
+  buffer over 1 MiB (19 in d3m-s8-m). `platform/register_metal.cpp` now installs a Metal probe after the shared one
+  that answers "no title memory" for a reserved chunk (`... is the arena's VA reservation, no title memory`, 65,536+
+  answers a run); `GTA6RT_METAL_ARENA_PROBE=shared` restores the old one. Every keep-out line since: `title 0.00 MiB`.
+- **Arena 384 MiB by default** (`create_arena` + the registration reservation; `LEONIDA_ARENA_MB` wins). With 256 MiB
+  the world filled it for real (252.8 MiB: buffers 129, descriptor heaps 102, shaders 22) and 35 world buffers were
+  refused in 10 s, each after 16 blocks outside the arena whose shader VA overlapped the title's memory, all kept:
+  560 set-aside blocks, Metal "other" 91 -> 2,710 MiB (d3m-s9-a; the memory worker's 04:20 note owns that path). With
+  512: 0 refusals, 0 set-asides, peak 327 MiB (d3m-s9-b), but one boot found no room below 4 GiB for the title's
+  185 MiB 32-bit reservation (`xmem: 32-bit reservation ... refused`, int3 at exe+0x19f4f58). 384 (d3m-s9-c..k):
+  peak 325 MiB, 0 refused, 0 set aside.
+- **Stop at the first GPU error by default** (lead's rule 3; port/metal `mtl_queue.mm` completion handler): a command
+  buffer failing with its own error (page fault included) makes the device lost, so the layer reports and exits 3.
+  `GTA6RT_METAL_GPU_ERRORS=continue` goes on after a page fault as before.
+- **`GTA6RT_METAL_CB_ABORT_MS`** (opt-in, `InFlight::watch`): a command buffer running that long ends the process
+  (`_Exit(5)`) with its encoders named, before Metal's watchdog. It ended d3m-s9-f at 2,007 ms (below).
+- `tools/s7_world_run.sh`: `GTA6RT_METAL_FOOTPRINT_CAP_MB=13312` unless the caller sets it.
+
+### 3. Task items
+
+- **Producer guard narrowed** (round 8, default `GTA6RT_METAL_INDIRECT_GUARD=producers`): with warm pipelines
+  (d3m-s8-m, tier prebuild) indirect mesh 4,433 a frame, 4,380 recorded; indirect dispatch 841, 841 recorded; the
+  guard skipped 1-192 compute passes a frame. With the prebuild off (my 13 GiB runs) the census is dominated by
+  "pipeline compiling" (d3m-s9-b +92 s: indirect mesh 7,551 / recorded 1,862 / compiling 3,999 / guard 1,633;
+  indirect dispatch 1,115 / recorded 14 / compiling 1,021).
+- **Warm archive**: the cache worker's tier is looked up by default; its bounded prebuild costs ~0.7-1 GiB in the first
+  world seconds (d3m-s9-c: Metal "other" 1,017 MiB, cap 3 s into the world), so my runs used `GTA6RT_METAL_PCACHE=0`
+  (lookups only).
+- **Threadgroup override manifest**: on by default since round 8 (`build/d3d12_metal-msl-overrides`, 118 rows; the
+  uint overlay loads after it). Measured this round: threadgroup refusals 5.4 a frame (one 36,056-byte shader left);
+  the largest refusal class is now `XPC_ERROR_CONNECTION_INTERRUPTED` (MTLCompilerService dying: 47-59 indirect mesh
+  draws a frame).
+
+### 4. Tried and stopped (measured)
+
+- d3m-s9-f, `GTA6RT_METAL_VSHARP_TITLE_FIRST=soft` limited to the title's first low allocation
+  (`GTA6RT_METAL_VSHARP_SOFT_RANGE=18000000-1f000000`, in-place windows `=soft`): 32+ ambiguous V#s (104-byte constant
+  ranges) rebased to in-place windows, then a direct-queue command buffer (`lib_cs_01208`, `lib_cs_03138` x5,
+  `lib_cs_01467` x2, `lib_cs_01449`, `lib_cs_01144 .. 01123`) ran past 2 s and the abort switch ended the run 12 s into
+  the world, before any timeout. Same family of spins as d3m-s8-e/-g: compute passes fed partly corrected inputs run
+  unbounded. Not repeated.
+- The world phase under the 13 GiB cap lasts 3-28 s (footprint 10.1-11.8 GiB at world entry, +2.2-2.8 GiB in the next
+  10 s, mostly the title pool becoming resident), too short for most instrumented variants to run.
+
+### Next (ranked)
+
+1. Why the title writes a null meshlet-header V# (base variant) / why the header records carry no counts (others):
+   trace the title's own descriptor writes into the user-data-9 tables (a write watch on one table page of the console
+   heap, naming the title code address) and the producer of the 16-byte meshlet records at the slot-70 addresses.
+2. Backing title memory without copies or ambiguity (lead's 03:58/04:15 notes: pool-backed XMemVirtualAlloc, one
+   bytesNoCopy buffer per pool, translation at the consumer) — the soft rebase shows partial fixes make compute spin.
+3. A loop cap in translated compute shaders (shaderc_msl), so experiments that make data more correct cannot spin.
+
+### Switches added this round
+
+`GTA6RT_METAL_ARENA_PROBE=shared`, `GTA6RT_METAL_GPU_ERRORS=continue`, `GTA6RT_METAL_CB_ABORT_MS`; debug only:
+`GpuDebug` record-time header snapshots and copy-tracked unbacked slots (with `GTA6RT_METAL_GPU_DEBUG=1`),
+`tools/msl_instrument.py --regs-if N` (dump only groups whose sN is non-zero; the dump now reads the first 4 words at
+the bases of s[32:35], s[36:39], s[44:47], s[48:51] when their records are non-zero).
+
 ## Round 8, gates worker (2026-11-27 02:15-03:10): no command buffer waits on the GPU any more — 0 GPU timeouts in 313 s of world; the pool-node fault did not recur; frame time is GPU-bound
 
 Tree `build/gates-x86_64` (new; attach.cmake super-build, `-build1..4.log`), launcher `build/gates-x86_64/run_world.sh`

@@ -29,7 +29,7 @@ sys.path.insert(0, HERE)
 import mesh_tg_pack as P  # noqa: E402
 
 R = P.R
-VERSION = "msl_instrument 1"
+VERSION = "msl_instrument 2"
 
 
 def cas_meta(row, stage):
@@ -180,13 +180,14 @@ def register_dump(msl, only_if=None):
         ind + "        gta6rt_r[192] = gl_WorkGroupID.x; gta6rt_r[193] = gl_NumWorkGroups.x; gta6rt_r[194] = %s;" % store.group(3),
         ind + "        for (uint gta6rt_k = 0u; gta6rt_k < 32u; ++gta6rt_k) gta6rt_r[196u + gta6rt_k] = %s._m0[gta6rt_k];" % push,
         ind + "        gta6rt_r[228] = %s._m1; gta6rt_r[229] = %s._m2;" % (push, push),
-        ind + "        for (uint gta6rt_q = 0u; gta6rt_q < 2u; ++gta6rt_q)",
+        ind + "        const uint gta6rt_at[4] = { 32u, 36u, 44u, 48u };",
+        ind + "        for (uint gta6rt_q = 0u; gta6rt_q < 4u; ++gta6rt_q)",
         ind + "        {",
-        ind + "            uint gta6rt_lo = %s[32u + gta6rt_q * 4u], gta6rt_hi = %s[33u + gta6rt_q * 4u] & 65535u;" % (sg.group(1), sg.group(1)),
+        ind + "            uint gta6rt_lo = %s[gta6rt_at[gta6rt_q]], gta6rt_hi = %s[gta6rt_at[gta6rt_q] + 1u] & 65535u;" % (sg.group(1), sg.group(1)),
         ind + "            ulong gta6rt_b = (ulong(gta6rt_hi) << 32ul) | ulong(gta6rt_lo);",
-        ind + "            if (gta6rt_b == 0ul) continue;",
+        ind + "            if (gta6rt_b == 0ul || %s[gta6rt_at[gta6rt_q] + 2u] == 0u) continue;" % sg.group(1),
         ind + "            device const uint* gta6rt_m = reinterpret_cast<const device uint*>(%s + ulong(long(gta6rt_b << ulong(16u)) >> long(16u)));" % hb,
-        ind + "            for (uint gta6rt_k = 0u; gta6rt_k < 8u; ++gta6rt_k) gta6rt_r[232u + gta6rt_q * 8u + gta6rt_k] = gta6rt_m[gta6rt_k];",
+        ind + "            for (uint gta6rt_k = 0u; gta6rt_k < 4u; ++gta6rt_k) gta6rt_r[232u + gta6rt_q * 4u + gta6rt_k] = gta6rt_m[gta6rt_k];",
         ind + "        }",
         ind + "    }",
         ind + "}",

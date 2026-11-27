@@ -1310,14 +1310,15 @@ std::string GpuDebug::take_report() {
                 std::snprintf(t, sizeof t, "\n    user data %d = 0x%x: ", k, r[196 + k]);
                 out += t + describe_va(r[196 + k]);
             }
-        for (int q = 0; q < 2; ++q) {
-            const std::uint64_t base = (std::uint64_t(r[33 + q * 4] & 0xffff) << 32) | r[32 + q * 4];
-            if (!base) continue;
-            std::snprintf(t, sizeof t, "\n    the GPU reads at the base of s[%d:%d] (0x%llx):", 32 + q * 4, 35 + q * 4,
+        static const int at[4] = {32, 36, 44, 48};
+        for (int q = 0; q < 4; ++q) {
+            const std::uint64_t base = (std::uint64_t(r[at[q] + 1] & 0xffff) << 32) | r[at[q]];
+            if (!base || !r[at[q] + 2]) continue;
+            std::snprintf(t, sizeof t, "\n    the GPU reads at the base of s[%d:%d] (0x%llx):", at[q], at[q] + 3,
                           static_cast<unsigned long long>(base));
             out += t;
-            for (int k = 0; k < 8; ++k) {
-                std::snprintf(t, sizeof t, " %08x", r[232 + q * 8 + k]);
+            for (int k = 0; k < 4; ++k) {
+                std::snprintf(t, sizeof t, " %08x", r[232 + q * 4 + k]);
                 out += t;
             }
         }

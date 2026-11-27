@@ -2864,6 +2864,19 @@ struct DeviceState {
         if (unbacked_slots.size() > (1u << 20)) unbacked_slots.clear();
         unbacked_slots[slot] = {target, bytes};
     }
+    void note_copied_slots(std::uint64_t destination, std::uint64_t source, std::uint64_t count) {
+        if (!context || !context->gpu_debug()) return;
+        std::lock_guard lock(unbacked_slot_mutex);
+        for (std::uint64_t i = 0; i < count; ++i) {
+            const auto it = unbacked_slots.find(source + i * kDescriptorSize);
+            if (it != unbacked_slots.end()) {
+                const auto value = it->second;
+                unbacked_slots[destination + i * kDescriptorSize] = value;
+            } else {
+                unbacked_slots.erase(destination + i * kDescriptorSize);
+            }
+        }
+    }
     static inline thread_local bool soft_in_place = false;
     // Under GTA6RT_METAL_GPU_DEBUG: the first 24 V# bases in GTA6RT_METAL_VSHARP_SOFT_RANGE, with what the rules found.
     bool vsharp_trace(uint64_t base) {
@@ -12008,8 +12021,11 @@ public:
                 s_at = 0;
             } else {
                 std::memmove(reinterpret_cast<std::uint8_t*>(destinations[d].ptr) + std::size_t(d_at) * kDescriptorSize,
-                             reinterpret_cast<const std::uint8_t*>(sources[s].ptr) + std::size_t(s_at++) * kDescriptorSize,
+                             reinterpret_cast<const std::uint8_t*>(sources[s].ptr) + std::size_t(s_at) * kDescriptorSize,
                              kDescriptorSize);
+                state_.note_copied_slots(destinations[d].ptr + SIZE_T(d_at) * kDescriptorSize,
+                                         sources[s].ptr + SIZE_T(s_at) * kDescriptorSize, 1);
+                ++s_at;
                 state_.probe_api(destinations[d].ptr + SIZE_T(d_at++) * kDescriptorSize, 1);  // LOCAL DIAGNOSTIC
             }
         }
@@ -12021,6 +12037,7 @@ public:
         if (!destination.ptr || !source.ptr) return;
         std::memmove(reinterpret_cast<void*>(destination.ptr), reinterpret_cast<const void*>(source.ptr),
                      std::size_t(count) * kDescriptorSize);
+        state_.note_copied_slots(destination.ptr, source.ptr, count);
         state_.probe_api(destination.ptr, count);  // LOCAL DIAGNOSTIC
         state_.probe_view("CopyDescriptorsSimple", destination.ptr, count);
     }
