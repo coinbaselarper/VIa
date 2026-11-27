@@ -1,5 +1,139 @@
 # port/d3d12_metal/cache: pipeline cache for the native Metal path (status)
 
+## Round 7 (2026-11-26 22:35 - 11-27 02:00): shards, the world recorded, a half-built world tier, why pipelines are slow
+
+Host as below; load average 6-50 during this round (other workers' titles and compiles; noted per number). Trees:
+`build/pc7-x86_64` (super-build, title), `build/pc7-cache-x86_64` (prepare_shaders, pso_probe, tests),
+`build/pc7-metal-x86_64` (backend tests). Runs: `cache/tools/pc7_run.sh` (imported save, private run dir
+`build/pc7/rundir` reset from a template each run, no audio, hidden window, FSR4 compute PSOs refused for GPU safety),
+logs `run/logs/pc7-*.log`, archive dirs `build/pc7/arch-rec` (cold run) and `build/pc7/arch-world` (the world tier).
+
+### 1. Archive shards (port/metal, done, tested)
+
+- The cache is a set of files per key, `gta6rt-<key>-<tag>-<n>.metalarchive` + `.key` (tag = the title phase at write
+  time, or the phase prepare_shaders is building). All shards with the key are loaded at open; the old single file
+  is read too if its `.key` has a content line.
+- A flush seals the in-memory archive (swap under a short lock), serialises it with **no lock a compile needs**,
+  re-opens the `.tmp` to verify, writes `.key` (key + size + content hash), then `link()`s it under a new name: a
+  written shard is never overwritten (not on a failed write, a stale key, or a torn file). The verified file replaces
+  the in-memory archive in the lookup list, so the added binaries leave memory.
+- **Metal's reader crashes on a damaged archive** (SIGSEGV in `deserializeBinaryArchiveHeader` on a truncated file,
+  measured), so a shard is handed to Metal only when size and content hash match its `.key`; otherwise it is moved to
+  `.unreadable`. Hashing 809 MB of shards at open: 2.2 s.
+- Size cap: writers flush before a shard's estimate passes 150 MB (`GTA6RT_METAL_PCACHE_SHARD_MB`); prepare_shaders
+  also starts a new shard at each phase. Largest shard written: 71.6 MB; none failed (MDB_MAP_FULL was at ~180 MB).
+- In the title: `pcache::flush_archive` no longer waits for an idle compile queue (old 120 s deferral meant runs
+  under 120 s never wrote anything: the shared archive was last written at 18:49 although seven S4 runs compiled
+  700-1,100 world pipelines each); the recorder also flushes when 64 pipelines are pending. pc7-rec-a wrote 14 shards
+  in its 248 s, 0.12-0.47 s each, 0 failures, compiles running throughout.
+- Tests: `pcache_archive_test` rewritten (cold, warm, a new shard beside an old one, other translator, failed write
+  into a read-only directory, stale key, torn shard, 14 async compiles with a flush every 5 ms, then all 14 hit):
+  PASS; `pcache_codec`, `pcache_runtime` PASS; port/metal `pipeline_cache_cold/warm/warm2/async` PASS (Metal's
+  per-user cache off).
+
+### 2. The world recorded (done)
+
+The S4 worker's seven world runs (20:58-21:48) had already recorded 294-1,376 world first uses each into the shared
+manifest (they reached 0.5-22 s of the world). My cold run pc7-rec-a (current live sources, recorder on, private
+directory seeded with that manifest, no archive) ran **176 s in the world without a fault** (ended by the 16 GiB
+footprint guard). `cache/tools/world_list.py` merges the per-run files by time since each run's world start:
+**1,628 pipelines in the world's first 60 s**, first-use order in `build/pc7/lists/world-60.tsv` / `.specs`:
+775 in the first second, 555 in 1-5 s, 138 in 5-10 s, 116 in 10-30 s, 44 in 30-60 s; 856 compute, 354 mesh, 418 render.
+In 176 s the run first-used 1,918 distinct pipelines. The world now issues 4,000-6,500 commands a frame (round 6's
+census: ~480).
+
+### 3. The world tier offline, and warm runs (partly done)
+
+prepare_shaders (resumable; `--title-jobs N` limits it while any gta6rt runs) on the 60 s list into
+`build/pc7/arch-world`, plus the cold run's own 14 shards linked in: 40 shards, **812 MB**, covering about 770 of the
+1,628 (the first ~1 s of the world, which is the list's order) when the round ended. Time: 556 real compiles,
+2,098 s of build time summed (median 0.39 s, p90 6.5 s, longest 265 s: `library/lib_cs_02653` at load 40-50); the
+second half stalled for ~1.5 h while the machine's load was 40-50 (1 pipeline in 106 min; the backend test run at the
+same time took 11 min instead of 4 s, so Metal's compiler service was starved, not the tool). Resume:
+`build/pc7-cache-x86_64/prepare_shaders --specs build/pc7/lists/world-60.specs --archive-dir build/pc7/arch-world --jobs 3 --title-jobs 2`.
+Opening all 40 shards in a process: +35-39 MiB footprint, 2.2 s.
+
+| run (world at) | archive | world+1 s: first uses / handed over ready / not ready | world+3-5 s | skipped as compiling | longest first-use stall | end |
+|---|---|---|---|---|---|---|
+| pc7-rec-a (+71.7 s) | none (manifest only) | 459 / 123 / 336 | +5 s: 1,204 / 123 / 1,079 queued | world+1..11 s: 3,047 a frame, 39,611 in all (13 presents) | 163 s (`lib_cs_00975`) | footprint guard, world+176 s |
+| pc7-warm-a (+73.1 s) | 30 shards (tier ~45 %) | 493 / 387 / 107 | +3 s: 935 / 388 / 548 | world+2..12 s: 1,017 a frame, 7,121 in all (7 presents) | 104 s (`lib_cs_02731`) | title SIGSEGV exe+0xfec056d2bd, world+169 s |
+| pc7-warm-b (+72.9 s) | 40 shards (tier ~47 %), large-build cap | 707 / **621** / 27 | +3 s: 1,188 / 621 / 507 | world+3 s window: 15.5 a frame, 1,953 | 2.2 s (`lib_cs_01694`) | title access violation exe+0x4e9b54a, world+6 s |
+
+So with the tier built, the world's first second is served almost entirely from it (621 of 707 handed over ready, 27
+not ready); everything after it that is not in the tier yet (the unfinished half) still compiles cold, at about 2
+pipelines/s on 3 threads. The three runs are at different load (rec-a 7-11, warm-a 12-15, warm-b 11-21). Both
+warm-run crashes are in title code and not in cache code as far as the logs show (requests file).
+
+### 4. Why the "65-158 s" world pipelines (measured, `cache/tools/pso_probe.mm`, one process per variant)
+
+- **They are the library compute kernels (`library/lib_cs_*`, 0.02-2.1 MB metallibs), not the 7 huge named kernels**
+  (RTShadowTrace32*, ShadowRenderTiledCascades*, ScreenProbes_Activate*: 9-25 MB SPIR-V, 339-486 s, ray tracing; none
+  of the 1,918 recorded world pipelines is one of them). The library kernels have no content-key twin among named
+  shaders.
+- **Most of the old 65-158 s was not compile time**: prepare_shaders timed "in flight" (created to ready) with 6 in
+  flight on 3 threads, so small kernels queued behind big ones (`lib_cs_00964`, 45 KB: 153 s in flight, **0.16 s**
+  to build); and with Metal's per-user cache off every miss was compiled **twice**: the archive add after a compile
+  recompiles (cold: `lib_cs_01056` 20.1 s + add 20.2 s; `lib_cs_00962` 41.1 s + 42.3 s; `lib_cs_02865` 2.0 + 2.0 s).
+  With the per-user cache on, the add costs 1-2 ms (`lib_cs_02200`, `lib_cs_01500`). The report now has the build
+  time (`compile_seconds`) beside the in-flight time.
+- Real cold build times: 0.16 s (45 KB) .. 2 s (280 KB) .. 20-24 s (1.1-1.3 MB) .. 41 s (2.1 MB): it scales with the
+  AIR size. **No function constants** in any of them (0 per function), so no specialisation at pipeline time;
+  **reflection costs nothing measurable** (`lib_cs_02539`: 24.3 s without, 22.4 s with BindingInfo|BufferTypeInfo).
+  The time is Metal's AIR -> GPU code generation.
+- `metal-tt -arch applegpu_g16s` on a pipeline script builds the same kernel's binary offline in 32 s wall (24 s CPU),
+  i.e. the same compiler cost, off-GPU; its output missed at run time for our descriptor (key mismatch, not
+  resolved). So the reductions available are: build them once into shards (this), and in the translator, smaller
+  AIR (shaderc_msl's `noinline_hot_helpers` kind of pass) for the 1-2 MB ones; not pipeline options.
+
+### 5. Priority and concurrency (port/metal compile queue; partly measured)
+
+- Demanded before background (as before), now with a **background cap** (threads-1; 1 during story load and world)
+  so a demanded build always finds a worker, a **large-build cap** (libraries >= 512 KiB: at most threads-1 at once,
+  smaller builds of the same priority go first; `GTA6RT_METAL_COMPILE_LARGE`, `_LARGE_KB`), and **QoS per priority**
+  (demand user-initiated, background utility; XPC carries it to MTLCompilerService). The recorder's prebuild puts every
+  recorded pipeline before any bootstrap guess, and in the first 10 s of the world (its opening cutscene;
+  `GTA6RT_METAL_PCACHE_QUIET_S`) starts only recorded pipelines of the current phase.
+- Frame rate against compiler processes (pc7-warm-a, world+40..130 s, 15 s steps of cold `prepare_shaders --jobs 1`
+  processes beside it, load 12-15; `cache/tools/compile_load.sh`, `load_fps.py`):
+
+| extra compiler processes | 0 | 1 | 2 | 3 (utility QoS) | 3 (default QoS) | 0 |
+|---|---|---|---|---|---|---|
+| frames/s (two 5 s windows) | 1.29 | 1.28 | 1.02 | 1.16 | 1.49 | 1.46 |
+
+  Within noise. The world runs at 1.0-1.6 frames/s here because of the layer's per-submission CPU work (~40
+  submissions a frame, `heaps` 7.5-10.6 ms each, 57-70% of the wall time in submission), so this does not show what
+  3 compilers do to a 20-25 frames/s world; compile threads stay at 3.
+- Not done: a cutscene signal (only the world's first seconds are treated as one); a fast lane for archive hits
+  queued behind cold builds.
+
+### 6. Memory
+
+- The cache's own cost: shards open +35-39 MiB (812 MB of files). Held prebuilt pipelines: the warm run's footprint
+  was +340-370 MiB above the cold run's on the first-run pages and story load and +270 MiB at the world's start
+  (10,775 vs 10,502 MiB); those pipelines are the world's own first-second set, which the cold run creates seconds
+  later, so the world-phase peak is not raised by it (warm-a peak 15,899 MiB at +178 s; cold rec-a ended at the 16 GiB
+  guard). Not proven pipeline by pipeline.
+- The descriptor hash table (not my area, request in `run/requests/d3d12_metal.md`): **29 live generations, 1,162 MiB**
+  in pc7-rec-a at slow frame rates (8 live, 320 MiB in warm-a). Proposed: a cap with a bounded wait, then exact
+  per-queue release marks instead of the 100 ms settle.
+
+### Files (this round)
+
+`port/metal`: `include/gta6rt_metal/gpu.h` (additive fields), `metal_backend.h` (`set_compile_limits`,
+`set_pipeline_cache_tag`), `src/mtl_pipeline.mm` (archive section, compile queue, pipeline cost), `src/mtl_internal.h`,
+`src/mtl_device.mm` (library byte size). `cache/src/pcache.cpp`, `cache/include/pcache.h`, `cache/tests/archive_test.cpp`,
+`cache/CMakeLists.txt`, `d3d12_metal/tools/prepare_shaders.cpp`, new `cache/tools/{pc7_run.sh, world_list.py,
+compile_load.sh, load_fps.py, census_skips.py, pso_probe.mm}`. No adapter file (`shims/`, `src/`) touched.
+
+### Next (ranked)
+
+1. Finish the world tier (command above; about 860 cold builds, ~30-60 min on a quiet machine), then one warm run.
+2. Hash-table generations (request) and the layer's per-submission `heaps` cost: they decide the world's footprint
+   and frame rate far more than the cache.
+3. Compaction (rebuild many small run shards into few) and a lane for archive hits behind cold builds.
+4. Smaller AIR for the 1-2 MB library kernels (shaderc_msl), or resolve metal-tt's key mismatch.
+
+
 Date 2026-11-26. Host: Apple M4 Pro (`applegpu_g16s`), macOS 27.0.1 (26A434), x86_64 title process under Rosetta.
 Every number was measured on this machine today with other workers' title runs and builds going on (load average
 10-45; the load is given beside each number). Title runs are this module's binary

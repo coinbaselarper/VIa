@@ -234,11 +234,13 @@ private:
                              static_cast<unsigned long long>(j.frame.id), why.c_str());
             counters().failed.fetch_add(1);
         }
-        id<MTLTexture> dump_in = nil, dump_out = nil;
+        id<MTLTexture> dump_in = nil, dump_out = nil, dump_depth = nil, dump_motion = nil;
         const std::uint64_t ran = counters().ran.load() + 1;
         if (ok && !dump_dir_.empty() && (ran == dump_at_ || (dump_every_ && ran > dump_at_ && (ran - dump_at_) % dump_every_ == 0))) {
             dump_in = MetalUpscaler::encode_readback(cb, j.color, in.render_w, in.render_h);
             dump_out = MetalUpscaler::encode_readback(cb, j.output, in.output_w, in.output_h);
+            if (j.depth) dump_depth = MetalUpscaler::encode_readback(cb, j.depth, in.render_w, in.render_h);
+            if (j.motion) dump_motion = MetalUpscaler::encode_readback(cb, j.motion, in.render_w, in.render_h);
         }
         const std::uint64_t n = j.n;
         const std::uint32_t slot = j.slot;
@@ -289,6 +291,11 @@ private:
                 std::fprintf(stderr, "[upscale] dumped frame %llu: %s%s (%s; %s), %s%s (%s; %s)\n",
                              static_cast<unsigned long long>(frame), dir.c_str(), a, w1 ? "ok" : "FAILED", s1.c_str(),
                              dir.c_str(), c, w2 ? "ok" : "FAILED", s2.c_str());
+                std::string s3, s4;
+                if (dump_depth) MetalUpscaler::write_png(dir + "/upscale-last-depth.png", dump_depth, &s3);
+                if (dump_motion) MetalUpscaler::write_png(dir + "/upscale-last-motion.png", dump_motion, &s4);
+                std::fprintf(stderr, "[upscale] frame %llu inputs: depth %s; motion %s\n",
+                             static_cast<unsigned long long>(frame), s3.c_str(), s4.c_str());
             }
         }];
         [cb commit];

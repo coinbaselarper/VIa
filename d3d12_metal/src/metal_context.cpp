@@ -814,7 +814,7 @@ bool SceneProbe::hdr_format(std::uint32_t f) { return f == 2 || f == 10 || f == 
 void SceneProbe::draw(const Target* rts, std::uint32_t count, const Target& depth, const char* pipeline,
                       const char* kind, bool recorded) {
     std::lock_guard lock(mutex_);
-    const std::string name = pipeline ? pipeline : "";
+    const char* name = pipeline ? pipeline : "";
     if (logging_ && passes_.size() < 600) {
         Pass* last = passes_.empty() ? nullptr : &passes_.back();
         const auto same = [&](const Pass& p) {
@@ -847,7 +847,7 @@ void SceneProbe::draw(const Target* rts, std::uint32_t count, const Target& dept
         if (count >= gbuffer_count_) {
             gbuffer_count_ = std::min<std::uint32_t>(count, 8);
             for (std::uint32_t i = 0; i < gbuffer_count_; ++i) gbuffer_[i] = rts[i];
-            gbuffer_by_ = name;
+            if (gbuffer_by_ != name) gbuffer_by_ = name;
             if (depth.id && render_size(depth)) gbuffer_depth_ = depth;
         }
         return;
@@ -855,7 +855,7 @@ void SceneProbe::draw(const Target* rts, std::uint32_t count, const Target& dept
     for (std::uint32_t i = 0; i < count; ++i)
         if (rts[i].id && render_size(rts[i]) && hdr_format(rts[i].format)) {
             hdr_ = rts[i];
-            hdr_by_ = name;
+            if (hdr_by_ != name) hdr_by_ = name;
         }
     if (!gbuffer_depth_.id && depth.id && render_size(depth)) gbuffer_depth_ = depth;
 }
@@ -1071,7 +1071,7 @@ void SceneProbe::write_readback(Readback& r) {
 
 void SceneProbe::finish_readbacks(bool all) {
     for (auto it = readbacks_.begin(); it != readbacks_.end();) {
-        if (!all && frame_ < it->frame + 4) {
+        if (!all && frame_ < it->frame + 2) {
             ++it;
             continue;
         }

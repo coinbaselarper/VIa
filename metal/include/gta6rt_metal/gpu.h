@@ -964,6 +964,9 @@ struct CompileQueueStats {
     std::uint64_t stolen = 0;                  // taken off the queue by a wait() on the caller's thread
     std::uint64_t running_background = 0;
     std::uint32_t active_limit = 0, background_limit = 0;  // set_compile_limits
+    std::uint64_t running_large = 0;                    // builds of libraries >= GTA6RT_METAL_COMPILE_LARGE_KB (512)
+    std::uint32_t large_limit = 0;                      // at most this many at once (GTA6RT_METAL_COMPILE_LARGE)
+    std::uint64_t large_passed = 0;                     // times a smaller build went ahead of a waiting large one
 };
 
 // ---- device ----

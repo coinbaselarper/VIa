@@ -1,5 +1,20 @@
 # gta6rt_metal status (S5.1, round 2)
 
+## Round 7 additions (made by port/d3d12_metal; api_version stays 5, all additive)
+
+- `PresentPlane::tone_exposure` (> 0): the plane is HDR linear colour, drawn as 1 - exp(-c * exposure), sRGB encoded,
+  alpha 1, by a compose pipeline compiled from MSL source at first use (`mtl_present.mm`); the adapter's diagnostic
+  scene present uses it.
+- Command-buffer budget (`mtl_queue.mm`, `GTA6RT_METAL_CB_BUDGET_MS`, default 1500, 0 off): a monitor thread names a
+  command buffer, with its encoders, once it has run that long since it could start (its commit or the previous one's
+  completion on its queue), and again when it completes; encoder-less ones (cross-queue waits) are not named. Encoder
+  labels carry the pipeline description's label (`PipelineCore::label_text`; Metal pipeline states have none) and the
+  builtin kernels' names; the summary adds the indirect pre-pass scratch and record counts.
+- Indirect grids: a record past `GTA6RT_METAL_INDIRECT_MESH_GROUPS` (default 2^18) mesh or `GTA6RT_METAL_INDIRECT_CS_GROUPS`
+  (default 2^20) compute groups is zeroed by the pre-pass (D3D12 allows 2^22 / 2^26).
+- Not re-tested with the ctest suite (the machine had titles running throughout); exercised in the title runs of
+  `port/d3d12_metal/STATUS.md` round 7.
+
 ## api_version 5: releases wait for the GPU, indirect rectangle lists (round 6, made by port/d3d12_metal)
 
 - **Deferred releases** (`MetalDevice::retire`, `collect_retired`; spike/r7-device-loss: Metal fails a command buffer

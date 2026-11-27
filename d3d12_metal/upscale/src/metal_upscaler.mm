@@ -342,7 +342,7 @@ std::string MetalUpscaler::describe() const { return impl_->key; }
 
 id<MTLTexture> MetalUpscaler::encode_readback(id<MTLCommandBuffer> cb, id<MTLTexture> src, std::uint32_t w, std::uint32_t h) {
     static std::mutex mu;
-    static id<MTLComputePipelineState> ps = nil;
+    static id<MTLComputePipelineState> ps = nil, psd = nil;
     id<MTLDevice> dev = cb.device;
     {
         std::lock_guard lock(mu);
@@ -351,13 +351,19 @@ id<MTLTexture> MetalUpscaler::encode_readback(id<MTLCommandBuffer> cb, id<MTLTex
             id<MTLLibrary> lib = [dev newLibraryWithSource:@"#include <metal_stdlib>\nusing namespace metal;\n"
                                                             "kernel void rb(texture2d<float, access::read> a [[texture(0)]],"
                                                             " texture2d<float, access::write> b [[texture(1)]], uint2 p [[thread_position_in_grid]]) {"
-                                                            " if (p.x < b.get_width() && p.y < b.get_height()) b.write(a.read(p), p); }"
+                                                            " if (p.x < b.get_width() && p.y < b.get_height()) b.write(a.read(p), p); }\n"
+                                                            "kernel void rbd(depth2d<float, access::read> a [[texture(0)]],"
+                                                            " texture2d<float, access::write> b [[texture(1)]], uint2 p [[thread_position_in_grid]]) {"
+                                                            " if (p.x < b.get_width() && p.y < b.get_height()) b.write(float4(a.read(p)), p); }"
                                                    options:nil error:&e];
-            if (lib) ps = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"rb"] error:&e];
-            if (!ps) return nil;
+            if (lib) {
+                ps = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"rb"] error:&e];
+                psd = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"rbd"] error:&e];
+            }
+            if (!ps || !psd) return nil;
         }
     }
-    if (is_depth_format(src.pixelFormat)) return nil;
+    const bool depth = is_depth_format(src.pixelFormat);
     MTLTextureDescriptor* d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA32Float
                                                                                  width:w height:h mipmapped:NO];
     d.usage = MTLTextureUsageShaderWrite | MTLTextureUsageShaderRead;
@@ -365,7 +371,7 @@ id<MTLTexture> MetalUpscaler::encode_readback(id<MTLCommandBuffer> cb, id<MTLTex
     id<MTLTexture> dst = [dev newTextureWithDescriptor:d];
     id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
     enc.label = @"gta6rt upscale readback";
-    [enc setComputePipelineState:ps];
+    [enc setComputePipelineState:depth ? psd : ps];
     [enc setTexture:src atIndex:0];
     [enc setTexture:dst atIndex:1];
     [enc dispatchThreads:MTLSizeMake(w, h, 1) threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];

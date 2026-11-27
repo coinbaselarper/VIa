@@ -216,6 +216,30 @@ int main(int argc, char** argv) {
         id<MTLTexture> motion = make(dev, MTLPixelFormatRG16Float, rw, rh, rd);
         id<MTLTexture> gt = make(dev, MTLPixelFormatRGBA16Float, ow, oh, rd);
 
+        if (only == "memory") {
+            for (Mode m : {Mode::bilinear, Mode::metalfx_spatial, Mode::metalfx_temporal}) {
+                id<MTLTexture> out = make(dev, MTLPixelFormatRG11B10Float, ow, oh, rd | MTLTextureUsageRenderTarget);
+                const std::uint64_t before = dev.currentAllocatedSize;
+                MetalUpscaler up(dev, m);
+                MetalInputs in;
+                in.color = color;
+                in.depth = depth;
+                in.motion = motion;
+                in.output = out;
+                in.render_w = rw;
+                in.render_h = rh;
+                in.output_w = ow;
+                in.output_h = oh;
+                std::string why;
+                id<MTLCommandBuffer> cb = [q commandBuffer];
+                const bool ok = up.encode(cb, in, why);
+                [cb commit];
+                [cb waitUntilCompleted];
+                std::printf("memory %-18s %s: device allocation +%.1f MiB (RG11B10F output, the title's format)\n",
+                            mode_name(m), ok ? "ok" : why.c_str(), double(dev.currentAllocatedSize - before) / 1048576.0);
+            }
+            return 0;
+        }
         std::vector<Candidate> cands;
         auto add = [&](const std::string& name, Mode m, Conventions c) {
             Candidate k;

@@ -252,8 +252,12 @@ public:
     // Compiles a deferred library (once, on whichever thread asks first); nil and an error if it fails.
     id<MTLLibrary> mtl(std::string* error = nullptr);
     bool deferred_pending() const { return !library_ && error_.empty(); }
+    // Size of what the device compiler is given (metallib bytes, else MSL text): the compile queue's cost estimate.
+    void set_bytes(std::size_t n) { bytes_ = n; }
+    std::size_t bytes() const { return bytes_ ? bytes_ : source_.size(); }
 
 private:
+    std::size_t bytes_ = 0;
     MetalDevice* device_;
     std::mutex mutex_;
     id<MTLLibrary> library_;
@@ -286,6 +290,7 @@ public:
     void detach_from_queue();  // destructors of derived classes call this first
     Priority priority() const { return priority_; }
     std::atomic<bool> queued{false};
+    std::size_t cost_bytes = 0;  // library bytes of its stages (CompileQueue: large builds are capped)
     std::string label_text;  // the description's label (Metal pipeline states carry none): encoder labels name it
 
 protected:
@@ -735,11 +740,13 @@ public:
 
 private:
     void run();
-    bool runnable_locked(std::size_t* priority) const;
+    bool runnable_locked(std::size_t* priority, std::size_t* index) const;
     void erase_locked(PipelineCore* p);
     void publish_pending_locked() const;
     std::uint32_t threads_n_ = 3, active_limit_ = 3, background_limit_ = 2;
-    std::uint32_t running_background_ = 0;
+    std::uint32_t running_background_ = 0, running_large_ = 0, large_limit_ = 2;
+    std::size_t large_bytes_ = 512 * 1024;
+    std::uint64_t large_deferred_ = 0;
     int qos_[3] = {0, 0, 0};
     mutable std::mutex mutex_;
     std::condition_variable cv_, done_cv_;

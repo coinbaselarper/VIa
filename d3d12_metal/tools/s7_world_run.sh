@@ -25,7 +25,9 @@ if [ ! -d "$rd/pipeline-archive" ]; then
   mkdir -p "$rd/pipeline-archive"
   cp -p "$port/build/d3d12_metal-x86_64/pipeline-archive/"* "$rd/pipeline-archive/" 2>/dev/null
 fi
-script="$(python3 -I -c 'import sys; s=int(sys.argv[1]); print(",".join("a@%d" % t for t in range(40, s - 19, 5)))' "$secs")"
+# S7_B_AFTER=T: from T s on, B instead of A every 5 s (B is "GOT IT" on the title's COULDN'T AUTOSAVE page, which A
+# retries: with A only the world phase stays behind that page from about +110 s).
+script="$(python3 -I -c 'import sys; s, b = int(sys.argv[1]), int(sys.argv[2]); print(",".join(("b@%d" if t >= b else "a@%d") % t for t in range(40, s - 19, 5)))' "$secs" "${S7_B_AFTER:-100000}")"
 busy() { ps -axo comm= | awk '{ n = $1; sub(/.*\//, "", n); if (n == "gta6rt" || n ~ /^gta6rt_/) f = 1 } END { exit !f }'; }
 mkdir -p $tree/run
 for attempt in $(seq 1 400); do

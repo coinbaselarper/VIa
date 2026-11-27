@@ -735,7 +735,9 @@ std::unique_ptr<gpu::ShaderLibrary> MetalDevice::create_library_metallib(std::sp
         if (error) *error = err ? err.localizedDescription.UTF8String : "metallib rejected";
         return nullptr;
     }
-    return std::make_unique<MetalLibrary>(this, lib, std::string(), now_seconds() - t0, MslOptions{});
+    auto out = std::make_unique<MetalLibrary>(this, lib, std::string(), now_seconds() - t0, MslOptions{});
+    out->set_bytes(bytes.size());
+    return out;
 }
 
 std::unique_ptr<gpu::CommandList> MetalDevice::create_command_list(QueueType type) {

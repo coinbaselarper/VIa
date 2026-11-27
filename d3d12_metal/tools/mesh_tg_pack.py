@@ -68,16 +68,49 @@ def entry_body(msl):
     return (i, msl[i:]) if i >= 0 else (-1, "")
 
 
+ALIGN = {"float3": 16, "float4": 16, "int3": 16, "int4": 16, "uint3": 16, "uint4": 16, "float2": 8, "int2": 8,
+         "uint2": 8, "half3": 8, "half4": 8, "half2": 4, "half": 2, "short": 2, "ushort": 2, "bool": 1, "uchar4": 4}
+MEMBER = re.compile(r"^\s*(\w+) \w+(?: \[\[[^\]]*\]\])?(?: ?\[(\d+)\])?;", re.M)
+
+
+def struct_size(msl, name):
+    m = re.search(r"struct " + re.escape(name) + r"\n\{\n(.*?)\n\};", msl, re.S)
+    if not m:
+        return None
+    size, align = 0, 1
+    for mm in MEMBER.finditer(m.group(1)):
+        t, n = mm.group(1), int(mm.group(2) or 1)
+        if t not in SIZES:
+            return None
+        a = ALIGN.get(t, 4)
+        size = (size + a - 1) // a * a + SIZES[t] * n
+        align = max(align, a)
+    return (size + align - 1) // align * align
+
+
 def tg_bytes(msl):
     _, body = entry_body(msl)
     total, arrays = 0, []
     for m in DECL.finditer(body):
         t, n, single, name = m.group(1) or m.group(3), int(m.group(2) or 1), m.group(3), m.group(4)
-        if t not in SIZES:
+        sz = SIZES.get(t) or struct_size(msl, t)
+        if sz is None:
             return None, []
-        total += SIZES[t] * n
+        total += sz * n
         arrays.append((name, t, n))
     return total, arrays
+
+
+def mesh_bytes(msl):
+    m = re.search(r"\bmesh<(\w+), (\w+), (\d+), (\d+), topology::\w+>", msl)
+    if not m:
+        return 0
+    v, p = struct_size(msl, m.group(1)) or 0, struct_size(msl, m.group(2)) or 0
+    return v * int(m.group(3)) + p * int(m.group(4))
+
+
+def over(tg, mesh):
+    return tg > LIMIT or tg + mesh > 61440
 
 
 IDX = "gl_PrimitiveTriangleIndicesEXT"
@@ -129,6 +162,11 @@ def cross(name, row, tmp):
     if rc != 0:
         return None, passes, base
     text = open(base + ".metal", encoding="utf-8", errors="replace").read()
+    for ext in (".spv", ".metal"):
+        try:
+            os.remove(base + ext)
+        except OSError:
+            pass
     fixed, _ = R.msl_fixups(text, passes)
     return (fixed if fixed is not None else text), passes, base
 
@@ -141,17 +179,19 @@ def build(out_dir, name, row, force):
         r["status"] = "cross_fail"
         return r
     before, arrays = tg_bytes(msl)
+    mesh = mesh_bytes(msl)
     r["before"] = before
+    r["mesh_output"] = mesh
     if before is None:
         r["status"] = "unsized"
         return r
-    if before <= LIMIT and not force:
+    if not over(before, mesh) and not force:
         r["status"] = "fits"
         return r
     packed, n = pack(msl, arrays)
     after, _ = tg_bytes(packed)
     r.update(after=after, packed_arrays=n)
-    if after is None or after > LIMIT:
+    if after is None or over(after, mesh):
         r["status"] = "still_over"
         return r
     key = hashlib.sha256((VERSION + "\n" + packed).encode()).hexdigest()
@@ -246,6 +286,8 @@ def main():
             r = json.loads(line)
             old[r["name"]] = r
     for r in results:
+        if old.get(r["name"], {}).get("status") == "split" and r["status"] != "split" and not a.split:
+            continue
         old[r["name"]] = r
     with open(log_path, "w") as f:
         for r in old.values():

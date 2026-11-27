@@ -490,6 +490,8 @@ void CompileQueue::init(std::uint32_t threads) {
     if (!threads_n_) threads_n_ = 1;
     active_limit_ = threads_n_;
     background_limit_ = std::min(env_u32("GTA6RT_METAL_COMPILE_BACKGROUND", threads_n_ > 1 ? threads_n_ - 1 : 1), threads_n_);
+    large_limit_ = std::min(env_u32("GTA6RT_METAL_COMPILE_LARGE", threads_n_ > 1 ? threads_n_ - 1 : 1), threads_n_);
+    large_bytes_ = std::size_t(env_u32("GTA6RT_METAL_COMPILE_LARGE_KB", 512)) * 1024;
     qos_[0] = qos_named("GTA6RT_METAL_COMPILE_QOS_DEMAND", QOS_CLASS_USER_INITIATED);
     qos_[1] = qos_named("GTA6RT_METAL_COMPILE_QOS_DEMAND", QOS_CLASS_USER_INITIATED);
     qos_[2] = qos_named("GTA6RT_METAL_COMPILE_QOS_BACKGROUND", QOS_CLASS_UTILITY);
@@ -504,13 +506,21 @@ void CompileQueue::set_limits(std::uint32_t active, std::uint32_t background) {
     cv_.notify_all();
 }
 
-bool CompileQueue::runnable_locked(std::size_t* priority) const {
+// A large library (cold AIR -> GPU code: 20-41 s for 1-2 MB, pso_probe) holds a worker for its whole build, so at
+// most large_limit_ run at once and a smaller one of the same priority goes first meanwhile; demanded work before
+// background work. *index is the queue position to take.
+bool CompileQueue::runnable_locked(std::size_t* priority, std::size_t* index) const {
     if (running_.size() >= active_limit_) return false;
     for (std::size_t pr = 0; pr < queues_.size(); ++pr) {
         if (queues_[pr].empty()) continue;
         if (pr == std::size_t(Priority::background) && running_background_ >= background_limit_) return false;
-        *priority = pr;
-        return true;
+        const auto& q = queues_[pr];
+        for (std::size_t i = 0; i < q.size(); ++i) {
+            if (running_large_ >= large_limit_ && q[i]->cost_bytes >= large_bytes_) continue;
+            *priority = pr;
+            *index = i;
+            return true;
+        }
     }
     return false;
 }
@@ -585,16 +595,19 @@ void CompileQueue::run() {
     std::unique_lock lock(mutex_);
     int qos_now = -1;
     while (true) {
-        std::size_t pr = 0;
-        cv_.wait(lock, [&] { return stop_ || runnable_locked(&pr); });
+        std::size_t pr = 0, index = 0;
+        cv_.wait(lock, [&] { return stop_ || runnable_locked(&pr, &index); });
         if (stop_) return;
-        PipelineCore* p = queues_[pr].front();
-        queues_[pr].pop_front();
+        if (index) ++large_deferred_;
+        PipelineCore* p = queues_[pr][index];
+        queues_[pr].erase(queues_[pr].begin() + std::ptrdiff_t(index));
         p->queued = false;
         if (!p->claim()) continue;
         running_.insert(p);
         const bool bg = pr == std::size_t(Priority::background);
+        const bool large = p->cost_bytes >= large_bytes_;
         if (bg) ++running_background_;
+        if (large) ++running_large_;
         publish_pending_locked();
         lock.unlock();
         if (qos_[pr] != qos_now) {
@@ -605,6 +618,7 @@ void CompileQueue::run() {
         lock.lock();
         running_.erase(p);
         if (bg) --running_background_;
+        if (large) --running_large_;
         publish_pending_locked();
         completed_[pr]++;
         done_cv_.notify_all();
@@ -625,15 +639,26 @@ CompileQueueStats CompileQueue::stats() const {
     s.running_background = running_background_;
     s.active_limit = active_limit_;
     s.background_limit = background_limit_;
+    s.running_large = running_large_;
+    s.large_limit = large_limit_;
+    s.large_passed = large_deferred_;
     return s;
 }
 
 // ---- render pipelines ----
 
+static std::size_t library_bytes(std::initializer_list<ShaderLibrary*> libs) {
+    std::size_t n = 0;
+    for (ShaderLibrary* l : libs)
+        if (l) n += static_cast<MetalLibrary*>(l)->bytes();
+    return n;
+}
+
 MetalRenderPipeline::MetalRenderPipeline(MetalDevice* device, const RenderPipelineDesc& desc)
     : PipelineCore(device, desc.mode, desc.not_ready, desc.priority), desc_(desc) {
     if (desc.label) label_text = desc.label;
     desc_.label = nullptr;
+    cost_bytes = library_bytes({desc.vs.library, desc.ps.library});
 }
 
 MetalRenderPipeline::~MetalRenderPipeline() { detach_from_queue(); }
@@ -843,6 +868,7 @@ MetalComputePipeline::MetalComputePipeline(MetalDevice* device, const ComputePip
     : PipelineCore(device, desc.mode, desc.not_ready, desc.priority), desc_(desc) {
     if (desc.label) label_text = desc.label;
     desc_.label = nullptr;
+    cost_bytes = library_bytes({desc.cs.library});
     threads_ = desc.threads;
     if (!threads_[0] || !threads_[1] || !threads_[2]) {
         auto* lib = static_cast<MetalLibrary*>(desc.cs.library);
@@ -907,6 +933,7 @@ MetalMeshPipeline::MetalMeshPipeline(MetalDevice* device, const MeshPipelineDesc
     : PipelineCore(device, desc.mode, desc.not_ready, desc.priority), desc_(desc) {
     if (desc.label) label_text = desc.label;
     desc_.label = nullptr;
+    cost_bytes = library_bytes({desc.mesh.library, desc.object.library, desc.ps.library});
 }
 
 MetalMeshPipeline::~MetalMeshPipeline() { detach_from_queue(); }

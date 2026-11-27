@@ -1,4 +1,185 @@
-# port/d3d12_metal status (round 6)
+# port/d3d12_metal status (round 7)
+
+## Round 7 (2026-11-26 22:35 - 11-27 02:10): stability and the first world frame on Metal — the heap damage is gone, a title-side fault and an empty G-buffer remain; no world frame yet
+
+Tree `build/d3m-s4-x86_64` (`-build19..29.log`). Launcher `tools/s7_world_run.sh` (new): s4_world_run.sh with a private
+run directory (`build/d3m-s4-x86_64/rundir`: saves, overlay, registry, Metal pipeline archive) reset from
+`rundir-template` (the imported user set) before every run; `run/saves` / `run/overlay` were never written;
+`S7_B_AFTER=T` presses B instead of A from T s (B dismisses the title's COULDN'T AUTOSAVE page). Every run alone on the
+machine (slot polled, collisions backed off). Evidence: `run/logs/s4-worldframe-metal.log` (rewritten,
+`tools/s7_evidence.py`), proposed check `tools/s4_check.py`. Measured = printed by a log or tool; inferred = reasoning.
+
+### Runs
+
+| run | settings | world at | end | in the world |
+|---|---|---:|---|---:|
+| d3m-s7-a | FSR4 refused, scene probe (present + dumps) | +70.8 s | title fault exe+0x4e9b54a | 6 s |
+| d3m-s7-b | probe, packed mesh shaders (manifest override); the upscale worker's MetalFX stage from here on | +70.4 s | footprint cap (exit 4): 48 hash-table generations, 1.9 GiB | 121 s |
+| d3m-s7-c | as b, + table back-pressure, labelled encoders | +70.3 s | title fault exe+0x4e9b54a | 19 s |
+| d3m-s7-d | as c, producer guard off | +70.4 s | title fault exe+0x4e9b54a (3 threads) | 10 s |
+| d3m-s7-e | **nothing of mine switched on** (no probe, no override, guard on) | +70.9 s | watchdog, rc 124: **S4a PASS** | 202 s |
+| d3m-s7-f | (no probe) | - | invalid: macOS maintenance at load 44-54, 1,043 submissions in 29 min; killed | - |
+| d3m-s7-g | probe (present + dumps), override, guard off | +70.0 s | title fault exe+0x4e9b54a | 8 s |
+| d3m-s7-h | probe (dumps only, cheaper), override, guard off | +69.5 s | **GPU timeout** (named ahead, below), device lost exit 3 | 153 s |
+| d3m-s7-i | negative control: hooks removed (`GTA6RT_METAL_BVH_HOOKS=0`), heap writes dropped (`GTA6RT_METAL_DROP_HEAP_WRITES=1`) | +69.3 s | footprint cap (exit 4, 16.6 GiB) | 172 s |
+| d3m-s7-j | nothing of mine switched on, B from +100 s (the world drawn from +106 s to the end, 1.5 frames/s) | +69.8 s | watchdog, rc 124: **S4a PASS** | 203 s |
+| d3m-s7-k | as j | +69.4 s | **GPU timeout** (a waiting compute-queue command buffer, GPU time 0), device lost exit 3 | 115 s |
+
+Load average 3-17 during the runs (54 during f), swap 2.1 of 3 GiB; other workers' titles between mine, never beside.
+
+### 1. The world-phase heap damage: cause removed (measured)
+
+- **The hooks.** `rt::xbox_bvh::set_hooks` is installed by `create_device_proxy` in `d3d12_xs_device.cpp`, which this
+  module compiles from `port/d3d12_vulkan` by path, and `LEONIDA_VULKAN_DEVICE` is defined here too
+  (`gta6rt_d3d12_vulkan_headers`): so spike/r8-world's patch 01, applied to the live tree at 22:32, installs the Metal
+  copy's `device_proxy_real_device` / `real_object_behind_proxy` / `rt::d3d12::hold_until_reset` once the module is
+  rebuilt (the menus worker added `xbox_bvh::` to `check_prelink.sh`'s allowed namespaces). Evidence: the shim's
+  "RehydrateRaytracingAccelerationStructureBatched2X: the list cannot hold its scratch" line is in every round-6 log
+  (d3m-s4-e/-f/-j) and in none of a..h.
+- **Round 6's guard never fired**: `land_outside_arena` treated any `gta6rt_vm_query` hit as a guest allocation, and
+  that call falls back to `mach_vm_region` for any host mapping, the malloc heap included ("dropped" was printed 0
+  times in round 6). Now a VA in a malloc-tagged region (`mach_vm_region_recurse` user tags 2/3/4/7/8/9/11/12, checked
+  under Rosetta with a probe) is counted and named; `GTA6RT_METAL_DROP_HEAP_WRITES=1` drops it (default: stored, since
+  the title's HeapAlloc is host malloc).
+- **Confirmation**: with the hooks, 0 list value writes landed in a malloc region in 8 runs (a-e, g, h: 0 lines);
+  with the hooks taken out again after `create_device_proxy` (`GTA6RT_METAL_BVH_HOOKS=0`, new switch in
+  `set_device_outer`), d3m-s7-i: "no proxy hooks are installed", the scratch line, and **2,048+ writes of 0 into malloc
+  blocks at 48-byte steps** (`0x7fd002690360`, `...390`, `...3c0`: the 48-byte
+  `D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC` elements spike/r8-world named), all dropped by the guard; that
+  run then lived 172 s in the world. The `GraphicsCommandList::Reset` SIGSEGV at 0x10 (round 6: 2 of 2 plain-tree
+  runs, 5-8 s into the world) did not recur in any run.
+- **A second collision, fixed**: a buffer block outside the full arena has console VA = its Metal gpuAddress minus the
+  arena's, numbers where the title allocates (0x3e740000 in d3m-s4-*, 0x61518000 / 0x11a310000 in d3m-s7-a) — replay
+  then resolved title addresses there to the block and list writes to the block's VA went to title memory.
+  `external_window` now reserves each block's VA range in the process (no access, no memory) and sets a block aside
+  when its range is not free (4-32 set aside a run); `land_outside_arena` tries the blocks first.
+  `GTA6RT_METAL_EXTERNAL_RESERVE_VA=0` turns it off.
+
+### 2. Survival: target not met (measured)
+
+- Three consecutive 3-minute world runs: **not reached**. Passing S4a (world + 180 s, no fatal, no GPU error, no
+  device loss): d3m-s7-e (202 s), | d3m-s7-j | nothing of mine switched on, B from +100 s (the world drawn from +106 s to the end, 1.5 frames/s) | +69.8 s | watchdog, rc 124: **S4a PASS** | 203 s |
+| d3m-s7-k | as j | +69.4 s | **GPU timeout** (a waiting compute-queue command buffer, GPU time 0), device lost exit 3 | 115 s |K_SUMMARY.
+- **Open: a title fault, `exe+0x4e9b54a` reading 0xb / 0xc** (a, c, d, g; 6-19 s into the world). The title walks its
+  pool allocator's chunk list (`exe+0x4e9b480`) and a node's object pointer and count are -1 / -1 (a, d, g) or 0 / 0
+  (c); the nodes are at `0x3a5cffe8`, `0x3a62ffe8`, `0x3a64ffe8` (d, three threads at once), `0x38eaffe8` (c): each the
+  last 0x18 bytes of a 64 KiB chunk of the title's VirtualAlloc region `0x372b0000` (185 MiB), the same region where
+  the title places small GPU buffers (`SRV/UAV of placed memory 0x38ef6850`, `0x3a8ab100` in the same logs). So whole
+  chunks of title memory are overwritten with a clear value (0 or 0xFFFFFFFF), by a GPU or layer write landing in
+  memory the title had reused (inferred; the writer is not found). It came in 4 of the 6 runs with my scene probe on
+  and in none of 8 without it (e, i, j, k here; the upscale worker's up7-a/-b/-c and the cache worker's pc7-rec-a ran
+  120-180 s in the world with the same sources). The probe records no GPU command until its first latch, and run c faulted
+  without any latch, so the probe is a trigger (timing, malloc churn), not the writer (inferred). d3m-s7-h, the probe
+  made cheaper (no per-draw string), ran 153 s without the fault.
+- **GPU timeout, named ahead** (d3m-s7-h, producer guard off): world graphics command buffers grew from 1.0 to 2.2 s on
+  the GPU in 60 s, each ~400 compute dispatches (encoders `library/lib_cs_01330 .. lib_cs_01087` x46,
+  `lib_cs_02039 .. lib_cs_01370` x136, `lib_cs_01379 .. lib_cs_01403` x151, `lib_cs_03000 .. lib_cs_01365` x18); then
+  Metal timed out a waiting compute-queue command buffer and the device was lost. With the guard on (default) no world
+  command buffer reached 1 s in e or i. Not repeated. The FSR4 timeout is moot on the shared tree: the upscale
+  worker's host upscaler (MetalFX) is on by default since b and the FSR4 DLL is not loaded.
+- **Footprint cap** (16 GiB, exit 4) ended b and i: b by 48 live descriptor-hash-table generations (1.9 GiB, command
+  buffers of 1.1 s let none retire); fixed: `MetalBindless::flush` waits up to 2 s for a free generation at 8 live
+  (`GTA6RT_METAL_TABLE_GENERATIONS`); since then 8 live (160-320 MiB). i still reached 16.6 GiB at 172 s in the world
+  (Metal 6.4 GiB: title copies 1.65, render targets 2.10, descriptors/arena 0.58, buffers 0.65, other 0.60; title pool
+  4.7 GiB; malloc 1.9 GiB).
+- **Budget monitor** (port/metal `mtl_queue.mm`, `GTA6RT_METAL_CB_BUDGET_MS`, default 1500): a command buffer still
+  running that long after it could start is printed with its encoders while it runs, and again when it completes; the
+  encoder labels now carry the pipeline's description label (`PipelineCore::label_text`) and the builtin kernels' names,
+  and the summary the indirect pre-pass scratch and record counts. Indirect grids are capped at 2^18 mesh / 2^20
+  compute groups per record (`GTA6RT_METAL_INDIRECT_MESH_GROUPS` / `_CS_GROUPS`).
+
+### 3. First world frame: diagnostic path built, the scene it shows is empty (measured)
+
+- **Scene probe** (`SceneProbe`, metal_context.h; replay hooks in `record(Draw)`, `record(IndirectRasterDraw)`,
+  `record(Dispatch)`, `record(ExecuteIndirect)` and the command loop): per frame the HDR colour target written last
+  at render size (1280x720, `GTA6RT_METAL_SCENE_SIZE`) before the upscaler (an `fspx/` dispatch, or the upscale
+  worker's `gta6rt-upscale` marker), the widest multi-target set (G-buffer) and its depth.
+  `GTA6RT_METAL_PRESENT_SCENE=1|2`: that colour, copied at the latch, tone-mapped (1 - exp(-c * exposure), exposure from
+  a readback every 30 frames, sRGB) and scaled to the window, under the title's UI plane or alone (port/metal
+  `PresentPlane::tone_exposure`, a tone-mapped compose pipeline). `GTA6RT_METAL_SCENE_DUMP=<dir>,first,every,count`:
+  colour, every G-buffer target and depth as PNGs with value statistics, and the frame's render-target passes in the log.
+- **What it found** (d3m-s7-h, upscaled frames 1/3/5, guard off): colour `f10` (RGBA16F) 1280x720 written by
+  `VS_TileGridDefaultPass + PS_CompositeIndirectDrawBlend`; G-buffer 6 targets (`f29` sRGB albedo, 4 x `f28`, `f34`
+  RG16F motion) + depth `f20` (D32S8), drawn by `MS_VS_TransformD_c5fd36bb`, `MSNC_VS_TransformSkinD`,
+  `MS_VS_PropFoliageDeferred`, `MS_VS_TransformTerrainNorm...` with `PS_DeferredTextured*`: **1,100+ indirect mesh draws
+  recorded into the G-buffer pass of frame 3**, shadow maps (`D f55` 256-768) 600+ more. Yet at the latch **every
+  G-buffer target is 0 except target 4 (a constant 0.502 grey: a cleared normal), depth is 0 everywhere (with inverted
+  depth: the far plane, nothing rasterised), and the colour is 0**. So geometry is recorded and draws nothing:
+  culling output (the mesh grids come from GPU culling compute passes that are skipped while compiling or guarded),
+  transforms, or the mesh stage's output counts. Not separated yet. Kept:
+  `run/present/d3m-s7-h-scene/scene_00005_{colour,depth,gbuffer0}.png` (black; the evidence that the G-buffer is empty).
+- **No 3D-scene frame exists** on this path yet; no world-phase present was kept (they are black or the autosave page).
+
+### 4. Draw classes in the world (census, d3m-s7-j t=227 s: world drawn since +106 s, guard on, 14 presents in 10 s, per frame)
+
+| class | per frame | recorded | skipped, why |
+|---|---:|---:|---|
+| indirect mesh (G-buffer, shadows, depth) | 1,368 | **0** | a compute pass before it not ready 1,055.7 (the producer guard), pipeline compiling 302.3, Metal refused 10 |
+| indirect mesh split64 | 17 | 0 | compiling 17 |
+| dispatch | 1,067 | 982 | compiling 84, PSO refused 1 |
+| indirect dispatch | 833 | **0** | guard 492.6, compiling 340.4 |
+| indirect rect-list (tiled lighting) | 257 | 0 | **Metal refused 170: "output of type float4 is not compatible with a MTLPixelFormatR32Uint color attachment"**, compiling 74, guard 13 |
+| draw | 107 | 37 | compiling 43, Metal refused 27 (float4 output to an RG32Uint attachment) |
+| draw indexed / rect-list / indirect draw / indirect indexed | 33 / 8 / 4 / 19 | 23 / 4 / 0 / 0 | compiling, guard, PSO refused 1 |
+
+So with the guard on no GPU-driven work is drawn at all, 2.5 minutes into the world: some compute pipeline is
+always still compiling (340 indirect dispatches a frame), which keeps the 2 s guard window open. With it off (h) the
+G-buffer pass records 1,100+ mesh draws and still rasterises nothing (section 3), and the heavy compute command
+buffers end in a GPU timeout. The rect-list class is the deferred lighting: 170 a frame refused for a float output to a
+uint target (a pixel variant with a bit-cast output is needed, a translation change; not done).
+
+- **Threadgroup memory** (the 26 refused a frame): SPIRV-Cross stages every mesh output in a 128-entry threadgroup
+  array, and an MSL float3/uint3 takes 16 bytes there. `tools/mesh_tg_pack.py` rebuilds a store shader with its own
+  recorded passes plus `packed_float3` staging and `uchar4` triangle indices (lossless; Metal's indices are uchar):
+  `MS_VS_Transform_4dbafe93~13` 36,056 -> 29,912 B, `~16` 35,544 -> 29,912 B (112.8 + 13.3 draws a frame refused in
+  e). The two at 34,008 B (`MS_VS_Transform_0c91b99b`, `MSNC_VS_TransformSkin_58f6b052`, 15 float4 outputs) still
+  pass Metal's threadgroup + mesh-output limit (32,472 + 30,720 > 61,440): rebuilt through the store's meshlet split
+  (route split64, 7 chunks of 64). All four create pipelines with their paired `PS_DeferredTextured_*` (offline probe)
+  and, in the title, no 36,056/35,544 refusal appeared with the override (b, c, d, g, h). A scan of all 9,232 mesh
+  shaders: 110 packed into the override, 2,044 still over by the tool's estimate (mostly float4 staging; the estimate
+  of the mesh-output part is conservative). Override: `GTA6RT_METAL_SHADER_MANIFEST=build/d3m-s4-x86_64/msl-overrides/manifest.tsv`
+  (the store's manifest with those rows pointing at `msl-overrides/cas`; not on by default).
+- **Not addressed**: float outputs to R32Uint / RG32Uint targets (170 + 27 a frame, above); the split64 shader at
+  36,336 B; the compiling and guarded classes (compile throughput is the cache worker's).
+
+### 5. Frames/s, ms per submission, footprint (measured)
+
+| | frames/s | ms per submission: heaps / shadows / textures / replay (max) | footprint | Metal (layer) by category, MiB |
+|---|---:|---|---:|---|
+| d3m-s7-e, world drawn (+92..+102 s, load 14-17) | 7.4-19.1 | 4.9-9.1 / 1.4-2.1 / 1.2-2.7 / 0.8-2.0 (64-197) | 13,232 (+94 s) | 4,837: title copies 948, render targets 2,090, descriptors/arena 416, buffers 41, other 542 |
+| d3m-s7-e, autosave page (+107..+268 s) | 30.0 | 1.6-2.1 / 1.4-1.6 / 2.0 / 0.3 | 14,702 (+245 s) | 5,077 |
+| d3m-s7-j, world drawn (+200..+210 s, load 4-7) | 1.45-1.50 | 3.9-4.3 / 1.0 / 0.9-1.0 / 0.5 (91-95) | 14,431 (+247 s) | 5,283: title copies 1,121, render targets 2,087, descriptors/arena 576, buffers 137, other 563 |
+| d3m-s7-i, world drawn, hooks off | 1.1-3.0 | | 16,562 (+240 s, cap) | 6,385: title copies 1,655, render targets 2,104, descriptors/arena 576, buffers 647, other 595 |
+
+Besides the Metal allocations: the title's pool 4,679 MiB committed (4,412 touched), imported title pages 777-791 MiB
+read in place, deferred title textures 3.2-4.3 GiB without a Metal texture (title memory), malloc 1.9 GiB, 8
+descriptor-table generations (160-320 MiB) since the back-pressure. About 30-40 submissions a second in the world;
+at 1.5 frames/s that is ~26 submissions a frame, so the GPU (the guard leaves 980 dispatches a frame) and the gates,
+not the CPU replay (0.5 ms), set the rate.
+
+### Switches added this round
+
+`GTA6RT_METAL_BVH_HOOKS=0`, `GTA6RT_METAL_DROP_HEAP_WRITES=1`, `GTA6RT_METAL_EXTERNAL_RESERVE_VA=0`,
+`GTA6RT_METAL_TABLE_GENERATIONS`, `GTA6RT_METAL_PRESENT_SCENE`, `GTA6RT_METAL_SCENE_DUMP`, `GTA6RT_METAL_SCENE_LOG`,
+`GTA6RT_METAL_SCENE_SIZE`, `GTA6RT_METAL_SCENE_EXPOSURE`; backend: `GTA6RT_METAL_CB_BUDGET_MS`,
+`GTA6RT_METAL_INDIRECT_MESH_GROUPS`, `GTA6RT_METAL_INDIRECT_CS_GROUPS`; launcher `S7_B_AFTER`.
+
+### Next (ranked)
+
+1. GPU safety at the world phase: the queues' waits on the list-values gates (CPU-signalled events) must not outlive
+   Metal's watchdog: hold such work on the CPU (QueueHolds) instead of encoding an event wait when the gate is not met at
+   submission, or cap a gate's GPU wait below ~1 s (k). Then the heavy world compute (h).
+2. The empty G-buffer: with the guard on nothing GPU-driven is drawn (j); narrow the guard to the consumers of the
+   dispatches that were actually skipped (or to argument buffers written by them), then dump one indirect mesh draw's
+   argument record and the mesh stage's output counts and check the camera constants (h: 1,100+ mesh draws recorded,
+   depth untouched).
+3. Float outputs to R32Uint / RG32Uint targets (the tiled lighting: 170 + 27 draws a frame): a pixel variant with a
+   bit-cast output (shaderc_msl request).
+4. The `exe+0x4e9b54a` fault: protect the tail page of the title's 64 KiB chunks in region `0x372b0000` to name the
+   writer (late list value writes or clears into reused placed memory are the candidates).
+5. Footprint: 14.4-16.6 GiB at 3 minutes; render-target aliasing (-1.1 GiB) and use-based eviction of title copies.
+
+---
 
 ## Round 6, menus (2026-11-26, 20:05-23:30): launch movie fixed; BRIGHTNESS grey is the title's; other pages match
 
