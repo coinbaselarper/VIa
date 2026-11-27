@@ -646,7 +646,13 @@ private:
             for (std::uint32_t i = 0; i < n; ++i) rts[i] = of(draw.views->render_targets[i], false);
         }
         const SceneProbe::Target depth = draw.depth.resource ? of(draw.depth, true) : SceneProbe::Target{};
-        s->draw(rts, n, depth, name, MetalContext::work_name(work), recorded);
+        if (s->draw(rts, n, depth, name, MetalContext::work_name(work), recorded, out_, [this](ResourceId id) -> gpu::Texture* {
+                const MetalBinding* b = binding(id, false);
+                return b ? b->texture : nullptr;
+            })) {
+            rt_dirty_ = true;
+            bound_compute_ = nullptr;
+        }
     }
     static Fate pipeline_fate(const gpu::Pipeline* pl, const char*& why) {
         if (!pl) return Fate::library_pending;
@@ -1091,6 +1097,7 @@ private:
             return;
         }
         if (MetalContext::census_on()) context_.note_census(p.name, "indirect-draw");
+        trace_draw(draw, p);
         if (p.mesh && context_.gpu_debug() && p.name && std::strstr(p.name, "MS_VS_TransformD_c5fd36bb"))
             context_.gpu_debug()->note_table_slot(draw.user_data[9], 0x80);
         out_.execute_indirect(d);
@@ -1130,9 +1137,13 @@ private:
         std::size_t which = 0;
         while (which < wants.size() && (wants[which].empty() || !std::strstr(p.name, wants[which].c_str()))) ++which;
         if (which == wants.size()) return false;
+        static const unsigned most = [] {
+            const char* v = std::getenv("GTA6RT_METAL_DRAW_TRACE_MAX");
+            return v ? unsigned(std::strtoul(v, nullptr, 10)) : 96u;
+        }();
         const unsigned n = seen[std::min<std::size_t>(which, 3)].fetch_add(1);
         if (n >= 8 && (!every || n % every)) return false;
-        if (printed.fetch_add(1) >= 96) return true;
+        if (printed.fetch_add(1) >= most) return true;
         std::string text;
         char line[256];
         std::snprintf(line, sizeof line, "%s: count %u instances %u first %u indexed %d topology %u viewport %.0f,%.0f %.0fx%.0f",
@@ -1262,10 +1273,40 @@ private:
         std::memcpy(to, static_cast<const std::uint8_t*>(b->cpu_pointer()) + off, std::size_t(bytes));
         return true;
     }
+    // GTA6RT_METAL_DRAW_TRACE_TABLE entries (comma separated, hex): [sN:]OFFSET[@START-END]: the descriptor at OFFSET of
+    // the table user-data register N names (default s8); a T# is decoded, a V#'s memory is printed from byte START to
+    // END (default 0-80, at most 0x800 bytes) as the GPU reads it.
     void trace_table(const Draw& draw) {
-        static const char* offsets = std::getenv("GTA6RT_METAL_DRAW_TRACE_TABLE");
-        if (!offsets) return;
-        const std::uint64_t table = draw.user_data[8] & ~3u;
+        static const char* spec = std::getenv("GTA6RT_METAL_DRAW_TRACE_TABLE");
+        if (!spec) return;
+        struct Entry {
+            unsigned reg = 8;
+            unsigned long offset = 0, start = 0, end = 0x80;
+        };
+        static const std::vector<Entry> entries = [] {
+            std::vector<Entry> out;
+            for (std::string s = spec; !s.empty();) {
+                const auto comma = s.find(',');
+                std::string t = s.substr(0, comma);
+                s = comma == std::string::npos ? "" : s.substr(comma + 1);
+                Entry e;
+                if (t.size() > 2 && t[0] == 's' && t.find(':') != std::string::npos) {
+                    e.reg = unsigned(std::strtoul(t.c_str() + 1, nullptr, 10)) & 31u;
+                    t = t.substr(t.find(':') + 1);
+                }
+                char* end = nullptr;
+                e.offset = std::strtoul(t.c_str(), &end, 16);
+                if (end == t.c_str()) continue;
+                if (*end == '@') {
+                    e.start = std::strtoul(end + 1, &end, 16);
+                    e.end = *end == '-' ? std::strtoul(end + 1, nullptr, 16) : e.start + 0x80;
+                }
+                e.start &= ~3ul;
+                e.end = std::clamp(e.end, e.start + 4, e.start + 0x800);
+                out.push_back(e);
+            }
+            return out;
+        }();
         std::string text;
         char line[160];
         std::snprintf(line, sizeof line, "user s0..s15:");
@@ -1274,72 +1315,101 @@ private:
             std::snprintf(line, sizeof line, " %08x", draw.user_data[i]);
             text += line;
         }
-        std::uint32_t words[64] = {};
-        const bool ok = read_va(table, words, sizeof words);
-        std::snprintf(line, sizeof line, "; table 0x%llx%s", static_cast<unsigned long long>(table), ok ? ":" : " (not read)");
-        text += line;
-        for (int i = 0; ok && i < 64; ++i) {
-            std::snprintf(line, sizeof line, "%s%08x", i % 4 ? " " : " | ", words[i]);
-            text += line;
-        }
         std::fprintf(stderr, "[rt] d3d12-metal: draw trace table %s\n", text.c_str());
-        for (const char* at = offsets; ok && *at;) {
-            char* end = nullptr;
-            const unsigned long o = std::strtoul(at, &end, 16);
-            if (end == at) break;
-            at = *end ? end + 1 : end;
-            if (o + 16 > sizeof words) continue;
-            gfx10::BufferWords w{words[o / 4], words[o / 4 + 1], words[o / 4 + 2], words[o / 4 + 3]};
+        const auto floats = [&](const std::uint32_t* words, int count, int first = 0) {
+            std::string s;
+            for (int i = 0; i < count; ++i) {
+                float f;
+                std::memcpy(&f, &words[i], 4);
+                if ((i + first) % 4 == 0) {
+                    std::snprintf(line, sizeof line, " | +%x:", unsigned((i + first) * 4));
+                    s += line;
+                }
+                std::snprintf(line, sizeof line, " %g", f);
+                s += line;
+                if (words[i] && (std::fabs(f) < 1e-20f || std::fabs(f) > 1e20f || !std::isfinite(f))) {
+                    std::snprintf(line, sizeof line, "(0x%x)", words[i]);
+                    s += line;
+                }
+            }
+            return s;
+        };
+        for (const Entry& e : entries) {
+            const std::uint64_t table = draw.user_data[e.reg] & ~3u;
+            std::uint32_t words[8] = {};
+            if (!read_va(table + e.offset, words, sizeof words)) {
+                std::fprintf(stderr, "[rt] d3d12-metal: draw trace table s%u 0x%llx +0x%lx: not read\n", e.reg,
+                             static_cast<unsigned long long>(table), e.offset);
+                continue;
+            }
+            const unsigned long o = e.offset;
+            gfx10::ImageWords iw{words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7]};
+            gfx10::Image img{};
+            if (gfx10::is_image(iw) && gfx10::decode(iw, img)) {
+                std::string bytes;
+                if (texture_memory_readable(std::uintptr_t(img.address), 16)) {
+                    std::uint32_t t[4];
+                    std::memcpy(t, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(img.address)), sizeof t);
+                    std::snprintf(line, sizeof line, "; title bytes at its base %08x %08x %08x %08x", t[0], t[1], t[2], t[3]);
+                    bytes = line;
+                }
+                std::fprintf(stderr,
+                             "[rt] d3d12-metal: draw trace table s%u +0x%lx: T# %08x %08x %08x %08x %08x %08x %08x %08x: "
+                             "address 0x%llx format %u type %u %ux%ux%u layers %u+%u mips %u+%u of %u swizzle %u%u%u%u min "
+                             "lod %.2f%s\n",
+                             e.reg, o, words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7],
+                             static_cast<unsigned long long>(img.address), img.format, unsigned(img.type), img.width,
+                             img.height, img.depth, img.first_layer, img.layer_count, img.first_mip, img.mip_count,
+                             img.resource_mips, img.swizzle[0], img.swizzle[1], img.swizzle[2], img.swizzle[3],
+                             img.min_lod, bytes.c_str());
+                continue;
+            }
+            gfx10::BufferWords w{words[0], words[1], words[2], words[3]};
             gfx10::Buffer v{};
             if (!gfx10::decode(w, v)) {
-                std::fprintf(stderr, "[rt] d3d12-metal: draw trace table +0x%lx: not a V#\n", o);
+                std::fprintf(stderr, "[rt] d3d12-metal: draw trace table s%u +0x%lx: not a V# (%08x %08x %08x %08x)\n",
+                             e.reg, o, words[0], words[1], words[2], words[3]);
                 continue;
             }
             const std::uint64_t base = std::uint64_t(std::int64_t(v.address << 16) >> 16);
-            std::uint32_t cb[32] = {};
-            std::uint64_t n = sizeof cb;
+            std::uint32_t cb[512] = {};
+            const std::uint64_t want = e.end - e.start;
+            std::uint64_t n = want;
             gpu::Buffer* holder = nullptr;
             std::uint64_t holder_offset = 0;
-            const bool found = v.num_records && context_.buffer_at(base, n, holder, holder_offset) && holder;
-            const bool read = found && holder->cpu_pointer() && n >= 16;
+            const bool found = v.num_records && context_.buffer_at(base + e.start, n, holder, holder_offset) && holder;
+            const bool read = found && holder->cpu_pointer() && n >= 4;
             if (read)
                 std::memcpy(cb, static_cast<const std::uint8_t*>(holder->cpu_pointer()) + holder_offset,
-                            std::size_t(std::min<std::uint64_t>(n, sizeof cb)));
-            const auto floats = [&](const std::uint32_t* words, int count) {
-                std::string s;
-                for (int i = 0; i < count; ++i) {
-                    float f;
-                    std::memcpy(&f, &words[i], 4);
-                    std::snprintf(line, sizeof line, "%s%g", i % 4 ? " " : " | ", f);
-                    s += line;
-                }
-                return s;
-            };
-            text = read ? floats(cb, int(std::min<std::uint64_t>(n, sizeof cb) / 4)) : "";
+                            std::size_t(std::min<std::uint64_t>(n, want)));
+            text = read ? floats(cb, int(std::min<std::uint64_t>(n, want) / 4), int(e.start / 4)) : "";
             std::uint64_t lo = 0, hi = 0, alias = 0, room = 0, source = 0, source_room = 0;
             auto& aliases = title_va_aliases();
-            if (!read && aliases.source_of_vsharp(base, source, source_room) && source_room >= 64 &&
-                texture_memory_readable(std::uintptr_t(source), 64)) {
-                std::memcpy(cb, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(source)),
-                            std::size_t(std::min<std::uint64_t>(source_room, sizeof cb)));
-                text = " (from title 0x" + [&] { char h[24]; std::snprintf(h, sizeof h, "%llx", (unsigned long long)source); return std::string(h); }() +
-                       ")" + floats(cb, int(std::min<std::uint64_t>(source_room, sizeof cb) / 4));
+            std::string from_title;
+            if (aliases.source_of_vsharp(base, source, source_room) && source_room >= e.end &&
+                texture_memory_readable(std::uintptr_t(source + e.start), want)) {
+                std::uint32_t tw[512] = {};
+                std::memcpy(tw, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(source + e.start)),
+                            std::size_t(want));
+                char h[64];
+                std::snprintf(h, sizeof h, "; title source 0x%llx%s:", static_cast<unsigned long long>(source),
+                              read && std::memcmp(tw, cb, std::size_t(std::min<std::uint64_t>(n, want))) == 0
+                                  ? " (same bytes)" : "");
+                from_title = h;
+                if (!read || std::memcmp(tw, cb, std::size_t(std::min<std::uint64_t>(n, want))) != 0)
+                    from_title += floats(tw, int(want / 4), int(e.start / 4));
             }
             const bool title = aliases.title_memory(base, lo, hi);
             const bool mapped = aliases.range_of(base, alias, room);
             std::fprintf(stderr,
-                         "[rt] d3d12-metal: draw trace table +0x%lx: V# base 0x%llx stride %u records %u; replay finds %s "
-                         "(%llu bytes at +0x%llx)%s; title memory %d [0x%llx, 0x%llx), alias %d -> 0x%llx (%llu)%s\n",
-                         o, static_cast<unsigned long long>(base), v.stride, v.num_records,
+                         "[rt] d3d12-metal: draw trace table s%u +0x%lx: V# base 0x%llx stride %u records %u; replay finds "
+                         "%s (%llu bytes at +0x%llx)%s; title memory %d [0x%llx, 0x%llx), alias %d -> 0x%llx (%llu)%s\n",
+                         e.reg, o, static_cast<unsigned long long>(base), v.stride, v.num_records,
                          found ? (holder == context_.arena_buffer() ? "the arena" : "a buffer") : "nothing",
                          static_cast<unsigned long long>(found ? n : 0), static_cast<unsigned long long>(holder_offset),
-                         text.c_str(), int(title),
-                         static_cast<unsigned long long>(lo), static_cast<unsigned long long>(hi), int(mapped),
-                         static_cast<unsigned long long>(alias), static_cast<unsigned long long>(room),
-                         title && hi - base >= 128 && texture_memory_readable(std::uintptr_t(base), 128) ? (" title bytes:" + floats(reinterpret_cast<const std::uint32_t*>(
-                                                                                  static_cast<std::uintptr_t>(base)), 32))
-                                                         .c_str()
-                                                   : "");
+                         text.c_str(), int(title), static_cast<unsigned long long>(lo), static_cast<unsigned long long>(hi),
+                         int(mapped), static_cast<unsigned long long>(alias), static_cast<unsigned long long>(room),
+                         from_title.c_str());
         }
     }
 

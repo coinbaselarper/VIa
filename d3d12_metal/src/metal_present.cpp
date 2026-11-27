@@ -120,6 +120,8 @@ void MetalPresenter::after_present() {
     if (!world && !due) return;
     std::uint32_t pw = 0, ph = 0;
     if (swapchain_->read_last_frame(dump_->pixels, pw, ph) != gpu::Status::ok || !pw || !ph) return;
+    // The window's CAMetalLayer is opaque, so the screen shows these texels with alpha ignored; the PNGs say the same.
+    for (std::size_t i = 3; i < dump_->pixels.size(); i += 4) dump_->pixels[i] = 255;
     if (world) {
         ++dump_->world_done;
         std::uint64_t lit = 0;

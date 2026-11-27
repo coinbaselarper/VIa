@@ -1,5 +1,6 @@
 #include "metal_shaders.h"
 
+#include <atomic>
 #include <chrono>
 #include <climits>
 #include <cstdio>
@@ -81,16 +82,40 @@ MetalShaders::Library MetalShaders::load_locked(const std::string& path, std::st
         return {};
     }
     std::string why;
-    auto lib = device_.create_library_metallib(bytes, &why);
+    std::unique_ptr<gpu::ShaderLibrary> lib;
+    // A metallib with a sibling .msl (the recipe's MSL for it, shipped by an overlay) is built from that text instead:
+    // port/metal can only wrap a rect-list vertex function whose source it has (build_rect), and a metallib has none.
+    const std::string msl_path =
+        path.size() > 9 && path.compare(path.size() - 9, 9, ".metallib") == 0 ? path.substr(0, path.size() - 9) + ".msl" : "";
+    if (!msl_path.empty() && exists(msl_path)) {
+        std::ifstream msl_in(msl_path, std::ios::binary);
+        const std::string source((std::istreambuf_iterator<char>(msl_in)), std::istreambuf_iterator<char>());
+        gpu::MslOptions o;
+        o.language_major = 3;
+        o.language_minor = 1;
+        o.fast_math = true;
+        o.label = "store row with MSL source";
+        o.deferred = true;
+        lib = device_.create_library_msl(source, o, &why);
+        static std::atomic<unsigned> told{0};
+        if (told.fetch_add(1) < 4 || !lib)
+            std::fprintf(stderr, "[rt] d3d12-metal: shader library from MSL source %s: %s\n", msl_path.c_str(),
+                         lib ? "ok (deferred compile)" : why.c_str());
+    }
+    if (!lib) lib = device_.create_library_metallib(bytes, &why);
     if (!lib) {
         if (error) *error = "Metal refused " + path + ": " + why;
         return {};
     }
     Library out;
-    const auto names = lib->function_names();
-    out.entry = names.empty() ? "main0" : names.front();
-    for (const auto& n : names)
-        if (n == "main0") out.entry = n;
+    if (!lib->source().empty()) {
+        out.entry = "main0";
+    } else {
+        const auto names = lib->function_names();
+        out.entry = names.empty() ? "main0" : names.front();
+        for (const auto& n : names)
+            if (n == "main0") out.entry = n;
+    }
     out.library = std::shared_ptr<gpu::ShaderLibrary>(std::move(lib));
     by_path_[path] = out;
     ++stats_.libraries;

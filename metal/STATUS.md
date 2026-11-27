@@ -1,5 +1,24 @@
 # gta6rt_metal status (S5.1, round 2)
 
+## Round 12 additions (made by port/d3d12_metal, GPU-pass worker; api_version stays 5, diagnostics only)
+
+- **Pass census** (`mtl_queue.mm`, `GTA6RT_METAL_PASS_CENSUS=1`, off by default; on with the pass timer): every 10 s,
+  per presented frame, encoders by kind, render-pass attachment actions (load / clear / dont-care, store / dont-care)
+  and the bytes they move, what ended each render pass (the command, a barrier's type, whether it named an attachment),
+  and render passes that reopen the previous pass's attachments (with or without other encoders between).
+- **Pass timer** (`GTA6RT_METAL_PASS_TIMING=<s after process start>,<frames>[,<period s>]`, off by default): for that
+  many presented frames every encoder of every command buffer gets counter samples at its boundaries (render: vertex
+  start/end and fragment start/end, so geometry and fragment time are separate) and waits for every encoder before it on
+  its queue (`_SERIAL=0`: no waits); then one table by key (kind, queue, attachments, first pipeline) per frame, with
+  indirect records issued / non-empty and mesh groups read back from the pre-pass records. `_TSV=<file>`: one line per
+  encoder. `_SPLIT=1` (`=2`: from the second window) also ends an implicit render pass at every pipeline change, so a
+  segment is one pipeline's draws (+~0.07 ms of load/store per split in the world). Sample buffers are pooled with a
+  high-water mark (a stage that took no sample reads as missing, never a stale value); Metal refuses new sample buffers
+  when too many are alive, so some encoders stay untimed in a window (counted).
+- Default path: a pointer assignment per command for the split cause; nothing else changed. A clear-folding change
+  (pending clears kept across barriers) was in the shared sources 08:00-08:44 and made world frames black (A/B on one
+  binary); it is removed.
+
 ## Round 8 additions (made by port/d3d12_metal, gates worker; api_version stays 5, no interface change)
 
 - **Commit gate** (`mtl_queue.mm`, `GTA6RT_METAL_COMMIT_GATE`, default on): a command buffer whose event waits (a

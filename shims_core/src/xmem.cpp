@@ -471,8 +471,23 @@ std::deque<std::pair<uint64_t, std::pair<uint64_t, uint64_t>>> g_removals;  // (
 constexpr size_t kRemovalLog = 8192;
 uint64_t g_removals_dropped = 0;  // the newest generation whose removal is no longer in g_removals
 
-void note_added() {
-    if (g_entry) g_generation.fetch_add(1, std::memory_order_release);
+std::deque<std::pair<uint64_t, std::pair<uint64_t, uint64_t>>> g_additions;  // (generation, [lo, hi)) given a view
+uint64_t g_additions_dropped = 0;
+
+void note_added(uint64_t lo, uint64_t hi) {
+    if (!g_entry) return;
+    const uint64_t generation = g_generation.fetch_add(1, std::memory_order_release) + 1;
+    if (lo >= hi) return;
+    if (!g_additions.empty() && g_additions.back().second.second == lo) {
+        g_additions.back().second.second = hi;
+        g_additions.back().first = generation;
+        return;
+    }
+    g_additions.push_back({generation, {lo, hi}});
+    if (g_additions.size() > kRemovalLog) {
+        g_additions_dropped = g_additions.front().first;
+        g_additions.pop_front();
+    }
 }
 void note_removed(uint64_t lo, uint64_t hi) {
     if (!g_entry || lo >= hi) return;
@@ -692,7 +707,7 @@ bool commit_in_run(uintptr_t address, uint64_t size, uint32_t vm_prot) {
         return false;
     }
     for (uintptr_t p = lo; p < hi; p += kSmallPage) run->state[(p - base) / kSmallPage] = kViewBit;
-    note_added();
+    note_added(lo, hi);
     note_view_time(now_ns() - t0);
     return true;
 }
@@ -1549,7 +1564,7 @@ bool map_pages_locked(uintptr_t start, const uint64_t* pages, uint64_t count, ui
     }
     done = count;
     if (!g_low.empty()) note_low_stretch(start, count);
-    note_added();
+    note_added(start, start + count * rt::xmem::kPhysicalPageSize);
     return true;
 }
 
@@ -1788,6 +1803,19 @@ std::uint64_t title_pool_removals(std::uint64_t since, std::vector<std::pair<std
         return now;
     }
     for (auto it = g_removals.rbegin(); it != g_removals.rend() && it->first > since; ++it) out.push_back(it->second);
+    return now;
+}
+
+std::uint64_t title_pool_additions(std::uint64_t since, std::vector<std::pair<std::uint64_t, std::uint64_t>>& out) {
+    const std::lock_guard lock(g_mutex);
+    out.clear();
+    const uint64_t now = g_generation.load(std::memory_order_acquire);
+    if (!g_entry || since >= now) return now;
+    if (since < g_additions_dropped) {
+        out.emplace_back(0, UINT64_MAX);
+        return now;
+    }
+    for (auto it = g_additions.rbegin(); it != g_additions.rend() && it->first > since; ++it) out.push_back(it->second);
     return now;
 }
 

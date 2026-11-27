@@ -951,7 +951,8 @@ int main(int argc, char** argv) {
     host::governor::install_title_hooks();
     host::window::set_hidden(g_args.hidden_window);
     if (!g_args.hud.empty()) setenv("GTA6RT_HUD", g_args.hud.c_str(), 1);
-    if (!g_args.hidden_window) {
+    const char* hud_log = std::getenv("GTA6RT_HUD_LOG");
+    if (!g_args.hidden_window || (hud_log && *hud_log)) {
         setenv("GTA6RT_HUD", "min", 0);
         gta6rt_hud_init_from_env();
         if (const char* profile = std::getenv("LEONIDA_CONSOLE_PROFILE")) gta6rt_hud_set_profile(profile);

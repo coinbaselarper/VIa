@@ -365,6 +365,7 @@ class GpuDebug {
 public:
     static std::unique_ptr<GpuDebug> create(MetalContext& context);
     std::string take_report();
+    std::string pixel_dumps(volatile std::uint32_t* words);
     // Replay, when it records an indirect mesh draw: the 16 bytes at a descriptor-table address (user data 9 + 0x80,
     // the draw header's V#) in the arena copy and in the title's heap, as they are at record time.
     void note_table_slot(std::uint32_t table, std::uint32_t offset);
@@ -392,6 +393,12 @@ private:
 // 60), then every every-th (default 600), count times (default 3): colour, G-buffer targets and depth as PNGs with
 // value statistics, and the frame's render-target passes in the log. GTA6RT_METAL_SCENE_LOG=1 logs the passes of the
 // dump frames without the PNGs.
+// In a dump frame, before its upscaler dispatch: GTA6RT_METAL_SCENE_STAGES=N reads the colour target (the previous
+// frame's) back at up to N draw-pass boundaries where a pass that wrote it ends or the first pass that writes it
+// starts; GTA6RT_METAL_SCENE_AFTER=<part>,... reads back every render target of a draw pass whose pipeline names
+// contain a part, when the pass ends. GTA6RT_METAL_SCENE_RAW=1 writes each readback's texels beside its PNG (.raw).
+// GTA6RT_METAL_SCENE_SENTINEL=1 (debug): the colour target is cleared to (4096, 0, 4096) before the first pass that
+// writes it in a dump frame, so what no pass writes shows.
 class SceneProbe {
 public:
     struct Target {
@@ -404,8 +411,9 @@ public:
     explicit SceneProbe(MetalContext& context);
     ~SceneProbe();
 
-    void draw(const Target* rts, std::uint32_t count, const Target& depth, const char* pipeline, const char* kind,
-              bool recorded);
+    // True when copies were recorded into `out` before this draw (the caller binds its render targets again).
+    bool draw(const Target* rts, std::uint32_t count, const Target& depth, const char* pipeline, const char* kind,
+              bool recorded, gpu::CommandList& out, const Resolve& resolve);
     // True when copies were recorded into `out` (the caller binds its render targets again).
     bool dispatch(const char* pipeline, bool recorded, gpu::CommandList& out, const Resolve& resolve);
     void end_frame();
@@ -440,6 +448,8 @@ private:
                         bool exposure_only);
     void finish_readbacks(bool all);
     void write_readback(Readback& r);
+    bool pass_boundary(const Target* rts, std::uint32_t count, const std::string& next, gpu::CommandList& out,
+                       const Resolve& resolve);
 
     MetalContext& context_;
     std::mutex mutex_;
@@ -468,6 +478,11 @@ private:
     bool copy_valid_ = false;
     std::uint64_t copy_frame_ = 0;
     std::vector<Readback> readbacks_;
+    std::uint32_t stages_max_ = 0, stages_done_ = 0, afters_done_ = 0, draw_passes_ = 0;
+    std::vector<std::string> after_;
+    bool raw_ = false, stage_written_ = false, sentinel_ = false;
+    Target stage_target_;
+    Pass cur_;
 };
 
 // Replays one closed IR list into `out` (ADAPTER.md section 4). Commands the backend cannot do yet are counted and

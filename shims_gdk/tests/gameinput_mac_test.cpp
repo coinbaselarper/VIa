@@ -30,6 +30,7 @@
 
 #include "gameinput_abi.h"
 #include "gameinput_backend.h"
+#include "gameinput_script.h"
 #include <gta6rt/shims.h>
 
 #include "shims.h"
@@ -895,6 +896,74 @@ int sticky_press(CreateFn create) {
     return 0;
 }
 
+// Stick throws in every direction, triggers, keyboard keys through the keyboard pad's mapping, and hold times.
+struct Axes {
+    uint32_t buttons = 0xFFFFFFFF;
+    float lx = -2, ly = -2, rx = -2, ry = -2, lt = -2, rt = -2;
+};
+Axes axes_at(IGameInput* input, double seconds) {
+    at(seconds);
+    Axes p;
+    IGameInputReading* r = nullptr;
+    if (input->GetCurrentReading(GameInputKindGamepad, nullptr, &r) != S_OK || !r) return p;
+    GameInputGamepadState s{};
+    if (r->GetGamepadState(&s)) {
+        p.buttons = s.buttons;
+        p.lx = s.leftThumbstickX, p.ly = s.leftThumbstickY, p.rx = s.rightThumbstickX, p.ry = s.rightThumbstickY;
+        p.lt = s.leftTrigger, p.rt = s.rightTrigger;
+    }
+    r->Release();
+    return p;
+}
+bool at_rest(const Axes& a) { return a.buttons == 0 && a.lx == 0 && a.ly == 0 && a.rx == 0 && a.ry == 0 && a.lt == 0 && a.rt == 0; }
+
+int script_axes(CreateFn create) {
+    const auto parsed = rt::gameinput::script::parse(
+        "lsup@1:4, rsleft@2:1.5, lsright@10, lsdown@11, lsleft@12, rsright@13, rsup@14, rsdown@15, lt@16, rt@17,"
+        "key_w@20:2, key_l@21, key_esc@25, key_return@26, a@30:2,"
+        "lsup@1:0, lsup@1:-1, lsup@1:601, lsup@1:2x, key_@1, key_1@1, key_ww@1, lsup@1:");
+    check(parsed.presses.size() == 15 && parsed.rejected == 8, "axes: 15 entries parsed, 8 rejected (bad holds and keys)");
+    check(!parsed.presses.empty() && parsed.presses[0].hold == 4.0 && parsed.presses[2].hold == 0.3,
+          "axes: a given hold is kept, a missing one is 0.3 s");
+    SetEnvironmentVariableA("LEONIDA_INPUT_SCRIPT",
+                            "lsup@1:4, rsleft@2:1.5, lsright@10, lsdown@11, lsleft@12, rsright@13, rsup@14, rsdown@15,"
+                            "lt@16, rt@17, key_w@20:2, key_l@21, key_esc@25, key_return@26, a@30:2");
+    rt::gameinput_mac::set_clock(fake_clock);
+    at(0);
+    IGameInput* input = nullptr;
+    check(create(reinterpret_cast<void**>(&input)) == S_OK && input, "axes: GameInputCreate returns an instance");
+    if (!input) return 1;
+    check(at_rest(axes_at(input, 0.5)), "axes: at rest before the script");
+    Axes a = axes_at(input, 1.5);
+    check(a.ly == 1 && a.lx == 0 && a.rx == 0, "axes: lsup throws the left stick up");
+    a = axes_at(input, 2.5);
+    check(a.ly == 1 && a.rx == -1, "axes: rsleft throws the right stick left while lsup still holds");
+    a = axes_at(input, 3.8);
+    check(a.ly == 1 && a.rx == 0, "axes: rsleft released after its 1.5 s, lsup still held");
+    check(axes_at(input, 4.9).ly == 1, "axes: lsup held to the end of its 4 s");
+    check(at_rest(axes_at(input, 5.1)), "axes: everything released after the holds");
+    check(axes_at(input, 10.1).lx == 1, "axes: lsright");
+    check(axes_at(input, 11.1).ly == -1, "axes: lsdown");
+    check(axes_at(input, 12.1).lx == -1, "axes: lsleft");
+    check(axes_at(input, 13.1).rx == 1, "axes: rsright");
+    check(axes_at(input, 14.1).ry == 1, "axes: rsup");
+    check(axes_at(input, 15.1).ry == -1, "axes: rsdown");
+    check(axes_at(input, 16.1).lt == 1, "axes: lt pulls the left trigger");
+    check(axes_at(input, 17.1).rt == 1, "axes: rt pulls the right trigger");
+    a = axes_at(input, 20.5);
+    check(a.ly == 1 && a.buttons == 0, "axes: key_w is the keyboard pad's left stick up");
+    a = axes_at(input, 21.1);
+    check(a.ly == 1 && a.rx == 1, "axes: key_l is the right stick right, key_w still held");
+    check(axes_at(input, 21.9).ly == 1, "axes: key_w held for its 2 s");
+    check(at_rest(axes_at(input, 22.1)), "axes: keys released");
+    check(axes_at(input, 25.1).buttons == GameInputGamepadMenu, "axes: key_esc is Menu");
+    check(axes_at(input, 26.1).buttons == GameInputGamepadA, "axes: key_return is A");
+    check(axes_at(input, 31.5).buttons == GameInputGamepadA, "axes: a held for its 2 s");
+    check(at_rest(axes_at(input, 32.1)), "axes: and released");
+    input->Release();
+    return 0;
+}
+
 // A press the title never asked for during its hold (a 3 s frame) is delivered late, once, and seen on four frames.
 int late_press(CreateFn create) {
     SetEnvironmentVariableA("LEONIDA_INPUT_SCRIPT", "a@1,b@20");
@@ -971,14 +1040,18 @@ int main(int argc, char** argv) {
     const bool with_sticky = argc == 2 && std::strcmp(argv[1], "--sticky") == 0;
     const bool with_late = argc == 2 && std::strcmp(argv[1], "--late") == 0;
     const bool with_alongside = argc == 2 && std::strcmp(argv[1], "--alongside") == 0;
+    const bool with_axes = argc == 2 && std::strcmp(argv[1], "--axes") == 0;
     SetEnvironmentVariableA("LEONIDA_INPUT_SCRIPT", nullptr);
     SetEnvironmentVariableA("LEONIDA_INPUT_LOG", nullptr);
-    SetEnvironmentVariableA("GTA6RT_SCRIPT_MIN_POLLS", with_script ? "0" : nullptr);
-    SetEnvironmentVariableA("GTA6RT_INPUT", with_script || with_sticky || with_late ? "script" : with_alongside ? "test" : "none");
+    SetEnvironmentVariableA("GTA6RT_SCRIPT_MIN_POLLS", with_script || with_axes ? "0" : nullptr);
+    SetEnvironmentVariableA("GTA6RT_INPUT", with_script || with_sticky || with_late || with_axes ? "script"
+                                            : with_alongside                                    ? "test"
+                                                                                                : "none");
     const int early = with_script      ? scripted_pad(create)
                       : with_sticky    ? sticky_press(create)
                       : with_late      ? late_press(create)
                       : with_alongside ? alongside(create)
+                      : with_axes      ? script_axes(create)
                       : with_synthetic ? synthetic(create)
                       : with_census    ? census(create)
                                        : identity_only(create);

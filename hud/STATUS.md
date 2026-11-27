@@ -194,3 +194,12 @@ All of these agree within the sampling offset. Fields that are blank by design o
 and nothing feeds `note_gpu_ns` there, so the overlay shows `-`, never a made-up number); `lat -` (Metal backend only); `imp -` (the import counter exists only with `--trace`, the same run used `--trace=0`
 so the count was off; not a wrong number); `disp` has no log counterpart (the `dispatches_emitted` counter is not printed anywhere), 1.0 per frame is what the counter says.
 Nothing was found wrong in the min line. In the stalled seconds the line now reads `stalled N s`.
+
+## Windowless log (round 11, play worker, 2026-11-27)
+
+`GTA6RT_HUD_LOG=<s>` now also works with `--hidden-window`: the host initialises the overlay when the variable is set
+(`host/src/main.cpp`), and with no window attached a dispatch timer at the overlay's rate samples the same stats block and
+prints `[rt] hud (no window): <the full three lines> || raw ...` every `<s>` seconds. It stops sampling while a window is
+attached (the panel's own tick logs then). Measured on the Metal path (`GTA6RT_GPU=metal`, hidden, world phase,
+`run/logs/play-d.log`): `1 fps 781ms (max 781) | draws 1721 | gpu 1144ms | pso 2.6k/3 pending | mem 13/18G gpu 6.5G`;
+menus `29 fps 34.5ms | draws 7.7 | gpu 6.2ms`. hud_unit_test 82 checks, 0 failed.

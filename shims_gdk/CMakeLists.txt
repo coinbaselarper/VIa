@@ -141,6 +141,7 @@ if(GTA6RT_GDK_TESTS)
   add_test(NAME gdk_gameinput_mac_sticky COMMAND gameinput_mac_test --sticky)
   add_test(NAME gdk_gameinput_mac_late COMMAND gameinput_mac_test --late)
   add_test(NAME gdk_gameinput_mac_alongside COMMAND gameinput_mac_test --alongside)
+  add_test(NAME gdk_gameinput_mac_axes COMMAND gameinput_mac_test --axes)
   foreach(_case unregister undispatched terminate parked self presignaled monitor close composite snapshot cross
                 concurrent held_snapshot admission cancel_unregister reentrant_admission
                 reentrant_vs_external_unregister multi_dispatcher_terminate multi_dispatcher_unregister_replace)

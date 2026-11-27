@@ -311,3 +311,13 @@ Real title (hidden window, 105-119 s before it aborted, see below), same title p
 **BCPack profile.** With `history.bcph` present every BC7 and BC6H request the title made in its first 110 s decoded (153 BC7, 1 BC6H, no failures); over all 5,435 BC7/BC6H chunks in the 57 pools 70 still fail (BC7 53 `missing-endpoint` + 7 `anchor-or-pbit` of 5,167; BC6H 10 `missing-endpoint` of 268), every success is `fitted`. Decode: BC7 26-28 MiB/s per thread arm64, 22-23 under Rosetta, 115-211 MiB/s on 14 threads. io_bench 11.4.
 
 **Open / found.** (1) Both traced title runs aborted at 107-119 s with a Metal assertion (BC1 view of a BC7 texture) in the d3d12_vulkan layer; same with the old serial backend (io_bench 11.6). (2) No host script runs `ensure_bcpack_history.sh` yet. (3) Page-list publishing is serial per queue and was not measured alone. (4) `CancelRequestsWithTag` writes `entry.cancelled` of a prefetched slot while a pool thread may read the entry (benign bool race, request dropped at publish either way).
+
+## Input script: sticks, triggers, keys and hold times (round 11, play worker, 2026-11-27)
+
+`src/gameinput_script.h` + `Hub::refresh_script` (`gameinput_mac.cpp`): an entry is `name@seconds[:hold]` (hold 0.3 s when
+none is given, at most 600 s). New names: `lsup lsdown lsleft lsright rsleft rsright` (with the old `rsup rsdown`) throw
+a stick fully, `lt rt` pull a trigger, `key_<k>` holds a keyboard key through `pad_state_from_keys` (the keyboard pad's
+own mapping; k = a letter, return, space, escape/esc, backspace, tab, arrowup/down/left/right). Old scripts parse and
+play the same. Each stick/key entry logs `[rt] gameinput: scripted lsup@100.0 held from 100.1 s for 4.0 s` once.
+Test: `gameinput_mac_test --axes` (ctest `gdk_gameinput_mac_axes`): 25 checks, 0 failed; the other seven modes and
+`gameinput_pad_test` unchanged at 0 failures (tree `build/play-x86_64`). In-title results: `spike/r10-play/STATUS.md`.

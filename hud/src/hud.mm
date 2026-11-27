@@ -486,6 +486,56 @@ void apply() {
     }
 }
 
+void log_metrics(const char* tag, const Metrics& m, const Raw& raw, FormatOptions opt) {
+    opt.mode = GTA6RT_HUD_FULL;
+    const std::vector<Line> full = gta6rt::hud::format_lines(m, opt);
+    std::string joined;
+    for (const Line& l : full) joined += (joined.empty() ? "" : " || ") + l.text;
+    std::fprintf(stderr,
+                 "[rt] hud%s: %s || raw presents %llu draws %llu dispatches %llu submissions %llu pso built %llu pending %llu failed %llu\n",
+                 tag, joined.c_str(), static_cast<unsigned long long>(raw.presents), static_cast<unsigned long long>(raw.draws),
+                 static_cast<unsigned long long>(raw.dispatches), static_cast<unsigned long long>(raw.submissions),
+                 static_cast<unsigned long long>(raw.pipelines_built), static_cast<unsigned long long>(raw.pipelines_pending),
+                 static_cast<unsigned long long>(raw.pso_failures));
+}
+
+dispatch_source_t g_headless = nil;
+
+void headless_tick() {
+    static Sampler sampler;
+    static double last_log = 0;
+    static bool primed = false;
+    if (g_attached.load() || g_disabled.load() || g_mode.load() == GTA6RT_HUD_OFF) {
+        primed = false;
+        return;
+    }
+    const Raw raw = read_raw();
+    if (!primed) {
+        sampler.reset();
+        sampler.update(raw);
+        last_log = raw.t_s;
+        primed = true;
+        return;
+    }
+    const Metrics m = sampler.update(raw);
+    if (raw.t_s - last_log < g_log_every.load()) return;
+    last_log = raw.t_s;
+    FormatOptions opt;
+    opt.budget_ms = g_budget.load();
+    log_metrics(" (no window)", m, raw, opt);
+}
+
+void start_headless() {
+    if (g_headless || !(g_log_every.load() > 0)) return;
+    dispatch_source_t src = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
+    if (!src) return;
+    const uint64_t interval = uint64_t(1e9 / g_rate.load());
+    dispatch_source_set_timer(src, dispatch_time(DISPATCH_TIME_NOW, int64_t(interval)), interval, 10 * NSEC_PER_MSEC);
+    dispatch_source_set_event_handler(src, ^{ headless_tick(); });
+    dispatch_resume(src);
+    g_headless = src;
+}
+
 void tick() {
     Ui* u = ui();
     const uint64_t t0 = now_ns();
@@ -514,17 +564,7 @@ void tick() {
         const double log_every = g_log_every.load();
         if (!u->warming && log_every > 0 && raw.t_s - u->last_log_t >= log_every) {
             u->last_log_t = raw.t_s;
-            FormatOptions all = opt;
-            all.mode = GTA6RT_HUD_FULL;
-            const std::vector<Line> full = gta6rt::hud::format_lines(m, all);
-            std::string joined;
-            for (const Line& l : full) joined += (joined.empty() ? "" : " || ") + l.text;
-            std::fprintf(stderr,
-                         "[rt] hud: %s || raw presents %llu draws %llu dispatches %llu submissions %llu pso built %llu pending %llu failed %llu\n",
-                         joined.c_str(), static_cast<unsigned long long>(raw.presents), static_cast<unsigned long long>(raw.draws),
-                         static_cast<unsigned long long>(raw.dispatches), static_cast<unsigned long long>(raw.submissions),
-                         static_cast<unsigned long long>(raw.pipelines_built), static_cast<unsigned long long>(raw.pipelines_pending),
-                         static_cast<unsigned long long>(raw.pso_failures));
+            log_metrics("", m, raw, opt);
         }
         if (mode == GTA6RT_HUD_TITLE) {
             const std::string base = u->original_title ? std::string(u->original_title.UTF8String ?: "") : std::string();
@@ -630,6 +670,7 @@ void gta6rt_hud_init(const gta6rt_hud_config* config) {
     g_disabled.store(0);
     g_log_every.store(env_double("GTA6RT_HUD_LOG", 0));
     set_mode_internal(config ? config->mode : GTA6RT_HUD_OFF);
+    start_headless();
 }
 
 void gta6rt_hud_init_from_env(void) {

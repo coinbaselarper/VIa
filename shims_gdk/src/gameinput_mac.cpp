@@ -733,8 +733,8 @@ struct Hub final : mac::Sink {
     static constexpr double kMaxHoldSeconds = 1.5;
     static constexpr double kLateSeconds = 10.0;  // a press the title did not ask for in its hold is still delivered
     std::vector<bool> served;
-    uint32_t sticky_buttons = 0;
-    int sticky_stick = 0;
+    std::vector<bool> announced;
+    script::Held sticky;
     double press_start_s = 0;
     uint32_t press_polls = 0;
     uint64_t last_poll_us = 0;
@@ -746,33 +746,39 @@ struct Hub final : mac::Sink {
         Device& d = *script_pad;
         const double seconds = now > origin_us ? (now - origin_us) / 1e6 : 0.0;
         script::Held held = script::held_at(script, seconds);
+        if (log_presses) {
+            announced.resize(script.presses.size(), false);
+            for (size_t i = 0; i < script.presses.size(); ++i) {
+                const script::Press& p = script.presses[i];
+                if (announced[i] || p.button || !script::holds_at(p, seconds)) continue;
+                announced[i] = true;
+                std::fprintf(stderr, "[rt] gameinput: scripted %s@%.1f held from %.1f s for %.1f s\n", p.name.c_str(), p.at,
+                             seconds, p.hold);
+            }
+        }
         if (min_polls > 0) {
             served.resize(script.presses.size(), false);
             for (size_t i = 0; i < script.presses.size(); ++i) {
                 const script::Press& p = script.presses[i];
-                if (seconds >= p.at && seconds < p.at + script::kHoldSeconds) served[i] = true;
-                else if (!served[i] && seconds >= p.at + script::kHoldSeconds && seconds < p.at + kLateSeconds) {
+                if (script::holds_at(p, seconds)) served[i] = true;
+                else if (!served[i] && seconds >= p.at + p.hold && seconds < p.at + kLateSeconds) {
                     served[i] = true;
-                    if (p.stick) held.stick = p.stick;
-                    else held.buttons |= p.button;
+                    script::hold(held, p);
                     if (log_presses)
                         std::fprintf(stderr,
                                      "[rt] gameinput: scripted press at %.1f s delivered late, at %.1f s: the title did not ask during its %.1f s hold\n",
-                                     p.at, seconds, script::kHoldSeconds);
+                                     p.at, seconds, p.hold);
                 }
             }
         }
-        if (held.buttons || held.stick) {
-            sticky_buttons = held.buttons;
-            sticky_stick = held.stick;
+        if (held.any()) {
+            sticky = held;
         } else if (press_active && press_polls < min_polls && seconds - press_start_s < kMaxHoldSeconds) {
-            held.buttons = sticky_buttons;
-            held.stick = sticky_stick;
+            held = sticky;
         } else {
-            sticky_buttons = 0;
-            sticky_stick = 0;
+            sticky = {};
         }
-        const bool pressed = held.buttons || held.stick;
+        const bool pressed = held.any();
         if (pressed) {
             if (!press_active) {
                 press_active = true;
@@ -793,12 +799,10 @@ struct Hub final : mac::Sink {
                              seconds, (seconds - press_start_s) * 1000.0, press_polls,
                              static_cast<unsigned long long>(press_gets));
         }
-        mac::PadState state;
-        state.buttons = held.buttons;
-        state.ry = static_cast<float>(held.stick);
+        const mac::PadState state = script::pad_of(held);
         const bool first = d.history.empty();
         if (!first && state == d.last) return;
-        script::log_scripted(held.buttons, &logged_held, seconds);
+        script::log_scripted(state.buttons, &logged_held, seconds);
         if (log_presses && !first)
             script::log_presses(state.buttons & ~d.last.buttons, d.last.ry, state.ry, seconds, kScriptPadName);
         push_reading(d, state, false, now);

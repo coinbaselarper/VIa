@@ -804,6 +804,10 @@ void MetalRenderPipeline::build_rect() {
     if (!vs_lib || vs_lib->source().empty()) {
         rect_wrapper_.error = "vertex library has no MSL source";
         rect_mode_ = RectMode::cpu_rewrite;
+        static std::atomic<int> told{0};
+        if (told.fetch_add(1) < 16)
+            log("rect wrapper impossible for %s: the vertex library has no MSL source (cpu_rewrite; its indirect rect-list "
+                "draws are skipped)", label_text.empty() ? "a pipeline" : label_text.c_str());
         return;
     }
     std::vector<rect::WrapperInput> inputs;

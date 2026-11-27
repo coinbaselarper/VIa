@@ -1091,6 +1091,15 @@ SceneProbe::SceneProbe(MetalContext& context) : context_(context) {
     if (const char* l = std::getenv("GTA6RT_METAL_SCENE_LOG"); l && *l == '1') log_only_ = dump_dir_.empty();
     if (const char* n = std::getenv("GTA6RT_METAL_SCENE_PASSES"); n && *n)
         max_passes_ = std::max<std::size_t>(1, std::strtoull(n, nullptr, 10));
+    if (const char* n = std::getenv("GTA6RT_METAL_SCENE_STAGES"); n && *n)
+        stages_max_ = std::uint32_t(std::min<unsigned long>(64, std::strtoul(n, nullptr, 10)));
+    for (std::string t = std::getenv("GTA6RT_METAL_SCENE_AFTER") ? std::getenv("GTA6RT_METAL_SCENE_AFTER") : ""; !t.empty();) {
+        const auto comma = t.find(',');
+        if (comma) after_.push_back(t.substr(0, comma));
+        t = comma == std::string::npos ? "" : t.substr(comma + 1);
+    }
+    if (const char* r = std::getenv("GTA6RT_METAL_SCENE_RAW"); r && *r == '1') raw_ = true;
+    if (const char* r = std::getenv("GTA6RT_METAL_SCENE_SENTINEL"); r && *r == '1') sentinel_ = true;
     std::fprintf(stderr,
                  "[rt] d3d12-metal scene probe: render size %ux%u, present %s, %s%s (frame %llu, then every %llu, %llu "
                  "times)\n",
@@ -1104,10 +1113,81 @@ SceneProbe::~SceneProbe() = default;
 
 bool SceneProbe::hdr_format(std::uint32_t f) { return f == 2 || f == 10 || f == 26 || f == 67; }
 
-void SceneProbe::draw(const Target* rts, std::uint32_t count, const Target& depth, const char* pipeline,
-                      const char* kind, bool recorded) {
+bool SceneProbe::pass_boundary(const Target* rts, std::uint32_t count, const std::string& next, gpu::CommandList& out,
+                               const Resolve& resolve) {
+    const auto holds = [](const Target* set, std::uint32_t n, ResourceId id) {
+        for (std::uint32_t i = 0; i < n; ++i)
+            if (set[i].id == id) return true;
+        return false;
+    };
+    bool copied = false;
+    const bool prev_wrote = stage_target_.id && holds(cur_.rts.data(), cur_.count, stage_target_.id);
+    const bool next_writes = stage_target_.id && holds(rts, count, stage_target_.id);
+    if (!latched_ && stages_done_ < stages_max_ && (prev_wrote || (next_writes && !stage_written_))) {
+        if (gpu::Texture* t = resolve(stage_target_.id)) {
+            char label[32];
+            std::snprintf(label, sizeof label, "stage%02u", stages_done_);
+            std::fprintf(stderr,
+                         "[rt] d3d12-metal scene %s (draw pass %u, upscaled frame %llu): after %s%s%s (%llu draws, %llu "
+                         "recorded); before %s\n",
+                         label, draw_passes_, static_cast<unsigned long long>(upscaled_frames_ + 1),
+                         short_name(cur_.first).c_str(), cur_.last != cur_.first ? " .. " : "",
+                         cur_.last != cur_.first ? short_name(cur_.last).c_str() : "",
+                         static_cast<unsigned long long>(cur_.calls), static_cast<unsigned long long>(cur_.recorded),
+                         short_name(next).c_str());
+            copied |= queue_readback(out, t, stage_target_, label, false);
+            ++stages_done_;
+            if (sentinel_ && next_writes && !stage_written_) {
+                gpu::TargetView v;
+                v.texture = t;
+                v.mip = stage_target_.mip;
+                v.layer = stage_target_.layer;
+                out.clear_render_target(v, {4096.0f, 0.0f, 4096.0f, 1.0f});
+                std::fprintf(stderr, "[rt] d3d12-metal scene %s: colour target cleared to the sentinel (4096, 0, 4096)\n", label);
+            }
+        }
+    }
+    if (next_writes) stage_written_ = true;
+    for (const std::string& part : after_) {
+        if (cur_.first.find(part) == std::string::npos && cur_.last.find(part) == std::string::npos) continue;
+        for (std::uint32_t i = 0; i < cur_.count && afters_done_ < 96; ++i) {
+            gpu::Texture* t = cur_.rts[i].id ? resolve(cur_.rts[i].id) : nullptr;
+            if (!t) continue;
+            char label[96];
+            std::snprintf(label, sizeof label, "after%02u_%s_rt%u", afters_done_, part.substr(0, 40).c_str(), i);
+            std::fprintf(stderr, "[rt] d3d12-metal scene %s (draw pass %u): %s (%llu draws), target %u %s\n", label,
+                         draw_passes_, short_name(cur_.first).c_str(), static_cast<unsigned long long>(cur_.calls), i,
+                         target_text(cur_.rts[i]).c_str());
+            copied |= queue_readback(out, t, cur_.rts[i], label, false);
+            ++afters_done_;
+        }
+        break;
+    }
+    return copied;
+}
+
+bool SceneProbe::draw(const Target* rts, std::uint32_t count, const Target& depth, const char* pipeline,
+                      const char* kind, bool recorded, gpu::CommandList& out, const Resolve& resolve) {
     std::lock_guard lock(mutex_);
     const char* name = pipeline ? pipeline : "";
+    bool copied = false;
+    {
+        bool same = cur_.count == std::min<std::uint32_t>(count, 8) && cur_.depth.id == depth.id && !cur_.first.empty();
+        for (std::uint32_t i = 0; same && i < cur_.count; ++i) same = cur_.rts[i].id == rts[i].id;
+        if (!same) {
+            if (logging_ && (stages_max_ || !after_.empty()) && !cur_.first.empty())
+                copied = pass_boundary(rts, std::min<std::uint32_t>(count, 8), name, out, resolve);
+            cur_ = Pass{};
+            cur_.count = std::min<std::uint32_t>(count, 8);
+            for (std::uint32_t i = 0; i < cur_.count; ++i) cur_.rts[i] = rts[i];
+            cur_.depth = depth;
+            cur_.first = name;
+            ++draw_passes_;
+        }
+        cur_.last = name;
+        ++cur_.calls;
+        if (recorded) ++cur_.recorded;
+    }
     if (logging_ && passes_.size() < max_passes_) {
         Pass* last = passes_.empty() ? nullptr : &passes_.back();
         const auto same = [&](const Pass& p) {
@@ -1134,7 +1214,7 @@ void SceneProbe::draw(const Target* rts, std::uint32_t count, const Target& dept
     }
     if (count == 1 && rts[0].id && rts[0].width == 1 && rts[0].height == 1 && std::strstr(name, "Exposure"))
         exposure_target_ = rts[0];
-    if (latched_) return;
+    if (latched_) return copied;
     std::uint32_t at_size = 0;
     for (std::uint32_t i = 0; i < count; ++i)
         if (rts[i].id && render_size(rts[i])) ++at_size;
@@ -1155,7 +1235,7 @@ void SceneProbe::draw(const Target* rts, std::uint32_t count, const Target& dept
             if (gbuffer_by_ != name) gbuffer_by_ = name;
             if (depth.id && render_size(depth)) gbuffer_depth_ = depth;
         }
-        return;
+        return copied;
     }
     for (std::uint32_t i = 0; i < count; ++i)
         if (rts[i].id && render_size(rts[i]) && hdr_format(rts[i].format)) {
@@ -1163,6 +1243,7 @@ void SceneProbe::draw(const Target* rts, std::uint32_t count, const Target& dept
             if (hdr_by_ != name) hdr_by_ = name;
         }
     if (!gbuffer_depth_.id && depth.id && render_size(depth)) gbuffer_depth_ = depth;
+    return copied;
 }
 
 bool SceneProbe::queue_readback(gpu::CommandList& out, gpu::Texture* texture, const Target& t, const std::string& name,
@@ -1197,7 +1278,12 @@ bool SceneProbe::queue_readback(gpu::CommandList& out, gpu::Texture* texture, co
     k.width = t.width;
     k.height = t.height;
     k.depth_plane = t.depth;
+    // Probe copies carry no title barrier: order them against the work around them (untracked placement heaps).
+    gpu::Barrier fence;
+    fence.type = gpu::BarrierType::uav;
+    out.barrier({&fence, 1});
     out.copy_texture_to_buffer(k);
+    out.barrier({&fence, 1});
     if (!exposure_only && !dump_dir_.empty()) {
         char file[96];
         std::snprintf(file, sizeof file, "/scene_%05llu_%s.png", static_cast<unsigned long long>(upscaled_frames_), name.c_str());
@@ -1226,6 +1312,7 @@ bool SceneProbe::dispatch(const char* pipeline, bool recorded, gpu::CommandList&
     if (!upscaler || latched_) return false;
     latched_ = true;
     ++upscaled_frames_;
+    if (hdr_.id) stage_target_ = hdr_;
     if (upscaled_frames_ == 1 || upscaled_frames_ == 10 || upscaled_frames_ % 100 == 0)
         std::fprintf(stderr, "[rt] d3d12-metal scene latch %llu (frame %llu, at %s): colour %s by %s; G-buffer %u by %s\n",
                      static_cast<unsigned long long>(upscaled_frames_), static_cast<unsigned long long>(frame_),
@@ -1363,6 +1450,59 @@ void SceneProbe::write_readback(Readback& r) {
             d[c] = std::uint8_t(std::clamp(x, 0.0, 1.0) * 255 + 0.5);
         }
     }
+    if (hdr && n > 16) {
+        std::vector<float> lum(n);
+        std::uint64_t over1 = 0, over64 = 0, near_max = 0, block_zero = 0, block_n = 0;
+        double block_sum = 0, rest_sum = 0;
+        const std::uint32_t bx = t.width * 2 / 5, by0 = t.height * 7 / 30, by1 = t.height * 14 / 30;
+        for (std::size_t i = 0; i < n; ++i) {
+            const float* v = &px[i * 4];
+            const double l = std::max(0.0, 0.2126 * v[0] + 0.7152 * v[1] + 0.0722 * v[2]);
+            lum[i] = float(l);
+            over1 += l > 1.0, over64 += l > 64.0, near_max += std::max({v[0], v[1], v[2]}) >= 60000.0f;
+            const std::uint32_t x = std::uint32_t(i % t.width), y = std::uint32_t(i / t.width);
+            if (x < bx && y >= by0 && y < by1) {
+                ++block_n, block_sum += l;
+                block_zero += l <= 0;
+            } else {
+                rest_sum += l;
+            }
+        }
+        const auto pct = [&](double q) {
+            const std::size_t k = std::min(n - 1, std::size_t(q * double(n)));
+            std::nth_element(lum.begin(), lum.begin() + std::ptrdiff_t(k), lum.end());
+            return double(lum[k]);
+        };
+        const double p50 = pct(0.5), p90 = pct(0.9), p99 = pct(0.99);
+        std::fprintf(stderr,
+                     "[rt] d3d12-metal scene %s luminance: p50 %.4g p90 %.4g p99 %.4g; > 1: %.1f%%, > 64: %.1f%%, a "
+                     "channel >= 60000: %.2f%%; top-left block [0,%u)x[%u,%u) mean %.4g (%.1f%% zero), elsewhere mean %.4g\n",
+                     r.name.c_str(), p50, p90, p99, 100.0 * double(over1) / double(n), 100.0 * double(over64) / double(n),
+                     100.0 * double(near_max) / double(n), bx, by0, by1, block_n ? block_sum / double(block_n) : 0.0,
+                     block_n ? 100.0 * double(block_zero) / double(block_n) : 0.0,
+                     n > block_n ? rest_sum / double(n - block_n) : 0.0);
+    } else if (n <= 16) {
+        std::string texels;
+        for (std::size_t i = 0; i < n; ++i) {
+            std::snprintf(b, sizeof b, "%s(", i ? " " : "");
+            texels += b;
+            for (int c = 0; c < channels; ++c) {
+                std::snprintf(b, sizeof b, "%s%.6g", c ? ", " : "", px[i * 4 + c]);
+                texels += b;
+            }
+            texels += ")";
+        }
+        std::fprintf(stderr, "[rt] d3d12-metal scene %s texels: %s\n", r.name.c_str(), texels.c_str());
+    }
+    if (raw_ && r.path.size() > 4) {
+        const std::string raw = r.path.substr(0, r.path.size() - 4) + ".raw";
+        if (std::FILE* f = std::fopen(raw.c_str(), "wb")) {
+            std::fwrite(src, 1, std::size_t(r.pitch) * t.height, f);
+            std::fclose(f);
+            std::fprintf(stderr, "[rt] d3d12-metal scene %s raw: DXGI %u %ux%u, %u bytes a texel, pitch %u -> %s\n",
+                         r.name.c_str(), t.format, t.width, t.height, r.texel, r.pitch, raw.c_str());
+        }
+    }
     bool written = false;
     if (std::FILE* f = std::fopen(r.path.c_str(), "wb")) {
         written = present_dump::write_png(f, VkExtent2D{t.width, t.height}, VK_FORMAT_R8G8B8A8_UNORM, false, rgba.data());
@@ -1411,6 +1551,9 @@ void SceneProbe::end_frame() {
     const std::uint64_t due = dump_first_ + dumps_done_ * dump_every_;
     logging_ = (!dump_dir_.empty() || log_only_) && dumps_done_ < dump_count_ && upscaled_frames_ + 1 >= due;
     latched_ = false;
+    stages_done_ = afters_done_ = draw_passes_ = 0;
+    stage_written_ = false;
+    cur_ = Pass{};
     hdr_ = {};
     hdr_by_.clear();
     gbuffer_count_ = 0;
@@ -1632,6 +1775,65 @@ std::string GpuDebug::take_report() {
                           static_cast<unsigned long long>(base), b.stride, b.num_records);
             out += t + describe_va(base);
         }
+    }
+    out += pixel_dumps(w);
+    return out;
+}
+
+// Pixel register dumps of the exposure worker's debug variants (build/expo-x86_64/tools/pix_dump.py): word 3000 + k
+// counts dumps of shader k, its slots at 4096 + 1024 k + 512 s.
+std::string GpuDebug::pixel_dumps(volatile std::uint32_t* w) {
+    std::string out;
+    char t[256];
+    const auto f = [](std::uint32_t u) {
+        float x;
+        std::memcpy(&x, &u, 4);
+        return x;
+    };
+    for (std::uint32_t k = 0; k < 8; ++k) {
+        const std::uint32_t taken = w[3000 + k];
+        if (!taken) continue;
+        for (std::uint32_t s = 0; s < std::min<std::uint32_t>(taken, 2); ++s) {
+            std::uint32_t r[512];
+            for (int i = 0; i < 512; ++i) r[i] = w[4096 + 1024 * k + 512 * s + i];
+            if (r[300] != (0xE0000000u | k)) continue;
+            std::snprintf(t, sizeof t, "\n    pixel dump shader %u slot %u (%u taken): frag (%.1f, %.1f) colour0 (%g %g %g %g) colour1 "
+                                       "(%g %g %g %g / 0x%x)\n      s:", k, s, taken, f(r[290]), f(r[291]), f(r[292]), f(r[293]),
+                          f(r[294]), f(r[295]), f(r[296]), f(r[297]), f(r[298]), f(r[299]), r[297]);
+            out += t;
+            for (int i = 0; i < 128; ++i)
+                if (r[i]) {
+                    std::snprintf(t, sizeof t, " s%d=%x(%g)", i, r[i], f(r[i]));
+                    out += t;
+                }
+            out += "\n      v:";
+            for (int i = 0; i < 128; ++i)
+                if (r[128 + i]) {
+                    std::snprintf(t, sizeof t, " v%d=%g", i, f(r[128 + i]));
+                    out += t;
+                }
+            out += "\n      user:";
+            for (int i = 0; i < 32; ++i)
+                if (r[256 + i]) {
+                    std::snprintf(t, sizeof t, " %d=%x", i, r[256 + i]);
+                    out += t;
+                }
+            for (int p = 0; p < 16; ++p) {
+                const std::uint32_t* q = r + 304 + 12 * p;
+                if (304 + 12 * p + 12 > 512) break;
+                bool any = false;
+                for (int i = 0; i < 12; ++i) any |= q[i] != 0;
+                if (!any) continue;
+                std::snprintf(t, sizeof t, "\n      probe %d: %08x %08x %08x %08x |", p, q[0], q[1], q[2], q[3]);
+                out += t;
+                for (int i = 4; i < 12; ++i) {
+                    std::snprintf(t, sizeof t, " %g(%x)", f(q[i]), q[i]);
+                    out += t;
+                }
+            }
+        }
+        w[3000 + k] = 0;
+        for (int i = 0; i < 1024; ++i) w[4096 + 1024 * k + i] = 0;
     }
     return out;
 }

@@ -78,6 +78,8 @@ std::uint64_t title_pool_generation();
 // The title ranges whose backing went or changed (unmapped, remapped, decommitted, released) after generation
 // `since`, into `out` ({0, UINT64_MAX} when the log no longer reaches back that far); returns the generation now.
 std::uint64_t title_pool_removals(std::uint64_t since, std::vector<std::pair<std::uint64_t, std::uint64_t>>& out);
+// The title ranges that became pool views (mapped, committed) after generation `since`, as title_pool_removals.
+std::uint64_t title_pool_additions(std::uint64_t since, std::vector<std::pair<std::uint64_t, std::uint64_t>>& out);
 // The pool's host range, false when the title pool is off.
 bool title_pool_range(void** base, std::uint64_t* size);
 struct TitlePoolStats {

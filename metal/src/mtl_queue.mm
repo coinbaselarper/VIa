@@ -4,6 +4,9 @@
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
 #include <pthread.h>
+#include <sys/sysctl.h>
+#include <sys/time.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <chrono>
@@ -1225,6 +1228,377 @@ private:
     std::unordered_map<std::string, Agg> agg_;
 };
 
+// One encoder as the pass census and the pass timer see it.
+struct PassRecord {
+    char kind = 'R';
+    std::uint32_t sample = 0;
+    bool timed = false;
+    std::uint32_t work = 0;
+    std::uint32_t w = 0, h = 0;
+    std::string first, last, targets, loads, stores, ended_by, split_by;
+    std::uint64_t load_bytes = 0, store_bytes = 0, clear_bytes = 0;
+    bool clear_only = false;
+    bool same_targets = false, adjacent = false;
+    std::uint32_t index = 0;
+    double ms = -1, vertex_ms = -1, fragment_ms = -1;
+    struct Records {
+        id<MTLBuffer> buffer = nil;
+        std::uint64_t offset = 0;
+        std::uint32_t stride = 0, count = 0;
+        bool mesh = false;
+    };
+    std::vector<Records> records;
+    std::uint64_t issued = 0, nonempty = 0, groups = 0;
+};
+
+// GTA6RT_METAL_PASS_CENSUS=1 (off by default; on with GTA6RT_METAL_PASS_TIMING): with every GPU time report, per
+// presented frame, encoders by kind, render-pass attachment actions and the bytes they move, what ended each render
+// pass, and render passes that open on the same attachments as the render pass before them in their command buffer.
+class PassCensus {
+public:
+    static PassCensus& get() {
+        static PassCensus* c = new PassCensus;
+        return *c;
+    }
+    bool on() const { return on_; }
+    void add(MetalDevice* device, const PassRecord& r) {
+        std::lock_guard lock(mutex_);
+        device_ = device;
+        const double now = CACurrentMediaTime();
+        if (last_ == 0) last_ = now;
+        if (now - last_ >= 10) {
+            last_ = now;
+            log("%s", report_locked().c_str());
+        }
+        if (r.kind == 'C') {
+            ++compute_;
+            return;
+        }
+        if (r.kind == 'B') {
+            ++blit_;
+            return;
+        }
+        ++render_;
+        clear_only_ += r.clear_only;
+        for (char c : r.loads) loads_[std::size_t(c == 'L' ? 0 : c == 'C' ? 1 : 2)]++;
+        for (char c : r.stores) stores_[std::size_t(c == 'S' ? 0 : 1)]++;
+        load_bytes_ += r.load_bytes;
+        store_bytes_ += r.store_bytes;
+        clear_bytes_ += r.clear_bytes;
+        ++ended_by_[r.ended_by];
+        if (r.same_targets) ++(r.adjacent ? same_adjacent_ : same_apart_)[r.split_by];
+    }
+    std::string report_locked() {
+        const std::uint64_t presents = device_ ? device_->counters().presents.load() : 0;
+        const double f = std::max(1.0, double(presents - seen_presents_));
+        seen_presents_ = presents;
+        auto list = [&](std::map<std::string, std::uint64_t>& m) {
+            std::vector<std::pair<std::string, std::uint64_t>> v(m.begin(), m.end());
+            std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+            if (v.size() > 16) v.resize(16);
+            std::string out;
+            for (const auto& [k, n] : v) {
+                char t[128];
+                std::snprintf(t, sizeof t, "%s%s %.1f", out.empty() ? "" : ", ", k.c_str(), double(n) / f);
+                out += t;
+            }
+            m.clear();
+            return out.empty() ? std::string("none") : out;
+        };
+        char text[640];
+        std::snprintf(text, sizeof text,
+                      "pass census, per frame (%.0f frames): render passes %.1f (clear only %.1f), compute encoders "
+                      "%.1f, blit encoders %.1f; attachments load %.1f / clear %.1f / dont-care %.1f, store %.1f / "
+                      "dont-care %.1f; MiB loaded %.1f, stored %.1f, cleared %.1f |",
+                      f, double(render_) / f, double(clear_only_) / f, double(compute_) / f, double(blit_) / f,
+                      double(loads_[0]) / f, double(loads_[1]) / f, double(loads_[2]) / f, double(stores_[0]) / f,
+                      double(stores_[1]) / f, double(load_bytes_) / f / 1048576.0, double(store_bytes_) / f / 1048576.0,
+                      double(clear_bytes_) / f / 1048576.0);
+        std::string out = text;
+        out += " render pass ended by: " + list(ended_by_);
+        out += " | next pass on the same attachments, nothing between, after: " + list(same_adjacent_);
+        out += " | same attachments with other encoders between, after: " + list(same_apart_);
+        render_ = clear_only_ = compute_ = blit_ = 0;
+        loads_ = {};
+        stores_ = {};
+        load_bytes_ = store_bytes_ = clear_bytes_ = 0;
+        return out;
+    }
+
+private:
+    PassCensus() {
+        const char* v = std::getenv("GTA6RT_METAL_PASS_CENSUS");
+        const char* t = std::getenv("GTA6RT_METAL_PASS_TIMING");
+        on_ = (v && *v && std::strcmp(v, "0") != 0) || (t && *t && std::strcmp(t, "0") != 0);
+    }
+    bool on_ = false;
+    std::mutex mutex_;
+    double last_ = 0;
+    MetalDevice* device_ = nullptr;
+    std::uint64_t seen_presents_ = 0, render_ = 0, clear_only_ = 0, compute_ = 0, blit_ = 0;
+    std::array<std::uint64_t, 3> loads_{};
+    std::array<std::uint64_t, 2> stores_{};
+    std::uint64_t load_bytes_ = 0, store_bytes_ = 0, clear_bytes_ = 0;
+    std::map<std::string, std::uint64_t> ended_by_, same_adjacent_, same_apart_;
+};
+
+// GTA6RT_METAL_PASS_TIMING=<start s after process start>[,frames (4)[,period s (0: once)]] (off by default): from the
+// start until that many frames were presented, every encoder of the title's queues takes timestamps at its start and
+// end (render: vertex start to fragment end) and waits for every encoder before it on its queue, so the times are
+// serialized; when those command buffers are done, the passes go to the log by key (kind, queue, attachments, first
+// pipeline), per presented frame.
+// GTA6RT_METAL_PASS_TIMING_TSV=<file>: one line per timed encoder as well. GTA6RT_METAL_PASS_TIMING_SERIAL=0: no waits.
+// GTA6RT_METAL_PASS_TIMING_SPLIT=1: in the window an implicit render pass also ends where the pipeline changes, so each
+// segment is one pipeline's draws (each split adds a load and a store of the attachments); =2: from the second window.
+class PassTiming {
+public:
+    static constexpr std::uint32_t kSamples = 4096;
+    static PassTiming& get() {
+        static PassTiming* t = new PassTiming;
+        return *t;
+    }
+    bool on() const { return on_; }
+    bool serial() const { return serial_; }
+    bool split() const { return split_ == 1 || (split_ == 2 && windows_ > 0); }
+    bool begin_command_buffer(MetalDevice* device) {
+        const double now = CACurrentMediaTime() - t0_;
+        std::lock_guard lock(mutex_);
+        if (done_ || closed_ || now < start_) return false;
+        if (!open_) {
+            open_ = true;
+            window_start_ = now;
+            presents0_ = device->counters().presents.load();
+            device_ = device;
+        }
+        if (device->counters().presents.load() - presents0_ >= frames_) {
+            closed_ = true;
+            window_end_ = now;
+            presents1_ = device->counters().presents.load();
+            if (!outstanding_) report(now);
+            return false;
+        }
+        ++outstanding_;
+        ++command_buffers_;
+        return true;
+    }
+    // Buffers are reused: a sample a stage did not take this time keeps an older value, which is never above the
+    // largest value the buffer held when it was last resolved, so those are read as missing.
+    id<MTLCounterSampleBuffer> take_buffer(MetalDevice* d, std::uint64_t* high) {
+        {
+            std::lock_guard lock(mutex_);
+            if (!pool_.empty()) {
+                id<MTLCounterSampleBuffer> b = pool_.back().first;
+                *high = pool_.back().second;
+                pool_.pop_back();
+                return b;
+            }
+        }
+        *high = 0;
+        MTLCounterSampleBufferDescriptor* sd = [MTLCounterSampleBufferDescriptor new];
+        sd.counterSet = d->timestamp_counters();
+        sd.sampleCount = kSamples;
+        sd.storageMode = MTLStorageModeShared;
+        NSError* e = nil;
+        id<MTLCounterSampleBuffer> b = [d->mtl() newCounterSampleBufferWithDescriptor:sd error:&e];
+        if (!b && failures_.fetch_add(1) < 4) log("pass timing: %s", e.localizedDescription.UTF8String);
+        return b;
+    }
+    void completed(std::vector<PassRecord>& passes, NSArray* buffers, const std::vector<std::uint64_t>& highs,
+                   std::uint32_t last_used, double tick_ns, double gpu_ms, std::uint64_t serial,
+                   const std::string& queue, std::uint32_t untimed) {
+        std::vector<std::uint64_t> stamps;
+        std::vector<std::pair<id<MTLCounterSampleBuffer>, std::uint64_t>> back;
+        for (NSUInteger b = 0; b < buffers.count; ++b) {
+            const std::uint32_t used = b + 1 == buffers.count ? last_used : kSamples;
+            id<MTLCounterSampleBuffer> buf = buffers[b];
+            NSData* data = used ? [buf resolveCounterRange:NSMakeRange(0, used)] : nil;
+            const auto* st = data ? static_cast<const MTLCounterResultTimestamp*>(data.bytes) : nullptr;
+            const std::size_t n = data ? data.length / sizeof(MTLCounterResultTimestamp) : 0;
+            const std::uint64_t high = b < highs.size() ? highs[b] : 0;
+            std::uint64_t top = high;
+            stamps.resize(std::size_t(b) * kSamples + kSamples, 0);
+            for (std::size_t i = 0; i < n; ++i) {
+                const std::uint64_t t = st[i].timestamp;
+                if (t == MTLCounterErrorValue || t <= high) continue;
+                stamps[std::size_t(b) * kSamples + i] = t;
+                top = std::max(top, t);
+            }
+            back.emplace_back(buf, top);
+        }
+        auto ok = [&](std::uint32_t i) { return i < stamps.size() && stamps[i]; };
+        std::lock_guard lock(mutex_);
+        for (auto& b : back) pool_.push_back(std::move(b));
+        for (PassRecord& p : passes) {
+            const std::uint32_t count = p.kind == 'R' ? 4 : 2;
+            std::uint64_t lo = UINT64_MAX, hi = 0;
+            for (std::uint32_t k = 0; p.timed && k < count; ++k)
+                if (ok(p.sample + k)) {
+                    lo = std::min<std::uint64_t>(lo, stamps[p.sample + k]);
+                    hi = std::max<std::uint64_t>(hi, stamps[p.sample + k]);
+                }
+            p.ms = hi > lo ? double(hi - lo) * tick_ns / 1e6 : (p.timed && lo != UINT64_MAX ? 0.0 : -1.0);
+            if (p.kind == 'R' && p.timed) {
+                const auto span = [&](std::uint32_t a) {
+                    return ok(p.sample + a) && ok(p.sample + a + 1) && stamps[p.sample + a + 1] >= stamps[p.sample + a]
+                               ? double(stamps[p.sample + a + 1] - stamps[p.sample + a]) * tick_ns / 1e6
+                               : -1.0;
+                };
+                p.vertex_ms = span(0);
+                p.fragment_ms = span(2);
+            }
+            for (PassRecord::Records& r : p.records) {
+                p.issued += r.count;
+                const auto* base = r.buffer.contents ? static_cast<const std::uint8_t*>(r.buffer.contents) + r.offset : nullptr;
+                for (std::uint32_t i = 0; base && i < r.count; ++i) {
+                    const auto* w = reinterpret_cast<const std::uint32_t*>(base + std::uint64_t(i) * r.stride);
+                    const std::uint64_t g = r.mesh ? std::uint64_t(w[0]) * w[1] * w[2] : std::uint64_t(w[0]) * w[1];
+                    p.nonempty += g != 0;
+                    p.groups += r.mesh ? g : 0;
+                }
+                r.buffer = nil;
+            }
+            char key[512];
+            std::snprintf(key, sizeof key, "%c|%s|%s|%s", p.kind, queue.c_str(), p.targets.c_str(),
+                          p.first.substr(0, 96).c_str());
+            Agg& a = agg_[key];
+            ++a.passes;
+            a.work += p.work;
+            if (p.ms >= 0) {
+                a.ms += p.ms;
+                a.max_ms = std::max(a.max_ms, p.ms);
+                timed_ms_[queue] += p.ms;
+            } else {
+                ++a.unsampled;
+            }
+            a.loads = p.loads;
+            a.stores = p.stores;
+            a.pixels = std::uint64_t(p.w) * p.h;
+            a.load_bytes += p.load_bytes;
+            a.store_bytes += p.store_bytes;
+            a.issued += p.issued;
+            if (p.vertex_ms > 0) a.vertex_ms += p.vertex_ms;
+            if (p.fragment_ms > 0) a.fragment_ms += p.fragment_ms;
+            a.nonempty += p.nonempty;
+            a.groups += p.groups;
+            if (a.last.empty() && p.last != p.first) a.last = p.last;
+            if (tsv_)
+                std::fprintf(tsv_, "%d\t%s\t%llu\t%u\t%c\t%s\t%s\t%s\t%u\t%ux%u\t%s\t%s\t%.1f\t%.1f\t%s\t%d\t%s\t%llu\t%llu\t%llu\t%.4f\t%.4f\t%.4f\n",
+                             windows_.load(), queue.c_str(), (unsigned long long)serial, p.index, p.kind, p.targets.c_str(),
+                             p.first.c_str(), p.last.c_str(), p.work, p.w, p.h, p.loads.c_str(), p.stores.c_str(),
+                             double(p.load_bytes) / 1048576.0, double(p.store_bytes) / 1048576.0, p.ended_by.c_str(),
+                             p.same_targets ? (p.adjacent ? 2 : 1) : 0, p.split_by.c_str(),
+                             (unsigned long long)p.issued, (unsigned long long)p.nonempty, (unsigned long long)p.groups, p.ms,
+                             p.vertex_ms, p.fragment_ms);
+        }
+        untimed_ += untimed;
+        gpu_ms_[queue] += gpu_ms;
+        if (outstanding_) --outstanding_;
+        if (!closed_ || outstanding_) return;
+        report(CACurrentMediaTime() - t0_);
+    }
+    void abandoned() {
+        std::lock_guard lock(mutex_);
+        if (outstanding_) --outstanding_;
+        if (closed_ && !outstanding_) report(CACurrentMediaTime() - t0_);
+    }
+
+private:
+    struct Agg {
+        std::uint64_t passes = 0, work = 0, unsampled = 0, pixels = 0, load_bytes = 0, store_bytes = 0;
+        std::uint64_t issued = 0, nonempty = 0, groups = 0;
+        double ms = 0, max_ms = 0, vertex_ms = 0, fragment_ms = 0;
+        std::string loads, stores, last;
+    };
+    PassTiming() {
+        t0_ = CACurrentMediaTime();
+        kinfo_proc info{};
+        std::size_t size = sizeof info;
+        int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, getpid()};
+        timeval now{};
+        gettimeofday(&now, nullptr);
+        if (sysctl(mib, 4, &info, &size, nullptr, 0) == 0 && info.kp_proc.p_starttime.tv_sec)
+            t0_ -= double(now.tv_sec - info.kp_proc.p_starttime.tv_sec) +
+                   double(now.tv_usec - info.kp_proc.p_starttime.tv_usec) / 1e6;
+        const char* v = std::getenv("GTA6RT_METAL_PASS_TIMING");
+        if (!v || !*v || std::strcmp(v, "0") == 0) return;
+        on_ = true;
+        double a = 120, b = 4, c = 0;
+        const int got = std::sscanf(v, "%lf,%lf,%lf", &a, &b, &c);
+        start_ = got >= 1 ? a : 120;
+        frames_ = got >= 2 ? std::uint64_t(std::max(1.0, b)) : 4;
+        period_ = got >= 3 ? c : 0;
+        serial_ = !env_is_zero("GTA6RT_METAL_PASS_TIMING_SERIAL");
+        if (const char* sp = std::getenv("GTA6RT_METAL_PASS_TIMING_SPLIT")) split_ = std::atoi(sp);
+        if (const char* p = std::getenv("GTA6RT_METAL_PASS_TIMING_TSV"); p && *p) {
+            tsv_ = std::fopen(p, "w");
+            if (tsv_)
+                std::fprintf(tsv_, "window\tqueue\tcb\tindex\tkind\ttargets\tfirst\tlast\twork\tsize\tloads\tstores\tload_mib\t"
+                                   "store_mib\tended_by\tsame_targets\tsplit_by\tissued\tnonempty\tgroups\tms\tvertex_ms\tfragment_ms\n");
+        }
+        log("pass timing: %llu frames from %.1f s after start%s%s", (unsigned long long)frames_, start_,
+            period_ > 0 ? " (repeated)" : "", serial_ ? ", encoders serialized" : "");
+    }
+    void report(double now) {
+        const double frames = std::max(1.0, double(presents1_ - presents0_));
+        std::vector<std::pair<std::string, Agg>> rows(agg_.begin(), agg_.end());
+        std::sort(rows.begin(), rows.end(), [](const auto& x, const auto& y) { return x.second.ms > y.second.ms; });
+        double timed = 0, gpu = 0;
+        std::string queues;
+        for (const auto& [q, ms] : gpu_ms_) {
+            const double t = timed_ms_[q];
+            timed += t;
+            gpu += ms;
+            char line[200];
+            std::snprintf(line, sizeof line, "%s%s: command buffers %.1f ms, passes %.1f ms", queues.empty() ? "" : "; ",
+                          q.c_str(), ms / frames, t / frames);
+            queues += line;
+        }
+        std::fprintf(stderr, "[metal] pass timing: window %.2f s from %.1f s (report %.1f s after it)%s, %.0f presents, %llu "
+                             "command buffers, %zu pass keys, %llu encoders untimed; per frame: command buffers %.1f ms, "
+                             "timed passes %.1f ms | %s\n",
+                     window_end_ - window_start_, window_start_, now - window_end_, split() ? ", split at pipelines" : "",
+                     frames,
+                     (unsigned long long)command_buffers_, rows.size(), (unsigned long long)untimed_, gpu / frames,
+                     timed / frames, queues.c_str());
+        std::size_t shown = 0;
+        for (const auto& [key, a] : rows) {
+            if (++shown > 40) break;
+            std::fprintf(stderr, "[metal]   %5.1f%% %8.2f ms/frame (max %6.2f; vertex %.1f, fragment %.1f) x%-5.1f work %-7.1f indirect records "
+                                 "%.0f (non-empty %.0f, mesh groups %.0f) px %-8llu L %s S %s MiB l/s %.1f/%.1f%s | "
+                                 "%s%s%s\n",
+                         timed > 0 ? 100.0 * a.ms / timed : 0.0, a.ms / frames, a.max_ms, a.vertex_ms / frames,
+                         a.fragment_ms / frames, double(a.passes) / frames, double(a.work) / frames, double(a.issued) / frames, double(a.nonempty) / frames,
+                         double(a.groups) / frames, (unsigned long long)a.pixels, a.loads.c_str(), a.stores.c_str(),
+                         double(a.load_bytes) / frames / 1048576.0, double(a.store_bytes) / frames / 1048576.0,
+                         a.unsampled ? " (some unsampled)" : "", key.c_str(), a.last.empty() ? "" : " .. ",
+                         a.last.substr(0, 80).c_str());
+        }
+        if (tsv_) std::fflush(tsv_);
+        agg_.clear();
+        gpu_ms_.clear();
+        timed_ms_.clear();
+        open_ = closed_ = false;
+        command_buffers_ = untimed_ = 0;
+        ++windows_;
+        if (period_ <= 0) done_ = true;
+        else start_ = window_start_ + period_;
+    }
+
+    bool on_ = false, serial_ = true, open_ = false, closed_ = false, done_ = false;
+    int split_ = 0;
+    std::atomic<int> windows_{0};
+    double t0_ = 0, start_ = 120, period_ = 0, window_start_ = 0, window_end_ = 0;
+    std::uint64_t frames_ = 4, presents1_ = 0;
+    std::mutex mutex_;
+    MetalDevice* device_ = nullptr;
+    std::uint64_t presents0_ = 0, outstanding_ = 0, command_buffers_ = 0, untimed_ = 0;
+    std::map<std::string, double> gpu_ms_, timed_ms_;
+    std::unordered_map<std::string, Agg> agg_;
+    std::atomic<std::uint32_t> failures_{0};
+    std::vector<std::pair<id<MTLCounterSampleBuffer>, std::uint64_t>> pool_;
+    FILE* tsv_ = nullptr;
+};
+
 class Encoder {
 public:
     Encoder(MetalQueue* queue) : q_(queue), d_(queue->device()) {}
@@ -1398,6 +1772,47 @@ private:
     std::uint32_t timing_used_ = 0;
     bool timed_compute(const PipelineCore* p);
     void finish_timing();
+
+    struct Att {
+        MetalTexture* t = nullptr;
+        std::uint32_t mip = 0;
+        MTLLoadAction load = MTLLoadActionLoad;
+        MTLStoreAction store = MTLStoreActionUnknown;
+        bool depth = false;
+    };
+    const char* cause_ = "start";
+    std::string cause_text_;
+    bool census_ = PassCensus::get().on();
+    bool record_open_ = false;
+    PassRecord rec_;
+    std::vector<Att> atts_, rec_atts_;
+    std::string prev_targets_, prev_ended_by_;
+    bool other_since_render_ = false;
+    std::uint32_t pass_index_ = 0;
+    int pass_cb_ = -1;
+    id<MTLCounterSampleBuffer> pass_samples_ = nil;
+    NSMutableArray* pass_buffers_ = nil;
+    std::vector<std::uint64_t> pass_highs_;
+    std::uint32_t pass_used_ = 0, pass_untimed_ = 0;
+    std::vector<PassRecord> passes_;
+    void note_att(MetalTexture* t, std::uint32_t mip, MTLLoadAction load, MTLStoreAction store, bool depth) {
+        if (census_ && t) atts_.push_back({t, mip, load, store, depth});
+    }
+    bool pass_sample(std::uint32_t n, std::uint32_t* base);
+    bool pass_serial() const { return pass_cb_ == 1 && PassTiming::get().serial(); }
+    const void* split_pso_ = nullptr;
+    void timing_split(const void* pso) {
+        if (!render_ || explicit_ || pass_cb_ != 1 || !PassTiming::get().split() || !pso) return;
+        if (split_pso_ && split_pso_ != pso && label_work_) {
+            cause_ = "timing split (pipeline change)";
+            end_encoder();
+        }
+        split_pso_ = pso;
+    }
+    void open_record(char kind, bool timed, std::uint32_t sample, std::uint32_t w = 0, std::uint32_t h = 0);
+    void close_record();
+    void finish_pass_timing();
+    void barrier_cause(const CmdBarrier& c);
 };
 
 Status Encoder::run(std::span<gpu::CommandList* const> lists) {
@@ -1425,6 +1840,7 @@ Status Encoder::run(std::span<gpu::CommandList* const> lists) {
         auto* ml = static_cast<MetalCommandList*>(l);
         cmds_ = &ml->commands();
         for (pos_ = 0; pos_ < cmds_->size(); ++pos_) visit((*cmds_)[pos_]);
+        cause_ = "end of command list";
         end_encoder();
         flush_clears();
         explicit_ = false;
@@ -1495,6 +1911,7 @@ void Encoder::close_command_buffer() {
     scratch_total_ = prepass_records_ = 0;
     prepass_largest_ = 0;
     finish_timing();
+    finish_pass_timing();
     q_->end_command_buffer(cb_, {}, std::move(summary_));
     summary_.clear();
     label_index_ = 0;
@@ -1534,6 +1951,7 @@ void Encoder::barrier(const CmdBarrier& c) {
         }
     }
     if (!fenced) return;
+    if (census_ && render_) barrier_cause(c);
     if (compute_ && compute_joined_ && pending_.empty()) {
         [compute_ memoryBarrierWithScope:MTLBarrierScopeBuffers | MTLBarrierScopeTextures];
         d_->counters().barriers_in_encoder++;
@@ -1546,6 +1964,13 @@ void Encoder::barrier(const CmdBarrier& c) {
 }
 
 void Encoder::visit(const Cmd& cmd) {
+    static constexpr const char* kNames[] = {"begin_pass", "end_pass", "set_targets", "clear_target", "clear_depth",
+                                             "discard", "draw", "copy_buffer", "copy_buffer_texture", "barrier",
+                                             "write_value", "wait_value", "begin_event", "end_event", "dispatch",
+                                             "draw_mesh", "indirect", "query", "resolve_queries", "write_timestamp",
+                                             "copy_texture", "fill_u32"};
+    static_assert(std::size(kNames) == std::variant_size_v<Cmd>);
+    cause_ = kNames[cmd.index()];
     if (auto* c = std::get_if<CmdBeginPass>(&cmd)) {
         end_encoder();
         flush_clears();
@@ -1727,6 +2152,7 @@ void Encoder::visit(const Cmd& cmd) {
             const bool on_cb = event_on_cb_.back();
             event_on_cb_.pop_back();
             if (on_cb) {
+                cause_ = "end_event (debug group on the command buffer)";
                 end_encoder();
                 [cb_ popDebugGroup];
             }
@@ -1749,13 +2175,25 @@ void Encoder::visit(const Cmd& cmd) {
 id<MTLBlitCommandEncoder> Encoder::blit() {
     if (render_ || compute_) end_encoder();
     if (!blit_) {
-        blit_ = [cb_ blitCommandEncoder];
-        const EncoderFences f = q_->open_encoder(join_ ? MetalQueue::Join::join : MetalQueue::Join::none, {});
+        std::uint32_t sample = 0;
+        const bool timed = pass_sample(2, &sample);
+        if (timed) {
+            MTLBlitPassDescriptor* bpd = [MTLBlitPassDescriptor blitPassDescriptor];
+            bpd.sampleBufferAttachments[0].sampleBuffer = pass_samples_;
+            bpd.sampleBufferAttachments[0].startOfEncoderSampleIndex = sample % PassTiming::kSamples;
+            bpd.sampleBufferAttachments[0].endOfEncoderSampleIndex = sample % PassTiming::kSamples + 1;
+            blit_ = [cb_ blitCommandEncoderWithDescriptor:bpd];
+        } else {
+            blit_ = [cb_ blitCommandEncoder];
+        }
+        const EncoderFences f =
+            q_->open_encoder(join_ || pass_serial() ? MetalQueue::Join::join : MetalQueue::Join::none, {});
         join_ = false;
         for (std::uint32_t i = 0; i < f.wait_count; ++i) [blit_ waitForFence:f.wait[i]];
         update_ = f.update;
         d_->counters().blit_encoders++;
         begin_label("blit");
+        open_record('B', timed, sample);
     }
     note_work();
     return blit_;
@@ -1764,15 +2202,28 @@ id<MTLBlitCommandEncoder> Encoder::blit() {
 id<MTLComputeCommandEncoder> Encoder::compute() {
     if (render_ || blit_) end_encoder();
     if (!compute_) {
-        compute_ = [cb_ computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
+        std::uint32_t sample = 0;
+        const bool timed = pass_sample(2, &sample);
+        if (timed) {
+            MTLComputePassDescriptor* cpd = [MTLComputePassDescriptor computePassDescriptor];
+            cpd.dispatchType = MTLDispatchTypeConcurrent;
+            cpd.sampleBufferAttachments[0].sampleBuffer = pass_samples_;
+            cpd.sampleBufferAttachments[0].startOfEncoderSampleIndex = sample % PassTiming::kSamples;
+            cpd.sampleBufferAttachments[0].endOfEncoderSampleIndex = sample % PassTiming::kSamples + 1;
+            compute_ = [cb_ computeCommandEncoderWithDescriptor:cpd];
+        } else {
+            compute_ = [cb_ computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
+        }
         declare_named(compute_);
-        const EncoderFences f = q_->open_encoder(join_ ? MetalQueue::Join::join : MetalQueue::Join::none, {});
+        const EncoderFences f =
+            q_->open_encoder(join_ || pass_serial() ? MetalQueue::Join::join : MetalQueue::Join::none, {});
         join_ = false;
         for (std::uint32_t i = 0; i < f.wait_count; ++i) [compute_ waitForFence:f.wait[i]];
         update_ = f.update;
         compute_joined_ = f.joined;
         d_->counters().compute_encoders++;
         begin_label("compute");
+        open_record('C', timed, sample);
     }
     return compute_;
 }
@@ -1797,11 +2248,20 @@ bool Encoder::discard_follows(const gpu::Resource* r) const {
 void Encoder::end_encoder() {
     if (render_) {
         if (!explicit_) {
+            const auto note_store = [&](const gpu::Texture* t, bool depth, bool drop) {
+                if (!census_) return;
+                for (Att& a : rec_atts_)
+                    if (a.t == t && a.depth == depth && a.store == MTLStoreActionUnknown) {
+                        a.store = drop ? MTLStoreActionDontCare : MTLStoreActionStore;
+                        break;
+                    }
+            };
             for (std::uint32_t i = 0; i < pass_count_; ++i) {
                 if (!pass_targets_[i].texture) continue;
                 const bool drop = discard_follows(pass_targets_[i].texture);
                 if (drop) d_->counters().stores_discarded++;
                 [render_ setColorStoreAction:drop ? MTLStoreActionDontCare : MTLStoreActionStore atIndex:i];
+                note_store(pass_targets_[i].texture, false, drop);
             }
             if (pass_has_depth_) {
                 const bool drop = discard_follows(pass_depth_.texture);
@@ -1809,6 +2269,7 @@ void Encoder::end_encoder() {
                 [render_ setDepthStoreAction:drop ? MTLStoreActionDontCare : MTLStoreActionStore];
                 if (pass_depth_stencil_)
                     [render_ setStencilStoreAction:drop ? MTLStoreActionDontCare : MTLStoreActionStore];
+                note_store(pass_depth_.texture, true, drop);
             }
         }
         if (active_.heap && pass_vis_ == active_.heap && !span_logged_) {
@@ -1817,6 +2278,7 @@ void Encoder::end_encoder() {
         }
         [render_ updateFence:update_
                  afterStages:kAllRenderStages | (render_mesh_ ? MTLRenderStageObject | MTLRenderStageMesh : 0)];
+        close_record();
         finish_label(render_);
         [render_ endEncoding];
         render_mesh_ = false;
@@ -1827,6 +2289,7 @@ void Encoder::end_encoder() {
     }
     if (blit_) {
         [blit_ updateFence:update_];
+        close_record();
         finish_label(blit_);
         [blit_ endEncoding];
         blit_ = nil;
@@ -1834,6 +2297,7 @@ void Encoder::end_encoder() {
     }
     if (compute_) {
         [compute_ updateFence:update_];
+        close_record();
         finish_label(compute_);
         [compute_ endEncoding];
         compute_ = nil;
@@ -1854,6 +2318,7 @@ void Encoder::attach(MTLRenderPassDescriptor* rp, const TargetView& v, std::uint
     ca.clearColor = MTLClearColorMake(clear[0], clear[1], clear[2], clear[3]);
     keep(t->mtl());
     note_target(t);
+    note_att(t, v.mip, load, store, false);
 }
 
 void Encoder::begin_render(MTLRenderPassDescriptor* rp, std::uint32_t w, std::uint32_t h) {
@@ -1864,12 +2329,24 @@ void Encoder::begin_render(MTLRenderPassDescriptor* rp, std::uint32_t w, std::ui
         keep(vis->results());
     }
     id<MTLFence> extra = prepass_fence_;
+    std::uint32_t sample = 0;
+    const bool timed = pass_sample(4, &sample);
+    if (timed) {
+        MTLRenderPassSampleBufferAttachmentDescriptor* sa = rp.sampleBufferAttachments[0];
+        sa.sampleBuffer = pass_samples_;
+        const std::uint32_t local = sample % PassTiming::kSamples;
+        sa.startOfVertexSampleIndex = local;
+        sa.endOfVertexSampleIndex = local + 1;
+        sa.startOfFragmentSampleIndex = local + 2;
+        sa.endOfFragmentSampleIndex = local + 3;
+    }
     render_ = [cb_ renderCommandEncoderWithDescriptor:rp];
     declare_named(render_);
     pass_vis_ = vis;
     pass_w_ = w;
     pass_h_ = h;
-    const EncoderFences f = q_->open_encoder(join_ ? MetalQueue::Join::join : MetalQueue::Join::none, rp_targets_);
+    const EncoderFences f =
+        q_->open_encoder(join_ || pass_serial() ? MetalQueue::Join::join : MetalQueue::Join::none, rp_targets_);
     rp_targets_.clear();
     join_ = false;
     for (std::uint32_t i = 0; i < f.wait_count; ++i) [render_ waitForFence:f.wait[i] beforeStages:kWaitStages];
@@ -1878,6 +2355,8 @@ void Encoder::begin_render(MTLRenderPassDescriptor* rp, std::uint32_t w, std::ui
     update_ = f.update;
     d_->counters().render_encoders++;
     begin_label("render");
+    open_record('R', timed, sample, w, h);
+    split_pso_ = nullptr;
     if (active_.heap && pass_vis_ == active_.heap)
         [render_ setVisibilityResultMode:active_.heap->type() == QueryType::binary_occlusion ? MTLVisibilityResultModeBoolean
                                                                                              : MTLVisibilityResultModeCounting
@@ -1942,6 +2421,7 @@ void Encoder::open_explicit(const RenderPassDesc& desc) {
         w = t->desc().width;
         h = t->desc().height;
         keep(t->mtl());
+        note_att(t, 0, rp.depthAttachment.loadAction, rp.depthAttachment.storeAction, true);
     }
     explicit_ = true;
     begin_render(rp, w, h);
@@ -2011,6 +2491,7 @@ void Encoder::open_implicit() {
         w = t->desc().width;
         h = t->desc().height;
         keep(t->mtl());
+        note_att(t, 0, rp.depthAttachment.loadAction, MTLStoreActionUnknown, true);
     }
     explicit_ = false;
     begin_render(rp, w, h);
@@ -2041,6 +2522,7 @@ void Encoder::flush_clears() {
                 rp.stencilAttachment.clearStencil = p.stencil_value;
             }
             keep(t->mtl());
+            note_att(t, 0, rp.depthAttachment.loadAction, MTLStoreActionStore, true);
         }
         const bool was_explicit = explicit_;
         explicit_ = true;
@@ -2431,8 +2913,10 @@ void Encoder::draw(const CmdDraw& d) {
     gta6rt_hud_add_draws(1);
     const DrawState& s = *d.state;
     MetalRenderPipeline* p = s.pipeline;
+    timing_split(p);
     const bool quads = s.topology == topology::quad_list;
     if (quads && d.indexed && render_ && !prepared_.count(&(*cmds_)[pos_])) {
+        cause_ = "quad pre-pass not hoisted";
         end_encoder();
         d_->counters().render_pass_splits++;
     }
@@ -2742,6 +3226,7 @@ bool Encoder::bind_mesh(const DrawState& s, MetalMeshPipeline* p) {
 }
 
 void Encoder::draw_mesh(const CmdDrawMesh& c) {
+    timing_split(c.state->mesh);
     if (!ensure_render()) return;
     const DrawState& s = *c.state;
     MetalMeshPipeline* p = s.mesh;
@@ -2829,9 +3314,11 @@ void Encoder::indirect(const CmdIndirect& c) {
         return;
     }
     const Cmd* self = &(*cmds_)[pos_];
+    timing_split(d.kind == IndirectKind::dispatch_mesh ? static_cast<const void*>(s.mesh) : static_cast<const void*>(s.pipeline));
     const bool rect = s.topology == topology::rect_list && d.kind != IndirectKind::dispatch_mesh;
     const bool mesh_limits = d.kind == IndirectKind::dispatch_mesh && indirect_limits();
     if ((d.count_buffer || rect || mesh_limits) && render_ && !prepared_.count(self)) {
+        cause_ = "indirect pre-pass not hoisted";
         end_encoder();
         d_->counters().render_pass_splits++;
     }
@@ -2874,6 +3361,7 @@ void Encoder::indirect(const CmdIndirect& c) {
             return;
         }
         render_mesh_ = true;
+        if (pass_cb_ == 1 && record_open_) rec_.records.push_back({src, base, std::uint32_t(stride), d.max_count, true});
         const auto o = p->object_threads();
         const auto m = p->mesh_threads();
         for (std::uint32_t i = 0; i < d.max_count; ++i)
@@ -2918,6 +3406,7 @@ void Encoder::indirect(const CmdIndirect& c) {
                          atIndex:p->vertex_buffer_index(e.slot)];
     }
     const MTLPrimitiveType type = primitive(s.topology);
+    if (pass_cb_ == 1 && record_open_) rec_.records.push_back({src, base, std::uint32_t(stride), d.max_count, false});
     if (d.kind == IndirectKind::draw_indexed) {
         gpu::Buffer* ib = nullptr;
         std::uint64_t ioff = 0;
@@ -3037,6 +3526,7 @@ bool Encoder::timed_compute(const PipelineCore* p) {
     compute_joined_ = f.joined;
     d_->counters().compute_encoders++;
     begin_label("compute");
+    open_record('C', false, 0);
     declare_named(compute_);
     DispatchTiming::Entry e;
     e.label = p->label_text.empty() ? std::string("(unlabelled)") : p->label_text;
@@ -3065,6 +3555,140 @@ void Encoder::finish_timing() {
     }];
     timing_samples_ = nil;
     timing_used_ = 0;
+}
+
+bool Encoder::pass_sample(std::uint32_t n, std::uint32_t* base) {
+    PassTiming& t = PassTiming::get();
+    if (!t.on() || !d_->timestamp_counters()) return false;
+    if (pass_cb_ < 0) pass_cb_ = t.begin_command_buffer(d_) ? 1 : 0;
+    if (pass_cb_ != 1) return false;
+    if (!pass_buffers_) pass_buffers_ = [NSMutableArray new];
+    if (!pass_samples_ || pass_used_ + n > PassTiming::kSamples) {
+        std::uint64_t high = 0;
+        pass_samples_ = pass_buffers_.count < 16 ? t.take_buffer(d_, &high) : nil;
+        if (!pass_samples_) {
+            ++pass_untimed_;
+            return false;
+        }
+        [pass_buffers_ addObject:pass_samples_];
+        pass_highs_.push_back(high);
+        pass_used_ = 0;
+    }
+    *base = std::uint32_t(pass_buffers_.count - 1) * PassTiming::kSamples + pass_used_;
+    pass_used_ += n;
+    return true;
+}
+
+void Encoder::open_record(char kind, bool timed, std::uint32_t sample, std::uint32_t w, std::uint32_t h) {
+    if (!census_) return;
+    rec_ = PassRecord{};
+    rec_.kind = kind;
+    rec_.timed = timed;
+    rec_.sample = sample;
+    rec_.w = w;
+    rec_.h = h;
+    rec_.index = pass_index_++;
+    record_open_ = true;
+    if (kind != 'R') {
+        other_since_render_ = true;
+        atts_.clear();
+        return;
+    }
+    rec_atts_ = std::move(atts_);
+    atts_.clear();
+    std::string sig, formats;
+    char t[96];
+    for (const Att& a : rec_atts_) {
+        std::snprintf(t, sizeof t, "%p:%u%s;", (const void*)a.t, a.mip, a.depth ? "d" : "");
+        sig += t;
+        std::snprintf(t, sizeof t, "%s%s%u", formats.empty() ? "" : ",", a.depth ? "D" : "f", a.t->desc().format);
+        formats += t;
+    }
+    std::snprintf(t, sizeof t, "%ux%u ", w, h);
+    rec_.targets = t + formats;
+    rec_.same_targets = !sig.empty() && sig == prev_targets_;
+    rec_.adjacent = !other_since_render_;
+    rec_.split_by = prev_ended_by_;
+    prev_targets_ = std::move(sig);
+    other_since_render_ = false;
+}
+
+void Encoder::close_record() {
+    if (!census_ || !record_open_) return;
+    record_open_ = false;
+    rec_.work = label_work_;
+    rec_.first = label_first_name_;
+    rec_.last = label_last_name_;
+    if (rec_.first.empty() && label_first_)
+        if (NSString* l = [(id)label_first_ label]) rec_.first = l.UTF8String;
+    rec_.ended_by = cause_ ? cause_ : cause_text_;
+    if (rec_.kind == 'R') {
+        bool cleared = false;
+        for (const Att& a : rec_atts_) {
+            const FormatInfo& fi = a.t->format().info;
+            const std::uint32_t bd = std::max(1u, fi.block_dim);
+            const std::uint64_t w = std::max(1u, a.t->desc().width >> a.mip), h = std::max(1u, a.t->desc().height >> a.mip);
+            const std::uint64_t bytes = ((w + bd - 1) / bd) * ((h + bd - 1) / bd) * std::max(1u, fi.block_bytes);
+            rec_.loads += a.load == MTLLoadActionLoad ? 'L' : a.load == MTLLoadActionClear ? 'C' : 'D';
+            rec_.stores += a.store == MTLStoreActionDontCare ? 'D' : 'S';
+            if (a.load == MTLLoadActionLoad) rec_.load_bytes += bytes;
+            if (a.load == MTLLoadActionClear) {
+                rec_.clear_bytes += bytes;
+                cleared = true;
+            }
+            if (a.store != MTLStoreActionDontCare) rec_.store_bytes += bytes;
+        }
+        rec_.clear_only = cleared && rec_.work == 0;
+        prev_ended_by_ = rec_.ended_by;
+        rec_atts_.clear();
+    }
+    PassCensus::get().add(d_, rec_);
+    if (pass_cb_ == 1) passes_.push_back(std::move(rec_));
+}
+
+void Encoder::finish_pass_timing() {
+    const bool counted = pass_cb_ == 1;
+    pass_cb_ = -1;
+    if (!counted) {
+        passes_.clear();
+        return;
+    }
+    auto passes = std::make_shared<std::vector<PassRecord>>(std::move(passes_));
+    passes_.clear();
+    NSArray* buffers = pass_buffers_ ? pass_buffers_ : [NSArray new];
+    const std::uint32_t used = std::min(pass_used_, PassTiming::kSamples);
+    const std::uint32_t untimed = pass_untimed_;
+    std::vector<std::uint64_t> highs = std::move(pass_highs_);
+    pass_highs_.clear();
+    pass_samples_ = nil;
+    pass_buffers_ = nil;
+    pass_used_ = pass_untimed_ = 0;
+    const double tick_ns = d_->caps().timestamp_frequency ? 1e9 / double(d_->caps().timestamp_frequency) : 1.0;
+    const std::uint64_t serial = q_->last_serial() + 1;
+    NSString* label = cb_.commandQueue.label;
+    const std::string queue = label ? label.UTF8String : "queue";
+    [cb_ addCompletedHandler:^(id<MTLCommandBuffer> done) {
+      const double gpu_ms =
+          done.GPUStartTime > 0 && done.GPUEndTime > done.GPUStartTime ? (done.GPUEndTime - done.GPUStartTime) * 1e3 : 0;
+      PassTiming::get().completed(*passes, buffers, highs, used, tick_ns, gpu_ms, serial, queue, untimed);
+    }];
+}
+
+void Encoder::barrier_cause(const CmdBarrier& c) {
+    for (const Barrier& b : c.barriers) {
+        if (barrier_is_noop(b)) continue;
+        bool attached = b.resource && pass_has_depth_ && pass_depth_.texture == b.resource;
+        for (std::uint32_t i = 0; b.resource && i < pass_count_; ++i) attached |= pass_targets_[i].texture == b.resource;
+        const char* what = !b.resource ? "no resource" : attached ? "attachment" : "other";
+        char t[128];
+        if (b.type == BarrierType::transition)
+            std::snprintf(t, sizeof t, "barrier transition %s 0x%x->0x%x", what, b.before, b.after);
+        else
+            std::snprintf(t, sizeof t, "barrier %s %s", b.type == BarrierType::uav ? "uav" : "aliasing", what);
+        cause_text_ = t;
+        cause_ = nullptr;
+        return;
+    }
 }
 
 // A timestamp is the end of a one-thread compute encoder that waits for every earlier encoder of the queue:
