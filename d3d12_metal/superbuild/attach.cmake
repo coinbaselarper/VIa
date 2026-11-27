@@ -58,6 +58,9 @@ function(_d3d12_metal_attach)
   set_source_files_properties("${_patched}" TARGET_DIRECTORY gta6rt PROPERTIES
     COMPILE_OPTIONS "-iquote;${GTA6RT_ROOT}/host/src")
   target_link_libraries(gta6rt PRIVATE gta6rt_d3d12_select "$<LINK_LIBRARY:WHOLE_ARCHIVE,gta6rt_d3d12_metal>")
+  if(GTA6RT_D3D12_METAL_ASAN)
+    target_link_options(gta6rt PRIVATE -fsanitize=address)
+  endif()
   message(STATUS "d3d12_metal: host gta6rt links gta6rt_d3d12_metal; GTA6RT_GPU=metal selects it")
 endfunction()
 

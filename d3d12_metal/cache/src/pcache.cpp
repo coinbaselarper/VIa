@@ -450,7 +450,8 @@ void monitor_main() {
                 s.cv.notify_all();
             }
         }
-        if (tick % 1000 == 0) write_locked(s, "periodic");
+        // Every 2 s while there is something new: the world's first seconds are where runs end in a crash.
+        if (tick % 200 == 0 && (s.dirty || !s.run_lines.empty())) write_locked(s, "periodic");
         if (tick % 3000 == 0) log_line("%s", report_locked(s).c_str());
     }
 }

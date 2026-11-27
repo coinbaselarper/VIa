@@ -2797,7 +2797,12 @@ ReplayResult prepare_draw(const Draw& draw, const IndirectDrawArgs* arguments, R
     // Slots the pipeline has a format for but the draw leaves unbound take a variant whose format there is
     // VK_FORMAT_UNDEFINED: D3D12 discards those writes, Vulkan wants the formats to match the attachments.
     std::uint32_t unbound = 0;
-    if (pipeline->rectangle_variant_topology && draw.topology == pipeline->rectangle_variant_topology) {
+    static const bool rect_as_triangle = [] {
+        const char* v = std::getenv("LEONIDA_RECT_AS_TRIANGLE");
+        return v && v[0] == '1';
+    }();
+    if (pipeline->rectangle_variant_topology && draw.topology == pipeline->rectangle_variant_topology &&
+        !rect_as_triangle) {
         unbound |= GraphicsPipeline::rectangle_stage;
         if (pipeline->rectangle_by_vertex) {
             // The vertex-stage expansion takes one non-indexed instance from instance 0 (rect_list_vertex.h).

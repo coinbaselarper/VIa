@@ -17,13 +17,27 @@ compile work done while the title runs.
   of waits, longest 443 / 502 ms (`library/lib_cs_01726`), 87 / 96 draws skipped. Warm (archive + manifest): 5 of 5
   handed over ready at first use, 0 waits, 0 draws skipped. First lit frame (= the landing prompt) 12.2 / 10.7 s cold,
   10.5 / 11.2 s warm at load 12-24: the landing prompt is not pipeline-bound; the difference is within run-to-run noise.
-- **Past the landing prompt** (movie, first-run pages, story load; two runs ended 68-73 s in at a Metal texture-view
-  assertion of the adapter, BC5 viewed as BC7, reported to the adapter worker; one ran its 120 s into the story
-  load): 11-17 pipelines in all. With the bootstrap from the Vulkan path's data alone (no earlier Metal run) 7 of 11
-  first uses were handed over ready; the second run 9 of 12; pcm-big-a 12 of 17 handed over, and the 5 new ones were
-  story-load compute pipelines that compiled at use in 77 ms-12.4 s (`library/lib_cs_01076`: 12.4 s, the one the
-  Vulkan census also reports "still building").
-- **World phase pipelines are the expensive ones**, measured offline because Metal runs do not reach it yet: the 777
+- **Into the world phase.** With the adapter worker's 19:37 sources the Metal runs reach "world (loading screen
+  ended)" at 71-100 s (before that, two runs ended at 68-73 s at the adapter's BC5-as-BC7 texture-view assertion).
+  The title uses 11-12 pipelines up to the story load and another 17-26 in the last seconds of the loading screen
+  (the world's first frame: light-integration passes, decoration blends, 13 library compute shaders) and 1 more in
+  the first world seconds before the runs end. Cold for those (pcm-prep-a/b): 23 and 17 compiled at first use, 12.5 s
+  and 7.9 s of waits in all, longest 2.3 / 2.6 s; earlier, pcm-big-a's `library/lib_cs_01076` waited 12.4 s.
+  Warm on the recorded directory (pcm-world-warm-a): 11 handed over ready, 12 served from the archive at first use
+  in 47-103 ms each, 1 new (2.1 s); waits 2.6 s in all. The world's first seconds are where the cold runs drop
+  work: the backend logs "command skipped: its pipeline is still compiling" once per pipeline, and the world phase
+  has 918 / 1,009 such lines in pcm-prep-a/b and 742 with the cache off (pcm-world-off-a) within 4-7 s: hundreds of
+  pipelines first used at once. (pcm-world-warm-a has 0, but its world began at 99.8 s, 5 s before its watchdog, and
+  those pipelines were not in its manifest either, so that 0 is not the cache's doing.) Those world first uses were
+  never recorded: every run that drew the world crashed inside the recorder's then 10 s write interval (now 2 s,
+  below), so the warm-world pair is still to be run.
+- **Crashes are not the cache's**: the control with `GTA6RT_METAL_PCACHE=0` (pcm-world-off-a) crashed in the world
+  like pcm-prep-a/b (SIGSEGV reading 0x10 at 75 s); and the tree as of 20:33 aborts at 9 s in the title's
+  `amd_fidelityfx_upscaler_xbox.dll+0x380d` with the cache on (pcm-world-rec-c, -warm-c, -warm-d) and off (pcm-ctl-e), which
+  stopped the last world pair.
+- **Bootstrap without any Metal run**: from the Vulkan path's boot manifests and census names alone, 7 of the first
+  11 first uses were handed over ready (pcm-far-a).
+- **World phase pipelines are the expensive ones**, measured offline (the Metal runs end seconds into the world): the 777
   world-phase pipeline specs (the 687 names the S3 MoltenVK runs reported "still building", with their boot-census
   states) compile at a median 1.6 s, mean 16.9 s, p90 65 s, longest 158 s each (in flight, 3 compile threads, Metal's
   cache off, load 16) and take about 500 KiB of archive each (205 built: 102 MB; one pipeline alone added 15.7 MB).
@@ -51,8 +65,8 @@ compile work done while the title runs.
 
 | path | what |
 |---|---|
-| `cache/include/pcache.h`, `cache/src/codec.cpp` | pipeline key and text codec (`encode`/`decode`/`key_of`), manifest (load, merge, atomic save), `archive_version`, `open_archive`, `flush_archive` |
-| `cache/src/pcache.cpp` | in-process recorder, bootstrap matching, background prebuild, hand-over at first use, stall watch, governor reclaimer, report |
+| `cache/include/pcache.h`, `cache/src/codec.cpp` | pipeline key and text codec (`encode`/`decode`/`key_of`), manifest (load, merge, atomic save), `archive_version` |
+| `cache/src/pcache.cpp` | in-process recorder, bootstrap matching, background prebuild, hand-over at first use, stall watch, governor reclaimer, report, `open_archive`, `flush_archive` |
 | `cache/src/phase.cpp` | the title's phase from its state words (RVAs of `host/src/title_watch.cpp`), process age |
 | `cache/cache.cmake` | adds the three sources to `gta6rt_d3d12_metal_objs` (one `include` line in `d3d12_metal.cmake`) |
 | `cache/CMakeLists.txt` | standalone tree: `prepare_shaders`, tests |
@@ -60,12 +74,24 @@ compile work done while the title runs.
 | `cache/tools/bootstrap.py` | `pcache-bootstrap.txt` from the Vulkan boot manifests and the S3 census logs |
 | `cache/tools/boot_set.py`, `pcache_text.py` | the boot PSO set as specs from the pipeline-library records and the PSO census logs |
 | `cache/tools/tiers.py` | per-phase spec lists (tier files) |
-| `cache/tools/pcache_run.sh`, `pcache_series.sh`, `pcache_summary.py` | the title runs behind this file and their summary |
+| `cache/tools/pcache_run.sh`, `pcache_series.sh`, `pcache_world.sh`, `pcache_summary.py` | the title runs behind this file and their summary |
 | `cache/tests/codec_test.cpp` | 2,000 random descriptions round-trip, key stability, manifest merge rules, atomic save, torn-file refusal |
 | `cache/tests/runtime_test.cpp` | prebuild + hand-over + demand-created + bootstrap match + manifest merge on a real device and store metallibs |
 | `cache/tests/archive_test.cpp` | archive keying and invalidation (translator version, key of another GPU/OS, torn file) |
 
-Tests: `ctest --test-dir port/build/pcache-x86_64` and `-arm64`: 3/3 pass on both arches.
+Tests: `ctest --test-dir port/build/pcache-x86_64` and `-arm64`: 3/3 pass on both arches; runtime and archive tests
+also pass under `MTL_DEBUG_LAYER=1`. Under `MTL_SHADER_VALIDATION=1` the archive test fails as expected: Metal misses
+every archive lookup with shader validation on (port/metal STATUS says the same).
+
+### Hooks in the adapter (`shims/d3d12_metal_device.cpp`; announced and agreed in `port/run/requests/d3d12_metal.md`)
+
+`#include "pcache.h"`; `~PipelineState`: `pcache::forget(this)`; `create_graphics_impl` / `create_compute_impl`: one
+`pcache::created(...)` after the PSO is registered; `ensure_built` / `ensure_rect`: the four
+`device_.gpu->create_*_pipeline` calls are `pcache::make_*` (probed mesh PSOs still call the backend); archive block:
+`pcache::open_archive` with `pcache::archive_version(...)`, then `pcache::start(...)`; the 20 s writer and
+`save_pipeline_caches_at_exit` write through `pcache::flush_archive`; `~Device` calls `pcache::stop()`;
+`save_pipeline_caches_at_exit` and `end_run` call `pcache::flush(...)`. `d3d12_metal.cmake`: one
+`include(.../cache/cache.cmake)` line.
 
 ### Key, manifest, phases
 
@@ -77,7 +103,8 @@ Tests: `ctest --test-dir port/build/pcache-x86_64` and `-arm64`: 3/3 pass on bot
   manifest stores, so an entry can be rebuilt with no title running.
 - **Manifest** `pcache-manifest.txt` beside the archive: `key, phase, t, runs, text`, ordered by phase then time.
   Merge across runs: union; an entry keeps its earliest phase (and that run's time); `runs` counts the runs that used
-  it. Written every 10 s, at every phase change, at exit and in the adapter's `end_run`, as tmp + fsync + rename; a
+  it. Written every 2 s while it grows (10 s until 20:33), at every phase change, at exit and in the adapter's
+  `end_run`, as tmp + fsync + rename; a
   torn or foreign file is moved to `.unreadable`, never half used. Per run, `pcache-runs/<time>-<pid>.tsv` lists each
   first use (`t, phase, key, adopted-ready | adopted-compiling | created, label`) and each wait (`ms, archive |
   compiled`).
@@ -122,7 +149,7 @@ Tests: `ctest --test-dir port/build/pcache-x86_64` and `-arm64`: 3/3 pass on bot
   archive in pcm-big-a; 70 s for 35 MB and 205 s for 58 MB offline next to compiles); (2) after one failed serialize
   (MDB_MAP_FULL) no further write in that run, because Metal's in-memory archive is damaged then and a later serialize
   wrote 7.7 MB over the 180 MB file. Runs end on a kill timer or a crash, so what was compiled since the last write can
-  be lost (the manifest, written every 10 s and at each phase change, still names it, so the next run's prebuild
+  be lost (the manifest, written every 2 s and at each phase change, still names it, so the next run's prebuild
   compiles it in the background), never the file.
 
 ## Measurements
@@ -140,16 +167,24 @@ again (archive + manifest from the cold run).
 | pcm-cold-b | 14.1 / 12.8 | new | 8.1 s | 10.7 s | 5 | 5 | 0 | 867 / 502 ms | 96 | 5,411 MiB |
 | pcm-warm-b | 12.8 / 14.1 | 0.3 MiB, 0.003 s | 8.6 s | 11.2 s | 5 | 0 | 5 | 0 | 0 | 5,404 MiB |
 | pcm-sys-a (Metal's cache on, no archive) | 14.1 / 13.3 | new | 8.6 s | 11.4 s | 5 | 5 | 0 | 545 / 238 ms | 34 | 5,400 MiB |
-| pcm-noprebuild-a (`GTA6RT_METAL_PCACHE=0`, archive loaded) | 17.1 / 16.7 | 0.3 MiB | 9.6 s | 13.1 s | - | - | - | - | - | 5,390 MiB |
+| pcm-noprebuild-a (`GTA6RT_METAL_PCACHE=0`, archive loaded) | 17.1 / 16.7 | 0.3 MiB | 9.6 s | 13.1 s | 5 (backend count) | 0 (5 archive hits) | - | not measured | 4 pipelines skipped draws (backend log) | 5,390 MiB |
 
-Past the landing prompt (100 s runs, presses at 40/55/70/85 s, `pcache_series.sh far|prepared`): every run reached
-first-run pages (41 s) and story load (56 s) and ended at the adapter's BC5-as-BC7 texture-view assertion.
+Past the landing prompt (100-120 s runs, presses at 40/55/70/85 s, `pcache_series.sh far|prepared|prepared2|world`,
+`cache/tools/pcache_world.sh`): first-run pages at 41 s, story load at 56 s in every run that booted; the ends
+are in the last column. Phases in the first-uses column are the recorder's (it reads the title's state every 250 ms,
+so a first use in the first moment of a phase can carry the phase before).
 
 | run | load | cache directory before the run | first uses by phase (boot/landing/movie/first-run/story-load) | handed over ready | compiled at use (waits) | end |
 |---|---|---|---|---|---|---|
 | pcm-far-a | 10.4 / 15.9 | bootstrap only | 3/2/4/2/- | 7 (bootstrap) | 4 (56, 56, 98, 98 ms) | abort 68 s |
 | pcm-far-b | 15.9 / 15.5 | far-a's archive + manifest + bootstrap | 3/2/4/2/1 | 9 | 3: 2 from the archive (12.5 ms each, the first-run entries were outside the then hold window of one phase ahead, now two), 1 new (63.5 ms) | abort 73 s |
-PREPARED_ROWS
+| pcm-big-a | 36.8 / 42.3 (world-tier build running next to it) | 102 MB world-tier archive (offline) + far's manifest | 3/2/4/-/8 | 12 | 5: 77 ms, 163 ms, 588 ms, 1.3 s, 12.4 s (`library/lib_cs_01076`) | watchdog 120 s, story load; archive writes 3.7 / 4.5 / 7.5 s |
+| pcm-prep-a | 8.5 / 11.0 | prepared offline from far's manifest (12) | 3/2/4/2/24 | 12 | 23 (18 waits, 12.5 s in all, longest 2.3 s) | **world at 71.0 s**, SIGSEGV 78 s |
+| pcm-story-b | 11.0 / 11.7 | big-a's directory + bootstrap | 5/2/2/-/26 | 11 | 24 (waits lost in the crash) | world at 71.5 s, abort (signal 6, no message) 75 s |
+| pcm-prep-b | 10.0 / 10.4 | prepared offline from far's manifest (12) | 3/2/4/2/18 | 12 | 17 (13 waits, 7.9 s in all, longest 2.6 s) | world at 71.5 s, SIGSEGV 78 s |
+| pcm-world-warm-a | 10.7 / 29.6 | prep-a's directory after its run (35 entries) | 3/2/2/2/14 + world 1 | 11 | 13: 12 from the archive (47-103 ms), 1 compiled (2.1 s); waits 2.6 s in all | world at 99.8 s, watchdog 105 s |
+| pcm-world-off-a (control, `GTA6RT_METAL_PCACHE=0`, new directory) | 18.2 / 12.1 | none | not recorded | - | 12 Metal pipelines at 60 s; 742 skip lines in the world | world at 69.0 s, SIGSEGV 75 s |
+| pcm-world-rec-c, -warm-c, -warm-d, pcm-ctl-e (cache off) | 9.7-10.7 | prep-b's directory / none | - | - | - | all four: abort at 7-9 s in `amd_fidelityfx_upscaler_xbox.dll` (tree as of 20:33) |
 
 ### Offline prepare (`prepare_shaders`)
 
@@ -163,7 +198,7 @@ every 10 s with rate, ETA, footprint, its own compile-service processes and thei
 | far manifest (exact, what the title used) | 12 | 12 | 1 s | 0.8 MiB | prep-a / prep-b |
 | census sample 300 (seed 1) | 300 | 290 | 9 s (cache on, first time) / 27 s (cache off) / 0.5 s (cache on, second time) | 18.1 MiB (64 KiB each) | archive hits: 291 in 0.35 s, also with the cache off |
 | tier story-load | 238 | 122 | 9 s | 2.5 MiB (21 KiB each) | 3 shaders not in the store |
-| tier world (part) | 205 of 777 | 204 | 11 min | 102 MB (about 500 KiB each) | median 1.6 s, p90 65 s, max 158 s in flight; rest: `tiers/tier-world-2.specs` |
+| tier world (part) | 205 + 78 of 777 | 204 + 78 | 11 min (load 16) + 13.6 min (load 41) | 102 MB + 58 MB in two files (about 500-750 KiB each) | median 1.6 s, p90 65 s, max 158 s in flight; writes of the second file took 70 s (35 MB) and 205 s (58 MB) next to the compiles; rest: `tiers/tier-world-2.specs` |
 | census boot set | 28,504 | 13,578 | 25.4 min | serialize failed past 180 MB (MDB_MAP_FULL) | 1,119 refused: 540 integer RTs with a float PS, 324 dual-source blend, 254 depth format 118, 1 vertex format |
 
 The per-user Metal cache matters: with it on, a second build of the same 300 took 0.5 s with no archive; with it off,
@@ -177,7 +212,7 @@ at 19:10 with nothing deleted by me), so it is not a cache to plan the world pha
 | boot path (boot, landing, movie) | 9 | under 1 s | 0.6 MiB | recorder manifest (exact) |
 | first-run | 2 (+5 specs) | under 1 s | 0.2 MiB | manifest + bootstrap names |
 | story load | 1 exact; 238 specs for the 16 bootstrap names | 9 s | 2.5 MiB | manifest + `tier-story-load.specs` |
-| world first frame | 777 specs for the 687 "still building" names | about 40-45 min (205 in 11 min) | about 385 MB at 500 KiB each: over one archive's limit, needs 2 files | `tier-world.specs` (approximate state) until a Metal run records it |
+| world first frame | recorded on Metal: 17-24 at the end of the loading screen (exact) + the world's own (not recorded yet); offline: 777 specs for the 687 "still building" names | recorded set: seconds offline (in pcm-prep-a its 23 compiled at use with 12.5 s of waits); specs: about 1-1.5 h (283 in 25 min at load 16-41) | specs: about 400-550 MB, over one archive's limit (2-3 files) | manifest (exact) for what Metal runs reached; `tier-world.specs` (approximate state) for the rest |
 | full boot PSO set | 28,504 specs / 13,578 Metal pipelines | 25.4 min (most of it the world tail) | over the limit; at least 2-3 files | `census.specs`, `records.specs` |
 
 The boot-set specs are approximate: the census logged topology, target count, RT0/RT1/DSV formats, samples and RT0
@@ -226,12 +261,16 @@ which trims itself (above); measured cost not done.
 
 ## Not done / gaps
 
-- No Metal run reaches the world phase yet (adapter assertion at 68-73 s), so the world-phase proof on the title is
-  offline only (costs above), not cold-vs-warm in the title.
-- The world tier is built for 205 of 777 specs; the full set does not fit one archive.
-- The backend serialises the whole archive under its archive mutex: 31.5 s for 180 MB offline; in the title every
-  20 s while it grows. With a large prepared archive and new pipelines added in the world phase that would block
-  compile threads for seconds (measured offline only). See next steps.
+- The world phase on the title: reached (71-100 s) but every run ends 4-7 s in, so no warm run of the world's first
+  frame with its pipelines recorded yet; the recorder now writes every 2 s while it grows (built and unit-tested, not
+  yet in a title run because of the 20:33 boot crash).
+- The world tier is built for 283 of 777 specs (two files, 102 + 58 MB); the full set does not fit one archive.
+- The backend serialises the whole archive under its archive mutex (3.7-7.5 s per write of 100 MB in the title,
+  31.5 s for 180 MB and 205 s for 58 MB offline). `flush_archive(when_idle)` keeps the periodic write away from
+  running compiles (measured: deferrals logged in pcm-story-b), but a write that starts still blocks any compile that
+  starts during it; only the backend can fix that (next steps 1).
+- The archive's pipelines need the shader store's metallibs at the same content keys; a corpus rebuild that changes a
+  shader changes its key, so that entry misses (by design) and is rebuilt.
 - Tier specs carry guessed state; only recorded entries are exact.
 
 ## Next steps (ranked)
@@ -239,10 +278,11 @@ which trims itself (above); measured cost not done.
 1. port/metal: several archives at once (`binaryArchives = @[read-only shards..., writable]`, each under ~150 MB) and
    serialise outside the archive mutex, only the writable one. Without it the world tier does not fit and a large
    archive's flush stalls compiles.
-2. The adapter's BC5-as-BC7 view assertion (reported), then Metal runs into the story load and the world phase:
-   record the world's exact pipelines, prepare them, and measure cold vs warm world first frame on the title.
-3. Finish the world tier (`prepare_shaders --specs build/pcache/tiers/tier-world-2.specs`, about 30 min) into a
-   second archive file once 1 lands.
+2. Once the tree boots again: `d3d12_metal/cache/tools/pcache_world.sh` (record the world's first uses on prep-b's directory,
+   then two warm runs) for cold vs warm at the world's first frame; then `prepare_shaders` on that manifest.
+3. Finish the world tier: rerun `prepare_shaders --specs build/pcache/tiers/tier-world-2.specs --archive-dir
+   build/pcache/tiers/archive-world-2 --jobs 3` (resumes: the 78 written are hits; about 1 h more at load 16-40),
+   split so no file passes ~150 MB, once 1 lands.
 4. Drop the process arch from the backend's archive key (measured portable) and key on GPU architecture + OS build;
    then try `metal-tt` per-architecture archives for shipping.
 5. Decode the graphics state blob of the pipeline-library records (leonida shader_library.md: not decoded) or record

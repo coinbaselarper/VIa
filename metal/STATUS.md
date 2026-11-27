@@ -1,5 +1,29 @@
 # gta6rt_metal status (S5.1, round 2)
 
+## api_version 5: releases wait for the GPU, indirect rectangle lists (round 6, made by port/d3d12_metal)
+
+- **Deferred releases** (`MetalDevice::retire`, `collect_retired`; spike/r7-device-loss: Metal fails a command buffer
+  with InvalidResource when an IOGPU allocation it names is released before it was scheduled, e.g. while it waits at
+  an event). Every buffer, texture (and its swizzle view), heap, query heap, descriptor heap and every object a
+  descriptor slot held when it is overwritten is kept, and an allocation stays in the device residency set, until
+  every command buffer committed or being encoded on any queue at the release has completed (its queue's timeline
+  reached it: `MetalQueue::retire_mark` = committed serial + command buffers open). A slot overwrite's residency
+  removal from the table's own set waits the same way (`pending_removals_`, re-checked against the slot refcount).
+  Collected at every `begin_command_buffer`; released at once when nothing is in flight. `DeviceStats` v5:
+  `releases_deferred`, `releases_immediate`, `releases_waiting`, `releases_waiting_bytes`, `releases_waiting_max`.
+  `GTA6RT_METAL_RELEASE_AT_ONCE=1` restores the old behaviour (negative control).
+- **Indirect rectangle lists** (`IndirectKind::draw`/`draw_indexed` with topology 17 on a `vertex_expand` pipeline):
+  a hoisted pre-pass (`gta6rt_rect_indirect`) writes per record a Metal draw of (vertex count / 3) * 6 vertices and
+  the wrapper's parameters (first vertex or index, base vertex, first instance; 256 B per record), honouring a count
+  buffer; then one indirect draw per record with its parameters bound. A `cpu_rewrite` pipeline still skips them
+  (logged once, no status error).
+- Tests (x86_64, `MTL_DEBUG_LAYER=1`, `port/build/d3m-s4-metal-x86_64/v-*.log`): new `metal_deferred_release` (a
+  buffer named only by a raw GPU address, destroyed while the command buffer reading it waits at an event: held,
+  0 of 4,096 words wrong, 0 command buffer errors, 8 rounds; everything released after); `metal_rect_list` gained the
+  indirect cases (blit and two indexed rectangles with a count buffer of 1: 0 pixels differ from the reference);
+  `metal_draw2`, `metal_device`, `metal_copy_fill`, `metal_texture_view`, `metal_compute`, `metal_mesh` PASS. The
+  negative control was not run (it needs a machine with no title running).
+
 ## api_version 4 and GPU-error diagnostics (round 5, made by port/d3d12_metal)
 
 Additive over v3 (`port/d3d12_metal/STATUS.md` round 5 has the title runs that use them):

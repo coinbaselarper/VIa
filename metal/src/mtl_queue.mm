@@ -505,6 +505,9 @@ private:
     bool needs_prepass(const Cmd& c) const;
     Prepared run_prepass(const Cmd& c);
     Prepared count_prepass(const IndirectDesc& d);
+    Prepared groups_prepass(const IndirectDesc& d);
+    Prepared rect_indirect_prepass(const IndirectDesc& d, const DrawState& s);
+    void indirect_rect(const CmdIndirect& c, MetalRenderPipeline* p);
     Prepared quad_prepass(const CmdDraw& d, const DrawState& s, bool* ok);
     id<MTLBuffer> scratch(std::uint64_t bytes, std::uint64_t* offset);
     void keep(id object) {
@@ -1340,7 +1343,10 @@ bool Encoder::ensure_render() {
 
 bool Encoder::needs_prepass(const Cmd& c) const {
     if (auto* d = std::get_if<CmdDraw>(&c)) return d->indexed && d->state->topology == topology::quad_list;
-    if (auto* i = std::get_if<CmdIndirect>(&c)) return i->desc.count_buffer && i->desc.kind != IndirectKind::dispatch;
+    if (auto* i = std::get_if<CmdIndirect>(&c))
+        return i->desc.kind != IndirectKind::dispatch &&
+               (i->desc.count_buffer || i->desc.kind == IndirectKind::dispatch_mesh ||
+                (i->state && i->state->topology == topology::rect_list));
     return false;
 }
 
@@ -1392,7 +1398,128 @@ Prepared Encoder::run_prepass(const Cmd& c) {
         bool ok = false;
         return quad_prepass(*d, *d->state, &ok);
     }
-    return count_prepass(std::get<CmdIndirect>(c).desc);
+    const CmdIndirect& i = std::get<CmdIndirect>(c);
+    if (i.desc.kind == IndirectKind::dispatch_mesh) return groups_prepass(i.desc);
+    if (i.state && i.state->topology == topology::rect_list) return rect_indirect_prepass(i.desc, *i.state);
+    return count_prepass(i.desc);
+}
+
+// Mesh and compute indirect records copied with the count applied and any record past the limits zeroed (a mesh
+// grid: D3D12's, each dimension at most 65,535 and 2^22 groups; a compute grid: 2^26 groups, Metal grids are 32-bit
+// and the title's may pass 65,535): a record the title never wrote (its producer pass skipped while its pipeline
+// compiled) otherwise launches billions of groups, and the kernel stops the command buffer
+// (kIOGPUCommandBufferCallbackErrorTimeout, d3m-s4-g). GTA6RT_METAL_INDIRECT_LIMITS=0: records as written.
+static bool indirect_limits() {
+    static const bool on = [] {
+        const char* v = std::getenv("GTA6RT_METAL_INDIRECT_LIMITS");
+        return !v || std::strcmp(v, "0") != 0;
+    }();
+    return on;
+}
+
+Prepared Encoder::groups_prepass(const IndirectDesc& d) {
+    if (!indirect_limits()) return d.count_buffer ? count_prepass(d) : Prepared{};
+    Prepared out;
+    id<MTLComputePipelineState> k = d_->builtin_kernel("gta6rt_indirect_groups");
+    if (!k || !d.max_count) return out;
+    out.buffer = scratch(std::uint64_t(d.max_count) * 12, &out.offset);
+    struct {
+        std::uint32_t stride_words, max_count, count_word, has_count, mesh;
+    } params{d.stride / 4, d.max_count, 0, d.count_buffer ? 1u : 0u, d.kind == IndirectKind::dispatch_mesh ? 1u : 0u};
+    id<MTLComputeCommandEncoder> e = compute();
+    auto* args = static_cast<MetalBuffer*>(d.arguments);
+    auto* count = static_cast<MetalBuffer*>(d.count_buffer);
+    [e setComputePipelineState:k];
+    note_work(k);
+    [e setBuffer:args->mtl() offset:d.argument_offset atIndex:0];
+    [e setBuffer:count ? count->mtl() : args->mtl() offset:count ? d.count_offset : 0 atIndex:1];
+    [e setBuffer:out.buffer offset:out.offset atIndex:2];
+    [e setBytes:&params length:sizeof(params) atIndex:3];
+    [e dispatchThreads:MTLSizeMake(d.max_count, 1, 1) threadsPerThreadgroup:MTLSizeMake(std::min<std::uint32_t>(64, d.max_count), 1, 1)];
+    d_->counters().indirect_prepasses++;
+    return out;
+}
+
+// Indirect rectangle lists: per record, a Metal draw of (vertex count / 3) * 6 vertices for the rect wrapper and the
+// wrapper's parameters (first vertex or index, base vertex, first instance) from the D3D12 record, written by the
+// GPU before the pass; the wrapper reads its parameters at params_stride bytes per record.
+constexpr std::uint32_t kRectParamsStride = 256;
+
+Prepared Encoder::rect_indirect_prepass(const IndirectDesc& d, const DrawState& s) {
+    Prepared out;
+    id<MTLComputePipelineState> k = d_->builtin_kernel("gta6rt_rect_indirect");
+    if (!k || !d.max_count) return out;
+    const std::uint64_t params_at = (std::uint64_t(d.max_count) * 16 + kRectParamsStride - 1) / kRectParamsStride * kRectParamsStride;
+    out.buffer = scratch(params_at + std::uint64_t(d.max_count) * kRectParamsStride, &out.offset);
+    struct {
+        std::uint32_t src_word, stride_words, max_count, count_word, has_count, indexed, index_bytes, params_stride_words;
+        std::uint32_t params_word;
+        std::uint32_t strides[8];
+    } params{};
+    params.params_word = std::uint32_t(params_at / 4);
+    params.stride_words = d.stride / 4;
+    params.max_count = d.max_count;
+    params.has_count = d.count_buffer ? 1u : 0u;
+    params.indexed = d.kind == IndirectKind::draw_indexed ? 1u : 0u;
+    params.index_bytes = s.index.format == format::r32_uint ? 4u : 2u;
+    params.params_stride_words = kRectParamsStride / 4;
+    for (std::uint32_t slot = 0; slot < 8; ++slot) params.strides[slot] = s.vertex_buffers[slot].stride;
+    id<MTLComputeCommandEncoder> e = compute();
+    auto* args = static_cast<MetalBuffer*>(d.arguments);
+    auto* count = static_cast<MetalBuffer*>(d.count_buffer);
+    [e setComputePipelineState:k];
+    note_work(k);
+    [e setBuffer:args->mtl() offset:d.argument_offset atIndex:0];
+    [e setBuffer:count ? count->mtl() : args->mtl() offset:count ? d.count_offset : 0 atIndex:1];
+    [e setBuffer:out.buffer offset:out.offset atIndex:2];
+    [e setBytes:&params length:sizeof(params) atIndex:3];
+    [e dispatchThreads:MTLSizeMake(d.max_count, 1, 1) threadsPerThreadgroup:MTLSizeMake(std::min<std::uint32_t>(64, d.max_count), 1, 1)];
+    d_->counters().indirect_prepasses++;
+    return out;
+}
+
+void Encoder::indirect_rect(const CmdIndirect& c, MetalRenderPipeline* p) {
+    const IndirectDesc& d = c.desc;
+    const DrawState& s = *c.state;
+    if (p->rect_mode() != RectMode::vertex_expand || !p->rect_pso()) {
+        static std::atomic<bool> logged{false};
+        if (!logged.exchange(true)) log("indirect rect-list draw skipped: the pipeline has no vertex-stage rect expansion");
+        return;
+    }
+    const Prepared& pr = prepared_[&(*cmds_)[pos_]];
+    if (!pr.buffer) {
+        status_ = Status::invalid_argument;
+        return;
+    }
+    if (!bind_common(s, p, true)) return;
+    const rect::WrapperResult& w = p->rect_wrapper();
+    for (std::uint32_t slot = 0; slot < w.vertex_buffer_index.size(); ++slot) {
+        const VertexBufferView& v = s.vertex_buffers[slot];
+        gpu::Buffer* b = nullptr;
+        std::uint64_t off = 0;
+        if (!d_->resolve_va(v.va, &b, &off)) continue;
+        [render_ setVertexBuffer:static_cast<MetalBuffer*>(b)->mtl() offset:off atIndex:w.vertex_buffer_index[slot]];
+    }
+    id<MTLBuffer> ib = p->rect_params_dummy();
+    std::uint64_t ib_off = 0;
+    if (d.kind == IndirectKind::draw_indexed) {
+        gpu::Buffer* b = nullptr;
+        if (!d_->resolve_va(s.index.va, &b, &ib_off)) {
+            status_ = Status::invalid_argument;
+            return;
+        }
+        ib = static_cast<MetalBuffer*>(b)->mtl();
+    }
+    [render_ setVertexBuffer:ib offset:ib_off atIndex:w.index_buffer_index];
+    const std::uint64_t params_base =
+        pr.offset + (std::uint64_t(d.max_count) * 16 + kRectParamsStride - 1) / kRectParamsStride * kRectParamsStride;
+    for (std::uint32_t i = 0; i < d.max_count; ++i) {
+        [render_ setVertexBuffer:pr.buffer offset:params_base + std::uint64_t(i) * kRectParamsStride atIndex:w.params_index];
+        [render_ drawPrimitives:MTLPrimitiveTypeTriangle indirectBuffer:pr.buffer indirectBufferOffset:pr.offset + i * 16];
+    }
+    d_->counters().indirect_commands += d.max_count;
+    d_->counters().rect_draws_expanded += d.max_count;
+    gta6rt_hud_add_draws(d.max_count);
 }
 
 Prepared Encoder::count_prepass(const IndirectDesc& d) {
@@ -1784,8 +1911,8 @@ void Encoder::indirect(const CmdIndirect& c) {
             }
             return;
         }
-        if (d.count_buffer) {
-            const Prepared pr = count_prepass(d);
+        if (d.count_buffer || indirect_limits()) {
+            const Prepared pr = indirect_limits() ? groups_prepass(d) : count_prepass(d);
             if (!pr.buffer) {
                 status_ = Status::invalid_argument;
                 return;
@@ -1810,12 +1937,27 @@ void Encoder::indirect(const CmdIndirect& c) {
         return;
     }
     const Cmd* self = &(*cmds_)[pos_];
-    if (d.count_buffer && render_ && !prepared_.count(self)) {
+    const bool rect = s.topology == topology::rect_list && d.kind != IndirectKind::dispatch_mesh;
+    const bool mesh_limits = d.kind == IndirectKind::dispatch_mesh && indirect_limits();
+    if ((d.count_buffer || rect || mesh_limits) && render_ && !prepared_.count(self)) {
         end_encoder();
         d_->counters().render_pass_splits++;
     }
     if (!ensure_render()) return;
-    if (d.count_buffer) {
+    if (rect) {
+        MetalRenderPipeline* p = s.pipeline;
+        Status why = Status::ok;
+        if (!p || !p->ready_for_encode(&why)) {
+            if (!p || why != Status::not_ready) {
+                log("indirect draw skipped: %s", p ? p->error().c_str() : "no pipeline");
+                status_ = p ? why : Status::invalid_argument;
+            }
+            return;
+        }
+        indirect_rect(c, p);
+        return;
+    }
+    if (d.count_buffer || mesh_limits) {
         const Prepared& pr = prepared_[self];
         if (!pr.buffer) {
             status_ = Status::invalid_argument;

@@ -83,6 +83,15 @@ target_compile_options(gta6rt_d3d12_metal_objs PRIVATE
 set_source_files_properties(${D3D12MTL_UPSTREAM_SOURCES} ${D3D12MTL_FORKED_SOURCES} PROPERTIES
   COMPILE_OPTIONS "-include;${D3D12VK_DIR}/platform/win32_host.h"
   OBJECT_DEPENDS "${_overlay}")
+# -DGTA6RT_D3D12_METAL_ASAN=ON (a diagnostic tree): this module and port/metal under AddressSanitizer, recoverable.
+option(GTA6RT_D3D12_METAL_ASAN "AddressSanitizer for the D3D12-on-Metal layer and the Metal backend" OFF)
+if(GTA6RT_D3D12_METAL_ASAN)
+  foreach(_t gta6rt_d3d12_metal_objs gta6rt_metal)
+    if(TARGET ${_t})
+      target_compile_options(${_t} PRIVATE -fsanitize=address -fsanitize-recover=address -fno-omit-frame-pointer)
+    endif()
+  endforeach()
+endif()
 
 # Besides the entry points: the process-wide state the front end shares with the host and the shims (title-memory
 # notes, XG layouts, value sinks, labels, DirectStorage staging, traces). Their inline functions and statics are

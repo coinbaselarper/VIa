@@ -81,17 +81,28 @@ MetalShaders::Library MetalShaders::load_locked(const std::string& path, std::st
     return out;
 }
 
-MetalShaders::Library MetalShaders::find(const std::string& name, const std::string& stage,
-                                         std::function<void()> ready, bool* pending, std::string* error) {
-    if (pending) *pending = false;
+MetalShaders::Library MetalShaders::load_relative(const std::string& relative, std::string* error) {
     std::lock_guard lock(mutex_);
-    if (catalog_loaded_)
+    if (!catalog_loaded_) {
+        if (error) *error = "no shader store manifest";
+        return {};
+    }
+    return load_locked(catalog_.path(relative), error);
+}
+
+MetalShaders::Library MetalShaders::find(const std::string& name, const std::string& stage,
+                                         std::function<void()> ready, bool* pending, std::string* error,
+                                         const std::string& variant) {
+    if (pending) *pending = false;
+    const std::string job_key = variant.empty() ? name : name + "|" + variant;
+    std::lock_guard lock(mutex_);
+    if (catalog_loaded_ && variant.empty())
         if (const auto* e = catalog_.find(name)) {
             ++stats_.store_hits;
             return load_locked(catalog_.library_path(*e), error);
         }
-    if (auto it = built_.find(name); it != built_.end()) return load_locked(it->second, error);
-    if (auto it = failed_.find(name); it != failed_.end()) {
+    if (auto it = built_.find(job_key); it != built_.end()) return load_locked(it->second, error);
+    if (auto it = failed_.find(job_key); it != failed_.end()) {
         if (error) *error = it->second;
         return {};
     }
@@ -99,15 +110,17 @@ MetalShaders::Library MetalShaders::find(const std::string& name, const std::str
         if (error) *error = "not in the shader store, and no builder";
         return {};
     }
-    auto [it, fresh] = jobs_.try_emplace(name);
+    auto [it, fresh] = jobs_.try_emplace(job_key);
     if (fresh) {
         it->second.name = name;
         it->second.stage = stage;
-        order_.push_back(name);
+        it->second.variant = variant;
+        order_.push_back(job_key);
         ++stats_.queued;
         if (stats_.queued <= 8 || (stats_.queued & (stats_.queued - 1)) == 0)
-            std::fprintf(stderr, "[rt] d3d12-metal: %s is not in the shader store: built on demand (%llu queued so far)\n",
-                         name.c_str(), static_cast<unsigned long long>(stats_.queued));
+            std::fprintf(stderr, "[rt] d3d12-metal: %s%s%s is not in the shader store: built on demand (%llu queued so far)\n",
+                         name.c_str(), variant.empty() ? "" : " variant ", variant.c_str(),
+                         static_cast<unsigned long long>(stats_.queued));
     }
     if (ready) it->second.waiters.push_back(std::move(ready));
     if (pending) *pending = true;
@@ -122,30 +135,32 @@ void MetalShaders::builder() {
             std::unique_lock lock(mutex_);
             wake_.wait(lock, [this] { return stopping_ || !order_.empty(); });
             if (stopping_) return;
-            const std::string name = order_.front();
+            const std::string key = order_.front();
             order_.pop_front();
-            auto it = jobs_.find(name);
+            auto it = jobs_.find(key);
             if (it == jobs_.end()) continue;
             job.name = it->second.name;
             job.stage = it->second.stage;
+            job.variant = it->second.variant;
         }
+        const std::string job_key = job.variant.empty() ? job.name : job.name + "|" + job.variant;
         std::string metallib, error;
         const auto start = std::chrono::steady_clock::now();
-        const bool ok = build(job.name, job.stage, metallib, error);
+        const bool ok = build(job.name, job.stage, job.variant, metallib, error);
         std::vector<std::function<void()>> waiters;
         {
             std::lock_guard lock(mutex_);
             stats_.build_seconds += seconds_since(start);
             if (ok) {
-                built_[job.name] = metallib;
+                built_[job_key] = metallib;
                 ++stats_.built;
             } else {
-                failed_[job.name] = error;
+                failed_[job_key] = error;
                 ++stats_.build_failures;
-                std::fprintf(stderr, "[rt] d3d12-metal: on-demand build of %s failed: %s\n", job.name.c_str(),
+                std::fprintf(stderr, "[rt] d3d12-metal: on-demand build of %s failed: %s\n", job_key.c_str(),
                              error.c_str());
             }
-            auto it = jobs_.find(job.name);
+            auto it = jobs_.find(job_key);
             if (it != jobs_.end()) {
                 waiters = std::move(it->second.waiters);
                 jobs_.erase(it);
@@ -155,19 +170,25 @@ void MetalShaders::builder() {
     }
 }
 
-bool MetalShaders::build(const std::string& name, const std::string& stage, std::string& metallib,
-                         std::string& error) {
-    const std::string spv = config_.spirv_root + "/" + name + ".spv";
+bool MetalShaders::build(const std::string& name, const std::string& stage, const std::string& variant,
+                         std::string& metallib, std::string& error) {
+    std::string root = config_.spirv_root;
+    std::string spv = root + "/" + name + ".spv";
+    if (!exists(spv) && !config_.spirv_fallback.empty() && exists(config_.spirv_fallback + "/" + name + ".spv")) {
+        root = config_.spirv_fallback;
+        spv = root + "/" + name + ".spv";
+    }
     if (!exists(spv)) {
         error = "no SPIR-V at " + spv;
         return false;
     }
     const std::string cas = config_.store + "/cas";
     const std::string out = config_.store + "/build-" + std::to_string(::getpid()) + "-" +
-                            std::to_string(std::hash<std::string>{}(name)) + ".json";
+                            std::to_string(std::hash<std::string>{}(name + "|" + variant)) + ".json";
     const char* python = "/usr/bin/env";
     std::vector<std::string> args = {"env", "PYTHONDONTWRITEBYTECODE=1", "python3", "-I", config_.tool, spv,
-                                     "--stage", stage, "--cas", cas, "--spirv-dir", config_.spirv_root};
+                                     "--stage", stage, "--cas", cas, "--spirv-dir", root};
+    if (variant == "dual") args.push_back("--dual-source");
     std::vector<char*> argv;
     for (auto& a : args) argv.push_back(a.data());
     argv.push_back(nullptr);

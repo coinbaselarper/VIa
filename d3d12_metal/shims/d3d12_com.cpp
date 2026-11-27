@@ -1021,10 +1021,24 @@ public:
                                           stride, sig->packed_size()))
             return check(false);
         if (kind == leonida::IndirectKind::dispatch_mesh) {
-            // Not replayed yet (#3777 replays it as vkCmdDrawMeshTasksIndirectEXT): nothing is recorded, and the
-            // first such call says so. The list stays valid.
-            leonida::indirect_stats::skip(leonida::indirect_stats::Event::record_skip, leonida::indirect_stats::mesh);
-            return;
+            // port/d3d12_metal: an indirect mesh draw (drawMeshThreadgroupsWithIndirectBuffer per record) with the
+            // list's graphics state, as DispatchMesh records it. A compound signature is skipped and counted.
+            namespace stats = leonida::indirect_stats;
+            if (!terminal_only || type_ != D3D12_COMMAND_LIST_TYPE_DIRECT) return stats::skip(stats::Event::record_skip, stats::mesh);
+            if (!max_command_count || !any_nonempty_viewport()) return;
+            if (!graphics_pipeline_ || !graphics_.layout) return stats::skip(stats::Event::record_skip, stats::pipeline);
+            if (!graphics_.layout->mesh_ok) return stats::skip(stats::Event::record_skip, stats::root_layout);
+            const leonida::IndirectDrawArgs margs{resource_id(argument_buffer), argument_buffer_offset, stride,
+                                                  max_command_count, count_buffer ? resource_id(count_buffer) : 0,
+                                                  count_buffer_offset};
+            leonida::Draw draw{graphics_pipeline_, graphics_user_data(), draw_views(), depth_, {}, 0, viewport_,
+                               scissor_, blend_factor_, front_stencil_ref_, back_stencil_ref_, false, 0, 0, 0, 0, 0};
+            draw.mesh = true;
+            draw.viewports = draw_viewports();
+            note_direct_heap_indexing(graphics_.layout);
+            const bool recorded = list_.draw_indirect(std::move(draw), margs);
+            if (recorded) stats::note(stats::Event::recorded);
+            return check(recorded);
         }
         if (!terminal_only && (kind == leonida::IndirectKind::draw || kind == leonida::IndirectKind::draw_indexed)) {
             if (type_ != D3D12_COMMAND_LIST_TYPE_DIRECT) return check(false);

@@ -6,6 +6,7 @@
 #include "metal_context.h"
 #include "gfx10_descriptors.h"
 #include "rect_list_geometry.h"
+#include "title_texture_memory.h"
 #include "title_va_alias.h"
 #include "vulkan_gpu_labels.h"
 
@@ -15,6 +16,7 @@
 #include <cstring>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 namespace leonida {
 
@@ -29,8 +31,8 @@ struct Resolved {
 class Replay {
 public:
     Replay(const CommandList& list, gpu::CommandList& out, MetalContext& context, gpu::QueueType queue,
-           std::vector<label::Write>* labels)
-        : list_(list), out_(out), context_(context), queue_(queue), labels_(labels) {}
+           std::vector<label::Write>* labels, std::vector<std::unique_ptr<gpu::Buffer>>* temps)
+        : list_(list), out_(out), context_(context), queue_(queue), labels_(labels), temps_(temps) {}
 
     ReplayResult run() {
         out_.set_root_layout(context_.root_layout());
@@ -256,7 +258,6 @@ private:
                       const MetalBinding& s, std::uint32_t src_sub, const CopyBox* box) {
         const Sub ds = subresource(d, dst_sub), ss = subresource(s, src_sub);
         if (ds.plane || ss.plane) return unsupported("CopyTextureRegion of a stencil plane"), false;
-        if (d.format != s.format) return unsupported("CopyTextureRegion between textures of two formats"), false;
         if (d.samples > 1 || s.samples > 1) return unsupported("CopyTextureRegion of a multisampled texture"), false;
         const std::uint32_t sw = std::max(1u, s.width >> ss.mip), sh = std::max(1u, s.height >> ss.mip);
         const std::uint32_t sd = s.volume ? std::max(1u, s.depth >> ss.mip) : 1;
@@ -264,6 +265,7 @@ private:
         if (box) b = *box;
         if (b.right > sw || b.bottom > sh || b.back > sd || b.left >= b.right || b.top >= b.bottom || b.front >= b.back)
             return true;
+        if (d.format != s.format) return copy_through_buffer(d, ds, dx, dy, dz, s, ss, b);
         gpu::TextureCopy k;
         k.src = s.texture;
         k.src_mip = ss.mip;
@@ -279,6 +281,59 @@ private:
         k.height = b.bottom - b.top;
         k.depth = s.volume ? b.back - b.front : 1;
         out_.copy_texture(k);
+        return true;
+    }
+    // Two formats of one block size (D3D12 allows a copy between formats of a family and, on the console, BC blocks
+    // to and from 64/128-bit texels): the bytes go through a buffer of this submission, block for block.
+    bool copy_through_buffer(const MetalBinding& d, const Sub& ds, std::uint32_t dx, std::uint32_t dy, std::uint32_t dz,
+                             const MetalBinding& s, const Sub& ss, const CopyBox& b) {
+        const std::uint32_t sk = std::max(1u, s.block_dim), dk = std::max(1u, d.block_dim);
+        if (!temps_ || !s.block_bytes || s.block_bytes != d.block_bytes || s.depth_stencil || d.depth_stencil) {
+            static std::atomic<unsigned> logged{0};
+            if (logged.fetch_add(1) < 8)
+                std::fprintf(stderr, "[rt] d3d12-metal: CopyTextureRegion DXGI %u -> %u (block %u B x%u -> %u B x%u) "
+                                     "not copied\n", s.format, d.format, s.block_bytes, sk, d.block_bytes, dk);
+            return unsupported("CopyTextureRegion between textures of two formats of different block sizes"), false;
+        }
+        const std::uint32_t bw = (b.right - b.left + sk - 1) / sk, bh = (b.bottom - b.top + sk - 1) / sk;
+        const std::uint32_t slices = b.back - b.front;
+        const std::uint32_t pitch = (bw * s.block_bytes + 255) & ~255u;
+        const std::uint64_t slice_bytes = std::uint64_t(pitch) * bh;
+        gpu::BufferDesc bd;
+        bd.size = slice_bytes * slices;
+        bd.memory = gpu::MemoryKind::device_local;
+        bd.usage = gpu::usage::copy;
+        bd.label = "texture format copy";
+        auto buffer = context_.gpu().create_buffer(bd);
+        if (!buffer) return unsupported("CopyTextureRegion between two formats: no staging buffer"), false;
+        const std::uint32_t dw = std::max(1u, d.width >> ds.mip), dh = std::max(1u, d.height >> ds.mip);
+        for (std::uint32_t z = 0; z < slices; ++z) {
+            gpu::BufferTextureCopy k;
+            k.buffer = buffer.get();
+            k.offset = z * slice_bytes;
+            k.row_pitch = pitch;
+            k.texture = s.texture;
+            k.mip = ss.mip;
+            k.layer = s.volume ? b.front + z : ss.layer;
+            k.x = b.left, k.y = b.top, k.width = b.right - b.left, k.height = b.bottom - b.top;
+            out_.copy_texture_to_buffer(k);
+        }
+        barrier_all(d3d12_state::copy_dest, d3d12_state::copy_source, buffer.get());
+        for (std::uint32_t z = 0; z < slices; ++z) {
+            gpu::BufferTextureCopy k;
+            k.buffer = buffer.get();
+            k.offset = z * slice_bytes;
+            k.row_pitch = pitch;
+            k.texture = d.texture;
+            k.mip = ds.mip;
+            k.layer = d.volume ? dz + z : ds.layer;
+            k.x = dx, k.y = dy;
+            k.width = std::min(bw * dk, dw > dx ? dw - dx : 0u);
+            k.height = std::min(bh * dk, dh > dy ? dh - dy : 0u);
+            if (k.width && k.height) out_.copy_buffer_to_texture(k);
+        }
+        temps_->push_back(std::move(buffer));
+        context_.stats().format_copies.fetch_add(1, std::memory_order_relaxed);
         return true;
     }
     void copy_between_textures(const CopyTexture& c) {
@@ -419,14 +474,32 @@ private:
     void record(const CopyAccelerationStructure&) { unsupported("CopyRaytracingAccelerationStructure"); }
     void record(const AccelerationStructurePostbuild&) { unsupported("EmitRaytracingAccelerationStructurePostbuildInfo"); }
 
-    bool compute(std::uintptr_t id, MetalComputePipeline& p) {
+    using Work = MetalContext::Work;
+    using Fate = MetalContext::Fate;
+    static Fate pipeline_fate(const gpu::Pipeline* pl, const char*& why) {
+        if (!pl) return Fate::library_pending;
+        switch (pl->state()) {
+        case gpu::PipelineState::failed: why = pl->error().c_str(); return Fate::metal_refused;
+        case gpu::PipelineState::compiling:
+        case gpu::PipelineState::queued: return Fate::compiling;
+        default: return Fate::recorded;
+        }
+    }
+    Fate compute(std::uintptr_t id, MetalComputePipeline& p, const char*& why) {
         if (!context_.compute_pipeline(id, p)) {
             unsupported("Dispatch with an unknown compute pipeline");
-            return false;
+            return Fate::pso_unknown;
         }
-        if (p.refused) return false;
+        if (p.refused) {
+            why = p.name;
+            return Fate::pso_refused;
+        }
         if (!p.pipeline && p.ensure && p.ensure(p.owner)) context_.compute_pipeline(id, p);
-        return p.pipeline != nullptr;
+        if (p.refused) {
+            why = p.name;
+            return Fate::pso_refused;
+        }
+        return pipeline_fate(p.pipeline, why);
     }
     void set_compute(const MetalComputePipeline& p, const std::array<std::uint32_t, 32>& user_data) {
         if (p.pipeline != bound_compute_) {
@@ -439,11 +512,14 @@ private:
     void record(const Dispatch& c) {
         auto& st = context_.stats();
         MetalComputePipeline p;
-        if (!compute(c.pipeline, p)) {
+        const char* why = nullptr;
+        if (const Fate f = compute(c.pipeline, p, why); f != Fate::recorded) {
             st.dispatches_skipped.fetch_add(1, std::memory_order_relaxed);
+            context_.note_work(Work::dispatch, f, why);
             if (MetalContext::census_on()) context_.note_census(p.name, "dispatch-skipped");
             return;
         }
+        context_.note_work(Work::dispatch, Fate::recorded);
         if (MetalContext::census_on()) context_.note_census(p.name, "dispatch");
         set_compute(p, c.user_data);
         out_.dispatch(c.x, c.y, c.z);
@@ -452,16 +528,25 @@ private:
 
     void record(const ExecuteIndirect& c) {
         auto& st = context_.stats();
-        if (c.kind != IndirectKind::dispatch) return unsupported("ExecuteIndirect draw without captured draw state");
+        if (c.kind != IndirectKind::dispatch) {
+            context_.note_work(Work::indirect_uncaptured, Fate::not_implemented);
+            return unsupported("ExecuteIndirect draw without captured draw state");
+        }
         MetalComputePipeline p;
-        if (!c.pipeline || !compute(c.pipeline, p)) {
+        const char* why = nullptr;
+        const Fate f = c.pipeline ? compute(c.pipeline, p, why) : Fate::pso_unknown;
+        if (f != Fate::recorded) {
             st.dispatches_skipped.fetch_add(1, std::memory_order_relaxed);
+            context_.note_work(Work::indirect_dispatch, f, why);
             return;
         }
         gpu::IndirectDesc d;
         if (!indirect(gpu::IndirectKind::dispatch, c.stride, c.max_count, c.argument_buffer, c.argument_offset,
-                      c.count_buffer, c.count_offset, d))
+                      c.count_buffer, c.count_offset, d)) {
+            context_.note_work(Work::indirect_dispatch, Fate::arguments_unknown);
             return unsupported("ExecuteIndirect with an unknown argument or count buffer");
+        }
+        context_.note_work(Work::indirect_dispatch, Fate::recorded);
         set_compute(p, c.user_data);
         out_.execute_indirect(d);
         st.dispatches.fetch_add(1, std::memory_order_relaxed);
@@ -484,14 +569,30 @@ private:
         return true;
     }
 
-    bool graphics(const Draw& draw, MetalGraphicsPipeline& p) {
+    Fate graphics(const Draw& draw, MetalGraphicsPipeline& p, const char*& why) {
         if (!context_.graphics_pipeline(draw.pipeline, p)) {
             unsupported("draw with an unknown graphics pipeline");
-            return false;
+            return Fate::pso_unknown;
         }
-        if (p.refused) return false;
+        if (p.refused) {
+            why = p.name;
+            return Fate::pso_refused;
+        }
         if (!p.render && !p.mesh && p.ensure && p.ensure(p.owner)) context_.graphics_pipeline(draw.pipeline, p);
-        return p.render || p.mesh;
+        if (p.refused) {
+            why = p.name;
+            return Fate::pso_refused;
+        }
+        if (p.mesh) return pipeline_fate(p.mesh, why);
+        return pipeline_fate(p.render, why);
+    }
+    static Work work_of(const Draw& draw, const MetalGraphicsPipeline& p, bool indirect) {
+        if (draw.mesh || p.mesh)
+            return indirect ? (p.split ? Work::indirect_mesh_split : Work::indirect_mesh)
+                            : (p.split ? Work::mesh_split : Work::mesh);
+        if (draw.topology == gpu::topology::rect_list) return indirect ? Work::indirect_rect : Work::draw_rect;
+        if (draw.indexed) return indirect ? Work::indirect_draw_indexed : Work::draw_indexed;
+        return indirect ? Work::indirect_draw : Work::draw;
     }
     bool bind_targets(const Draw& draw) {
         std::array<gpu::TargetView, 8> rts{};
@@ -530,10 +631,10 @@ private:
         rt_dirty_ = false;
         return true;
     }
-    bool bind_draw_state(const Draw& draw, const MetalGraphicsPipeline& p) {
+    Fate bind_draw_state(const Draw& draw, const MetalGraphicsPipeline& p, const char*& why) {
         if (!bind_targets(draw)) {
             unsupported("draw with an unknown render target or depth texture");
-            return false;
+            return Fate::target_unknown;
         }
         if (p.mesh) {
             out_.set_mesh_pipeline(p.mesh);
@@ -547,8 +648,9 @@ private:
                 }
                 if (!pipeline) {
                     unsupported("rect-list draw whose rectangle pipeline variant is not built");
-                    return false;
+                    return Fate::library_pending;
                 }
+                if (const Fate f = pipeline_fate(pipeline, why); f != Fate::recorded) return f;
             }
             out_.set_pipeline(pipeline);
             if (draw.views) {
@@ -569,7 +671,7 @@ private:
                             std::fprintf(stderr, "[rt] d3d12-metal: vertex buffer slot %u va 0x%llx size %u stride %u "
                                                  "names no buffer\n",
                                          slot, static_cast<unsigned long long>(v.va), v.size, v.stride);
-                        return false;
+                        return Fate::vertex_unknown;
                     }
                     vbs[slot] = {r.buffer->gpu_va() + r.offset, std::uint32_t(std::min<std::uint64_t>(v.size, r.bytes)),
                                  v.stride};
@@ -583,7 +685,7 @@ private:
                     Resolved r;
                     if (!va(draw.index.va, draw.index.size, r, TitleVaAliases::index_view)) {
                         unsupported("index buffer at an unknown VA");
-                        return false;
+                        return Fate::index_unknown;
                     }
                     ib.va = r.buffer->gpu_va() + r.offset;
                     ib.size = std::uint32_t(std::min<std::uint64_t>(draw.index.size, r.bytes));
@@ -591,7 +693,7 @@ private:
                     out_.set_index_buffer(ib);
                 } else {
                     unsupported("indexed draw without an index buffer");
-                    return false;
+                    return Fate::index_unknown;
                 }
             }
             out_.set_topology(draw.topology);
@@ -604,12 +706,16 @@ private:
         out_.set_blend_factor(draw.blend_factor);
         out_.set_stencil_refs(draw.stencil_front, draw.stencil_back);
         if (draw.viewports) unsupported("more than one viewport or scissor (the first is used)");
-        return true;
+        return Fate::recorded;
     }
     void record(const Draw& draw) {
         auto& st = context_.stats();
         MetalGraphicsPipeline p;
-        if (!graphics(draw, p) || !bind_draw_state(draw, p)) {
+        const char* why = nullptr;
+        Fate f = graphics(draw, p, why);
+        if (f == Fate::recorded) f = bind_draw_state(draw, p, why);
+        context_.note_work(work_of(draw, p, false), f, why);
+        if (f != Fate::recorded) {
             st.draws_skipped.fetch_add(1, std::memory_order_relaxed);
             if (MetalContext::census_on()) context_.note_census(p.name, "draw-skipped");
             return;
@@ -628,22 +734,31 @@ private:
         const Draw& draw = payload->state;
         const IndirectDrawArgs& a = payload->arguments;
         MetalGraphicsPipeline p;
-        if (!graphics(draw, p) || !bind_draw_state(draw, p)) {
+        const char* why = nullptr;
+        Fate f = graphics(draw, p, why);
+        const Work work = work_of(draw, p, true);
+        if (f == Fate::recorded && !p.mesh && work != Work::indirect_rect &&
+            (draw.topology == gpu::topology::quad_list || draw.topology > gpu::topology::triangle_strip)) {
+            unsupported("indirect quad-list or adjacency draw");
+            f = Fate::not_implemented;
+        }
+        if (f == Fate::recorded) f = bind_draw_state(draw, p, why);
+        gpu::IndirectDesc d;
+        const gpu::IndirectKind kind = p.mesh         ? gpu::IndirectKind::dispatch_mesh
+                                       : draw.indexed ? gpu::IndirectKind::draw_indexed
+                                                      : gpu::IndirectKind::draw;
+        if (f == Fate::recorded && !indirect(kind, a.stride, a.max_count, a.argument_buffer, a.argument_offset,
+                                             a.count_buffer, a.count_offset, d)) {
+            unsupported("indirect draw with an unknown argument or count buffer");
+            f = Fate::arguments_unknown;
+        }
+        context_.note_work(work, f, why);
+        if (f != Fate::recorded) {
             st.draws_skipped.fetch_add(1, std::memory_order_relaxed);
             if (MetalContext::census_on()) context_.note_census(p.name, "indirect-draw-skipped");
             return;
         }
         if (MetalContext::census_on()) context_.note_census(p.name, "indirect-draw");
-        const gpu::IndirectKind kind = p.mesh         ? gpu::IndirectKind::dispatch_mesh
-                                       : draw.indexed ? gpu::IndirectKind::draw_indexed
-                                                      : gpu::IndirectKind::draw;
-        gpu::IndirectDesc d;
-        if (!indirect(kind, a.stride, a.max_count, a.argument_buffer, a.argument_offset, a.count_buffer, a.count_offset,
-                      d)) {
-            unsupported("indirect draw with an unknown argument or count buffer");
-            st.draws_skipped.fetch_add(1, std::memory_order_relaxed);
-            return;
-        }
         out_.execute_indirect(d);
         st.draws.fetch_add(1, std::memory_order_relaxed);
     }
@@ -654,16 +769,28 @@ private:
     // <hex offsets>: the descriptor table at s8 (as the shader reads it, heap_base + s8) and, for each listed offset
     // holding a V#, the V# and the first 32 words of the memory it names.
     void trace_draw(const Draw& draw, const MetalGraphicsPipeline& p) {
-        static const char* want = std::getenv("GTA6RT_METAL_DRAW_TRACE");
-        if (!want || !*want || !p.name || !std::strstr(p.name, want)) return;
+        static const std::vector<std::string> wants = [] {
+            std::vector<std::string> out;
+            const char* v = std::getenv("GTA6RT_METAL_DRAW_TRACE");
+            for (std::string s = v ? v : ""; !s.empty();) {
+                const auto comma = s.find(',');
+                out.push_back(s.substr(0, comma));
+                s = comma == std::string::npos ? "" : s.substr(comma + 1);
+            }
+            return out;
+        }();
         static const unsigned every = [] {
             const char* v = std::getenv("GTA6RT_METAL_DRAW_TRACE_EVERY");
             return v ? unsigned(std::strtoul(v, nullptr, 10)) : 0u;
         }();
-        static std::atomic<unsigned> seen{0}, printed{0};
-        const unsigned n = seen.fetch_add(1);
+        static std::atomic<unsigned> seen[4]{}, printed{0};
+        if (wants.empty() || !p.name) return;
+        std::size_t which = 0;
+        while (which < wants.size() && (wants[which].empty() || !std::strstr(p.name, wants[which].c_str()))) ++which;
+        if (which == wants.size()) return;
+        const unsigned n = seen[std::min<std::size_t>(which, 3)].fetch_add(1);
         if (n >= 8 && (!every || n % every)) return;
-        if (printed.fetch_add(1) >= 64) return;
+        if (printed.fetch_add(1) >= 96) return;
         std::string text;
         char line[256];
         std::snprintf(line, sizeof line, "%s: count %u instances %u first %u indexed %d topology %u viewport %.0f,%.0f %.0fx%.0f",
@@ -736,17 +863,42 @@ private:
             }
             const std::uint64_t base = std::uint64_t(std::int64_t(v.address << 16) >> 16);
             std::uint32_t cb[32] = {};
-            const bool read = v.num_records && read_va(base, cb, sizeof cb);
-            text.clear();
-            for (int i = 0; read && i < 32; ++i) {
-                float f;
-                std::memcpy(&f, &cb[i], 4);
-                std::snprintf(line, sizeof line, "%s%g", i % 4 ? " " : " | ", f);
-                text += line;
-            }
-            std::fprintf(stderr, "[rt] d3d12-metal: draw trace table +0x%lx: V# base 0x%llx stride %u records %u%s%s\n",
+            std::uint64_t n = sizeof cb;
+            gpu::Buffer* holder = nullptr;
+            std::uint64_t holder_offset = 0;
+            const bool found = v.num_records && context_.buffer_at(base, n, holder, holder_offset) && holder;
+            const bool read = found && holder->cpu_pointer() && n >= 16;
+            if (read)
+                std::memcpy(cb, static_cast<const std::uint8_t*>(holder->cpu_pointer()) + holder_offset,
+                            std::size_t(std::min<std::uint64_t>(n, sizeof cb)));
+            const auto floats = [&](const std::uint32_t* words, int count) {
+                std::string s;
+                for (int i = 0; i < count; ++i) {
+                    float f;
+                    std::memcpy(&f, &words[i], 4);
+                    std::snprintf(line, sizeof line, "%s%g", i % 4 ? " " : " | ", f);
+                    s += line;
+                }
+                return s;
+            };
+            text = read ? floats(cb, int(std::min<std::uint64_t>(n, sizeof cb) / 4)) : "";
+            std::uint64_t lo = 0, hi = 0, alias = 0, room = 0;
+            auto& aliases = title_va_aliases();
+            const bool title = aliases.title_memory(base, lo, hi);
+            const bool mapped = aliases.range_of(base, alias, room);
+            std::fprintf(stderr,
+                         "[rt] d3d12-metal: draw trace table +0x%lx: V# base 0x%llx stride %u records %u; replay finds %s "
+                         "(%llu bytes at +0x%llx)%s; title memory %d [0x%llx, 0x%llx), alias %d -> 0x%llx (%llu)%s\n",
                          o, static_cast<unsigned long long>(base), v.stride, v.num_records,
-                         read ? ", words as floats:" : " (not read)", text.c_str());
+                         found ? (holder == context_.arena_buffer() ? "the arena" : "a buffer") : "nothing",
+                         static_cast<unsigned long long>(found ? n : 0), static_cast<unsigned long long>(holder_offset),
+                         text.c_str(), int(title),
+                         static_cast<unsigned long long>(lo), static_cast<unsigned long long>(hi), int(mapped),
+                         static_cast<unsigned long long>(alias), static_cast<unsigned long long>(room),
+                         title && hi - base >= 128 && texture_memory_readable(std::uintptr_t(base), 128) ? (" title bytes:" + floats(reinterpret_cast<const std::uint32_t*>(
+                                                                                  static_cast<std::uintptr_t>(base)), 32))
+                                                         .c_str()
+                                                   : "");
         }
     }
 
@@ -759,6 +911,7 @@ private:
     MetalContext& context_;
     gpu::QueueType queue_;
     std::vector<label::Write>* labels_;
+    std::vector<std::unique_ptr<gpu::Buffer>>* temps_;
     std::unordered_map<ResourceId, Cached> bindings_;
     std::array<gpu::TargetView, 8> bound_rts_{};
     std::uint32_t bound_rt_count_ = ~0u;
@@ -772,8 +925,8 @@ private:
 }  // namespace
 
 ReplayResult metal_replay(const CommandList& list, gpu::CommandList& out, MetalContext& context, gpu::QueueType queue,
-                          std::vector<label::Write>* labels) {
-    return Replay(list, out, context, queue, labels).run();
+                          std::vector<label::Write>* labels, std::vector<std::unique_ptr<gpu::Buffer>>* temps) {
+    return Replay(list, out, context, queue, labels, temps).run();
 }
 
 }  // namespace leonida

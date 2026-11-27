@@ -119,6 +119,10 @@ def prepare(words, stage, opts):
         passes.append({"pass": "x_buf_device", "x_buf_words": info["x_buf_words"], "binding": info["binding"]})
     w, r = spv.split_bindings(words)
     passes.append({"pass": "split_bindings", "moved": r["moved"]})
+    if opts.get("dual_source") and stage == "ps":
+        w, r = spv.dual_source(w)
+        if r["moved"]:
+            passes.append({"pass": "dual_source"})
     extra = []
     if stage == "vs" and vs_lane_used(w):
         route = opts.get("vs_route", "lane")
@@ -525,8 +529,10 @@ def main():
     ap.add_argument("--drop", default="")
     ap.add_argument("--keep-msl", action="store_true")
     ap.add_argument("--force", action="store_true")
+    ap.add_argument("--dual-source", action="store_true",
+                    help="ps: blend source 1 from Location 1 to Location 0 Index 1 (dual-source-blend PSOs)")
     a = ap.parse_args()
-    opts = {"vs_route": a.vs_route, "force": a.force}
+    opts = {"vs_route": a.vs_route, "force": a.force, "dual_source": a.dual_source}
     if a.drop:
         opts["drop_outputs"] = [int(x) for x in a.drop.split(",")]
     tr = translator_id(a.spirv_dir or os.path.dirname(a.spv))

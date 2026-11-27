@@ -256,6 +256,68 @@ std::string MetalContext::take_census() {
     return out;
 }
 
+const char* MetalContext::work_name(Work w) {
+    static const char* names[] = {"draw", "draw indexed", "draw rect-list", "mesh", "mesh split64", "indirect draw",
+                                  "indirect draw indexed", "indirect rect-list", "indirect mesh",
+                                  "indirect mesh split64", "dispatch", "indirect dispatch",
+                                  "ExecuteIndirect draw (no captured state)"};
+    static_assert(sizeof(names) / sizeof(*names) == std::size_t(Work::count));
+    return names[std::size_t(w)];
+}
+
+const char* MetalContext::fate_name(Fate f) {
+    static const char* names[] = {"recorded", "PSO refused", "PSO unknown", "library pending", "pipeline compiling",
+                                  "Metal refused the pipeline", "render target unknown", "vertex buffer unknown",
+                                  "index buffer unknown", "arguments unknown", "not implemented"};
+    static_assert(sizeof(names) / sizeof(*names) == std::size_t(Fate::count));
+    return names[std::size_t(f)];
+}
+
+void MetalContext::note_work(Work w, Fate f, const char* why) {
+    work_[std::size_t(w) * std::size_t(Fate::count) + std::size_t(f)].fetch_add(1, std::memory_order_relaxed);
+    if (f == Fate::recorded) return;
+    std::lock_guard lock(work_mutex_);
+    std::string key = std::string(work_name(w)) + ": " + fate_name(f);
+    if (why && *why) key += std::string(" (") + std::string(why).substr(0, 140) + ")";
+    ++work_why_[key];
+}
+
+std::string MetalContext::take_work_report(std::uint64_t presents) {
+    const double frames = presents ? double(presents) : 1.0;
+    std::string out;
+    char text[160];
+    for (std::size_t w = 0; w < std::size_t(Work::count); ++w) {
+        std::string row;
+        std::uint64_t total = 0;
+        for (std::size_t f = 0; f < std::size_t(Fate::count); ++f) {
+            const std::size_t i = w * std::size_t(Fate::count) + f;
+            const std::uint64_t now = work_[i].load(std::memory_order_relaxed);
+            const std::uint64_t n = now - work_seen_[i];
+            work_seen_[i] = now;
+            if (!n) continue;
+            total += n;
+            std::snprintf(text, sizeof text, "%s%s %.1f", row.empty() ? "" : ", ", fate_name(Fate(f)), double(n) / frames);
+            row += text;
+        }
+        if (!total) continue;
+        std::snprintf(text, sizeof text, "%s%s %.1f (", out.empty() ? "" : "; ", work_name(Work(w)), double(total) / frames);
+        out += text + row + ")";
+    }
+    std::map<std::string, std::uint64_t> why;
+    {
+        std::lock_guard lock(work_mutex_);
+        why.swap(work_why_);
+    }
+    std::vector<std::pair<std::uint64_t, std::string>> rows;
+    for (const auto& [k, n] : why) rows.emplace_back(n, k);
+    std::sort(rows.rbegin(), rows.rend());
+    for (std::size_t i = 0; i < rows.size() && i < 12; ++i) {
+        std::snprintf(text, sizeof text, "%s%.1f/frame ", i ? "; " : " || skipped: ", double(rows[i].first) / frames);
+        out += text + rows[i].second;
+    }
+    return out;
+}
+
 void MetalContext::note_submitted(gpu::Fence* progress, std::uint64_t value) {
     std::lock_guard lock(submitted_mutex_);
     auto& v = submitted_[progress];
@@ -407,10 +469,11 @@ ReplayResult MetalQueue::execute_now(std::span<const CommandList* const> lists) 
     std::vector<gpu::CommandList*> recorded;
     recorded.reserve(lists.size());
     std::vector<label::Write> labels;
+    std::vector<std::unique_ptr<gpu::Buffer>> temps;
     for (std::size_t i = 0; i < lists.size(); ++i) {
         gpu::CommandList* out = list_slot(i);
         if (!out) return ReplayResult::unsupported;
-        const ReplayResult r = metal_replay(*lists[i], *out, context_, type_, &labels);
+        const ReplayResult r = metal_replay(*lists[i], *out, context_, type_, &labels, &temps);
         if (r != ReplayResult::success) return r;
         if (const gpu::Status s = out->close(); s != gpu::Status::ok) {
             std::fprintf(stderr, "[rt] d3d12-metal: a recorded list did not close: %s\n", gpu::status_name(s));

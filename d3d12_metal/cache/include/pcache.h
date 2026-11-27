@@ -119,7 +119,7 @@ struct StartConfig {
 bool enabled();
 void start(const StartConfig& config);
 void stop();
-void flush(const char* why);  // writes the manifest now (also every 10 s and at every phase change)
+void flush(const char* why);  // writes the manifest now (also every 2 s while it grows and at every phase change)
 
 // PSO creation (bootstrap triggers: the Vulkan boot manifest's PSO keys, census pipeline names). Cheap when unmatched.
 void created(const void* owner, const std::string& pso_key, const std::string& label, const gpu::RenderPipelineDesc& d,

@@ -98,6 +98,7 @@ struct MetalComputePipeline {
 struct MetalGraphicsPipeline {
     gpu::RenderPipeline* render = nullptr;
     gpu::MeshPipeline* mesh = nullptr;
+    bool split = false;  // mesh: the split64 route (object stage + 64-vertex-chunk mesh stage)
     // The rectangle-list variant (topology type rectangle, vertex-stage expansion) of a triangle PSO the title draws
     // rect lists with: console PSOs say TRIANGLE for those. Built at the first rect-list draw (ensure_rect).
     gpu::RenderPipeline* rect = nullptr;
@@ -216,7 +217,7 @@ public:
     struct Stats {
         std::atomic<std::uint64_t> executes{0}, lists{0}, commands{0}, draws{0}, draws_skipped{0}, dispatches{0},
             dispatches_skipped{0}, copies{0}, clears{0}, barriers{0}, unsupported{0}, replay_us{0}, execute_us{0},
-            before_us{0}, holds{0}, presents{0}, composed_presents{0}, deferred_backed{0};
+            before_us{0}, holds{0}, presents{0}, composed_presents{0}, deferred_backed{0}, format_copies{0};
     };
     Stats& stats() { return stats_; }
     void note_unsupported(const char* what);
@@ -225,6 +226,22 @@ public:
     static bool census_on();
     void note_census(const char* pipeline, const char* what);
     std::string take_census();
+
+    // Every draw and dispatch replay sees, by class and by what became of it (atomics; always on). `why` names the
+    // refusal of a skipped one (the refused PSO's reason, Metal's error), kept by count.
+    enum class Work : std::uint8_t {
+        draw, draw_indexed, draw_rect, mesh, mesh_split, indirect_draw, indirect_draw_indexed, indirect_rect,
+        indirect_mesh, indirect_mesh_split, dispatch, indirect_dispatch, indirect_uncaptured, count
+    };
+    enum class Fate : std::uint8_t {
+        recorded, pso_refused, pso_unknown, library_pending, compiling, metal_refused, target_unknown,
+        vertex_unknown, index_unknown, arguments_unknown, not_implemented, count
+    };
+    static const char* work_name(Work w);
+    static const char* fate_name(Fate f);
+    void note_work(Work w, Fate f, const char* why = nullptr);
+    // Counts since the last call, per presented frame, and the top skip reasons; empty when nothing was seen.
+    std::string take_work_report(std::uint64_t presents);
 
     // The latest progress value each queue signalled, so a present (on its own queue) waits for the work before it.
     void note_submitted(gpu::Fence* progress, std::uint64_t value);
@@ -271,6 +288,11 @@ private:
     std::map<std::string, std::uint64_t> unsupported_;
     std::mutex census_mutex_;
     std::map<std::pair<std::string, std::string>, std::uint64_t> census_;
+    static constexpr std::size_t kWork = std::size_t(Work::count) * std::size_t(Fate::count);
+    std::array<std::atomic<std::uint64_t>, kWork> work_{};
+    std::array<std::uint64_t, kWork> work_seen_{};
+    std::mutex work_mutex_;
+    std::map<std::string, std::uint64_t> work_why_;
     mutable std::mutex submitted_mutex_;
     std::map<gpu::Fence*, std::uint64_t> submitted_;
 };
@@ -279,8 +301,11 @@ private:
 // named once (MetalContext::note_unsupported); a draw or dispatch whose pipeline is not ready is skipped by the
 // backend (NotReady::skip) and counted there.
 // `labels`: the GPU-label writes of the list (LEONIDA_GPU_LABELS), stored by the CPU once the submission completes.
+// `temps`: buffers the replay made for this submission (a copy between two texture formats goes through one); the
+// caller keeps them until the lists are executed (the backend holds their release until the GPU is done).
 ReplayResult metal_replay(const CommandList& list, gpu::CommandList& out, MetalContext& context, gpu::QueueType queue,
-                          std::vector<label::Write>* labels = nullptr);
+                          std::vector<label::Write>* labels = nullptr,
+                          std::vector<std::unique_ptr<gpu::Buffer>>* temps = nullptr);
 
 // A D3D12 queue: QueueHolds holder over a gpu::Queue (the Vulkan path's VulkanQueue minus layouts).
 class MetalQueue : private QueueHolds<gpu::Fence*>::Holder {

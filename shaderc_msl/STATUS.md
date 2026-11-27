@@ -7,6 +7,17 @@ Host: M4 Pro, macOS 27.0.1, Metal compiler 32023.922 (`metal -c`), Homebrew `spi
 also as x86_64 under Rosetta). Numbers are measured in this module unless a spike is named. The machine was shared
 with other workers (load average 10-42 during this round); all timings below are loaded timings.
 
+## Round 4 addition (2026-11-26, by port/d3d12_metal): `--dual-source`
+
+The adapter measured 121 of the first 400 mesh PSOs refused by Metal with "Fragment shader does not write to render
+target color(0), index(1) that is required for blending": dual-source-blend PSOs (SRC1 blend factors). The console
+exports blend source 1 as MRT1, so the translation writes it at Location 1 (e.g. `+PS_Cable_MirrorReflection_5863fb9a`:
+outputs at Locations 0 and 1). New SPIR-V pass `spv.dual_source` (flag `--dual-source`, pixel shaders only): the
+Location 1 output moves to Location 0 Index 1, so SPIRV-Cross writes `[[color(0), index(1)]]` (checked on that shader:
+`float4 m_4 [[color(0), index(1)]]`, metallib built). A no-op when the shader has no Location 0 and 1 outputs; the pass
+is in the cache key, so variants never collide with the store's libraries. The adapter builds the variant on demand for
+PSOs whose blend state names SRC1 factors.
+
 ## Round 3 summary (2026-11-26, 15:20-19:40)
 
 Every shader of the corpus now has a defined path; counts are exact and recomputed from the files named in each line

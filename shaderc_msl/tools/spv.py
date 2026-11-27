@@ -384,6 +384,31 @@ def drop_outputs(words, locations):
     return out, {"dropped": sorted(victims.values()), "kept_private": sorted(victims[v] for v in keep_private)}
 
 
+DEC_INDEX = 32
+
+
+def dual_source(words):
+    """Fragment shaders of dual-source-blend PSOs: the console exports blend source 1 as MRT1, so the translation
+    writes it at Location 1; Metal (and Vulkan) take it from Location 0 Index 1. Moves the Location 1 output there.
+    Returns words and {"moved": bool}."""
+    m = Module(words)
+    if m.model != "ps":
+        return words, {"moved": False}
+    outs = {d["location"]: d["id"] for d in m.interface() if d["sc"] == "out" and d["builtin"] is None}
+    if 0 not in outs or 1 not in outs:
+        return words, {"moved": False}
+    target = outs[1]
+    patch, ins = {}, {}
+    for i, op, n in insts(words):
+        if op == OP_DECORATE and n >= 4 and words[i + 1] == target and words[i + 2] == DEC_LOCATION:
+            patch[(i, 3)] = 0
+            ins[i] = [_inst(OP_DECORATE, target, DEC_INDEX, 1)]
+            break
+    if not patch:
+        return words, {"moved": False}
+    return _rebuild(words, (), ins, patch), {"moved": True}
+
+
 def trim_outputs(words, widths):
     """Shrink user outputs (vec4 or arrayed vec4) at location L to widths[L] components; stores keep the leading
     components. A variable used other than through element access chains and stores is left alone."""

@@ -106,6 +106,44 @@ kernel void gta6rt_indirect_count(device const uint* args [[buffer(0)]], device 
     for (uint w = 0; w < p.words; ++w)
         out[i * p.words + w] = i < n ? args[p.src_word + i * p.stride_words + w] : 0u;
 }
+struct RectIndirectParams { uint src_word; uint stride_words; uint max_count; uint count_word; uint has_count;
+                            uint indexed; uint index_bytes; uint params_stride_words; uint params_word;
+                            uint strides[8]; };
+kernel void gta6rt_rect_indirect(device const uint* args [[buffer(0)]], device const uint* count [[buffer(1)]],
+                                 device uint* out [[buffer(2)]], constant RectIndirectParams& p [[buffer(3)]],
+                                 uint i [[thread_position_in_grid]]) {
+    if (i >= p.max_count) return;
+    const uint n = p.has_count != 0u ? min(count[p.count_word], p.max_count) : p.max_count;
+    device const uint* a = args + p.src_word + i * p.stride_words;
+    const uint vertices = i < n ? a[0] : 0u;
+    device uint* draw = out + i * 4u;
+    draw[0] = vertices / 3u * 6u;
+    draw[1] = i < n ? a[1] : 0u;
+    draw[2] = 0u;
+    draw[3] = i < n ? (p.indexed != 0u ? a[4] : a[3]) : 0u;
+    device uint* w = out + p.params_word + i * p.params_stride_words;
+    w[0] = i < n ? a[2] : 0u;
+    w[1] = p.indexed != 0u && i < n ? a[3] : 0u;
+    w[2] = p.indexed != 0u ? p.index_bytes : 0u;
+    w[3] = draw[3];
+    for (uint k = 0; k < 8u; ++k) w[4u + k] = p.strides[k];
+}
+struct IndirectGroupsParams { uint stride_words; uint max_count; uint count_word; uint has_count; uint mesh; };
+kernel void gta6rt_indirect_groups(device const uint* args [[buffer(0)]], device const uint* count [[buffer(1)]],
+                                   device uint* out [[buffer(2)]], constant IndirectGroupsParams& p [[buffer(3)]],
+                                   uint i [[thread_position_in_grid]]) {
+    if (i >= p.max_count) return;
+    const uint n = p.has_count != 0u ? min(count[p.count_word], p.max_count) : p.max_count;
+    device const uint* a = args + i * p.stride_words;
+    uint3 g = i < n ? uint3(a[0], a[1], a[2]) : uint3(0u);
+    const ulong groups = ulong(g.x) * ulong(g.y) * ulong(g.z);
+    const bool legal = p.mesh != 0u ? g.x <= 65535u && g.y <= 65535u && g.z <= 65535u && groups <= 4194304ul
+                                    : groups <= 67108864ul;
+    if (!legal) g = uint3(0u);
+    out[i * 3u + 0u] = g.x;
+    out[i * 3u + 1u] = g.y;
+    out[i * 3u + 2u] = g.z;
+}
 struct QuadParams { uint first_byte; uint index_bytes; uint readable; uint quads; };
 kernel void gta6rt_quad_expand(device const uchar* ib [[buffer(0)]], device uint* out [[buffer(1)]],
                                constant QuadParams& p [[buffer(2)]], uint q [[thread_position_in_grid]]) {
@@ -246,6 +284,8 @@ void MetalDevice::remove_queue(MetalQueue* queue) {
 
 RetireMarks MetalDevice::retire_marks() {
     RetireMarks marks;
+    static const bool now = env_flag("GTA6RT_METAL_RELEASE_AT_ONCE");
+    if (now) return marks;
     std::lock_guard lock(retire_mutex_);
     for (MetalQueue* q : queues_) {
         const std::uint64_t mark = q->retire_mark();
@@ -262,10 +302,11 @@ bool MetalDevice::marks_reached(const RetireMarks& marks) {
 
 void MetalDevice::retire(id object, id<MTLAllocation> evict_allocation) {
     if (!object && !evict_allocation) return;
+    static const bool now = env_flag("GTA6RT_METAL_RELEASE_AT_ONCE");
     Retired r;
     r.object = object;
     r.evict = evict_allocation;
-    {
+    if (!now) {
         std::lock_guard lock(retire_mutex_);
         for (MetalQueue* q : queues_) {
             const std::uint64_t mark = q->retire_mark();

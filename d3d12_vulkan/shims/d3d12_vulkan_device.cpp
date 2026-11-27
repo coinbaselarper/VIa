@@ -2312,6 +2312,18 @@ struct DeviceState {
         std::call_once(pipeline_cache_once, [this] {
             const auto& vk = context->vk;
             decide_session_cache_writes();
+            // port/ (spike/r5-perf-fixes fix 1, opt-in until its input regression is settled): MoltenVK holds a
+            // shared cache's lock through each build's conversion and compile; with the session file off it persists
+            // nothing. LEONIDA_MVK_PIPELINE_CACHE=none creates pipelines without one.
+            if (driver_is_moltenvk() && !g_session_cache_writes.load(std::memory_order_relaxed) &&
+                !session_cache_loadable()) {
+                const char* v = std::getenv("LEONIDA_MVK_PIPELINE_CACHE");
+                if (v && std::strcmp(v, "none") == 0) {
+                    std::fprintf(stderr, "[rt] d3d12: MoltenVK: pipelines are created without a VkPipelineCache "
+                                         "(LEONIDA_MVK_PIPELINE_CACHE=none)\n");
+                    return;
+                }
+            }
             if (!vk.vkCreatePipelineCache || !vk.vkDestroyPipelineCache) return;
             if (pipeline_cache_save_limit()) clean_stale_cache_files(pipeline_cache_session_path());
             VkPipelineCache handle = create_seeded_pipeline_cache(vk.vkCreatePipelineCache, info.device, pso_identity);
@@ -3682,7 +3694,8 @@ struct DeviceState {
     // served like a slot-70 view of the heap's title memory: an image made from the title's bytes, its T# written into
     // the copy instead of the title's. Requests are queued here (a slot fix holds the heap locks) and served by the
     // device before the title textures' refresh; the slot stays unsettled, and is fixed again, until then.
-    // LEONIDA_HEAP_TEXTURES=0: such T#s stay unbound, as before.
+    // Off by default (LEONIDA_HEAP_TEXTURES=1): measured to change nothing visible yet, and a made image retires the
+    // made images its bytes overlap.
     struct HeapTsharpRequest {
         leonida::gfx10::ImageWords words;
         std::uint64_t cpu;
@@ -3694,7 +3707,7 @@ struct DeviceState {
     static bool heap_textures_enabled() {
         static const bool on = [] {
             const char* v = std::getenv("LEONIDA_HEAP_TEXTURES");
-            return !v || std::strcmp(v, "0");
+            return v && std::strcmp(v, "1") == 0;
         }();
         return on;
     }
@@ -13456,13 +13469,17 @@ private:
         std::uint64_t direct_copies = 0, direct_failures = 0;
     };
 
-    static bool bink_direct_enabled() {
-        static const bool on = [] {
+    // The boot movie only (the first group found), unless LEONIDA_BINK_DIRECT=all: movies in the world phase play
+    // over memory the title remaps (CopyPageMappingsBatchX), which an import would keep the old pages of; one run with
+    // them imported ended in a host fault 3.7 s into the world phase (pol-fix1-on), not shown to be this path.
+    bool bink_direct_enabled() {
+        static const int mode = [] {
             const char* v = std::getenv("LEONIDA_BINK_DIRECT");
-            return !v || std::strcmp(v, "0");
+            return !v ? 1 : !std::strcmp(v, "0") ? 0 : !std::strcmp(v, "all") ? 2 : 1;
         }();
-        return on;
+        return mode == 2 || (mode == 1 && bink_groups_found_ == 0);
     }
+    unsigned bink_groups_found_ = 0;
 
     bool import_plane(std::uintptr_t address, std::uint32_t pitch, std::uint32_t height, PlaneImport& out) {
         auto& vk = state_.context->vk;
@@ -13708,6 +13725,7 @@ private:
                          static_cast<unsigned long long>(fb), total, header[1], header[2], header[3], header[4],
                          static_cast<unsigned long long>(-offset));
             bink_groups_.push_back(g);
+            ++bink_groups_found_;
             return true;
         }
         static std::atomic<int> logged{0};

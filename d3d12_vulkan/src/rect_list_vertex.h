@@ -294,6 +294,15 @@ inline RectVertexShader rect_list_vertex(const std::vector<std::uint32_t>& in, s
     emit(body, op_label, {fresh()});
     const std::uint32_t table = fresh();
     emit(body, op_variable, {table_pointer, table, storage_function, table_value});
+    // port/: each corner's outputs are stored into Function variables of their own right after its call. Loading the
+    // Private copies once per corner is the same in SPIR-V, but SPIRV-Cross (MoltenVK) forwards those loads to their
+    // use after the third call, so every corner read corner 2's outputs and each rectangle was degenerate: nothing drawn.
+    std::vector<std::vector<std::uint32_t>> corner_outputs(3, std::vector<std::uint32_t>(outputs.size()));
+    for (std::uint32_t c = 0; c < 3; ++c)
+        for (std::size_t k = 0; k < outputs.size(); ++k) {
+            corner_outputs[c][k] = fresh();
+            emit(body, op_variable, {pointer(storage_function, pointee(outputs[k])), corner_outputs[c][k], storage_function});
+        }
     const auto value = [&](std::uint32_t op, std::uint32_t type, std::initializer_list<std::uint32_t> operands) {
         const std::uint32_t id = fresh();
         body.push_back((std::uint32_t(operands.size() + 3) << 16) | op);
@@ -317,8 +326,12 @@ inline RectVertexShader rect_list_vertex(const std::vector<std::uint32_t>& in, s
             emit(body, op_store, {private_of[attributes[i]], value(op_load, pointee(attributes[i]), {corner_inputs[c][i]})});
         value(op_function_call, void_type, {entry});
         for (std::size_t k = 0; k < outputs.size(); ++k)
-            results[c][k] = value(op_load, pointee(outputs[k]), {private_of[outputs[k]]});
+            emit(body, op_store,
+                 {corner_outputs[c][k], value(op_load, pointee(outputs[k]), {private_of[outputs[k]]})});
     }
+    for (std::uint32_t c = 0; c < 3; ++c)
+        for (std::size_t k = 0; k < outputs.size(); ++k)
+            results[c][k] = value(op_load, pointee(outputs[k]), {corner_outputs[c][k]});
     const std::size_t pk = std::size_t(std::find(outputs.begin(), outputs.end(), position) - outputs.begin());
     std::uint32_t x[3], y[3];
     for (std::uint32_t c = 0; c < 3; ++c) {

@@ -51,9 +51,11 @@ struct Ctx {
 
 enum class Pass { implicit, explicit_clear, depth_discard };
 
+// indirect: the same draw as one record of execute_indirect (with a count buffer of 1 and a second record that must
+// not run when `counted`).
 std::vector<std::uint8_t> draw(Ctx& c, RenderPipeline* p, std::span<const V> verts, std::span<const std::uint16_t> idx,
                                std::uint32_t topo, std::int32_t base_vertex = 0, Pass pass = Pass::implicit,
-                               Texture* depth = nullptr) {
+                               Texture* depth = nullptr, bool indirect = false, bool counted = false) {
     BufferDesc vbd{verts.size_bytes() + 256, MemoryKind::upload, usage::vertex, "vb"};
     auto vb = c.dev->create_buffer(vbd);
     std::memcpy(static_cast<std::uint8_t*>(vb->cpu_pointer()) + 64, verts.data(), verts.size_bytes());
@@ -89,11 +91,39 @@ std::vector<std::uint8_t> draw(Ctx& c, RenderPipeline* p, std::span<const V> ver
     VertexBufferView v{vb->gpu_va() + 64, std::uint32_t(verts.size_bytes()), sizeof(V)};
     l->set_vertex_buffers(0, std::span<const VertexBufferView>(&v, 1));
     l->set_topology(topo);
+    std::unique_ptr<Buffer> args, count;
+    if (indirect) {
+        args = c.dev->create_buffer({64, MemoryKind::shared, usage::indirect, "rect args"});
+        count = c.dev->create_buffer({16, MemoryKind::shared, usage::indirect, "rect count"});
+        auto* a = static_cast<std::uint32_t*>(args->cpu_pointer());
+        std::memset(a, 0, 64);
+        if (ib) {
+            const std::uint32_t r[5] = {std::uint32_t(idx.size()), 1, 0, std::uint32_t(base_vertex), 0};
+            std::memcpy(a, r, sizeof r);
+            const std::uint32_t junk[5] = {3, 1, 0, 0, 0};
+            std::memcpy(a + 8, junk, sizeof junk);
+        } else {
+            const std::uint32_t r[4] = {std::uint32_t(verts.size()), 1, 0, 0};
+            std::memcpy(a, r, sizeof r);
+            const std::uint32_t junk[4] = {3, 1, 0, 0};
+            std::memcpy(a + 8, junk, sizeof junk);
+        }
+        *static_cast<std::uint32_t*>(count->cpu_pointer()) = 1;
+    }
     if (ib) {
         l->set_index_buffer({ib->gpu_va(), std::uint32_t(idx.size_bytes()), format::r16_uint});
-        l->draw_indexed(std::uint32_t(idx.size()), 1, 0, base_vertex, 0);
-    } else {
+        if (!indirect) l->draw_indexed(std::uint32_t(idx.size()), 1, 0, base_vertex, 0);
+    } else if (!indirect) {
         l->draw(std::uint32_t(verts.size()), 1, 0, 0);
+    }
+    if (indirect) {
+        IndirectDesc d;
+        d.kind = ib ? IndirectKind::draw_indexed : IndirectKind::draw;
+        d.stride = 32;
+        d.max_count = counted ? 2 : 1;
+        d.arguments = args.get();
+        d.count_buffer = counted ? count.get() : nullptr;
+        l->execute_indirect(d);
     }
     if (pass == Pass::explicit_clear) l->end_render_pass();
     if (pass == Pass::depth_discard) l->discard(depth);
@@ -234,6 +264,12 @@ int main() {
     CHECK(differing(r2, texels) == 0, "two-rectangle reference equals the source");
     CHECK(differing(g2, r2) == 0, "vertex_expand indexed");
     CHECK(differing(c2, r2) == 0, "cpu_rewrite indexed");
+    const auto gi1 = draw(c, rect_gpu.get(), blit, {}, topology::rect_list, 0, Pass::implicit, nullptr, true);
+    const auto gi2 = draw(c, rect_gpu.get(), padded, idx, topology::rect_list, 2, Pass::implicit, nullptr, true, true);
+    std::printf("indirect rect lists (vertex_expand): blit %d pixels differ, two indexed rectangles with a count buffer "
+                "of 1 (second record junk) %d pixels differ\n", differing(gi1, ref), differing(gi2, r2));
+    CHECK(differing(gi1, ref) == 0, "indirect vertex_expand blit");
+    CHECK(differing(gi2, r2) == 0, "indirect vertex_expand indexed, counted");
 
     const V small[3] = {{-0.5f, 0.5f, 0, 1, 0.25f, 0.25f}, {-0.5f, -0.5f, 0, 1, 0.25f, 0.75f}, {0.5f, -0.5f, 0, 1, 0.75f, 0.75f}};
     const V post[3] = {nl(small[0]), nl(small[1]), nl(small[2])};

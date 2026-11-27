@@ -1595,8 +1595,10 @@ HWND create_fallback_window(bool show) {
 // replayed to its pacer; without that replay the next WaitFrameEventX would fail.
 bool frame_pacing_enabled() {
     static const bool enabled = [] {
+        // port/: on by default. Unpaced, the title ticked at 40-60 Hz against its 30 Hz interval, and the movie (at
+        // most one decoded frame a tick) went out 1 to 6 ticks apart. LEONIDA_FRAME_PACING=0: unpaced, as before.
         const auto* p = std::getenv("LEONIDA_FRAME_PACING");
-        return p && *p && *p != '0';
+        return !p || !*p || *p != '0';
     }();
     return enabled;
 }

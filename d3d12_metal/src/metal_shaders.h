@@ -28,6 +28,7 @@ public:
     struct Config {
         std::string manifest;     // port/build/shaderc_msl/runs/main/manifest.tsv
         std::string spirv_root;   // the corpus the store was built from (spike/s2-make-game/work/shaders/spirv)
+        std::string spirv_fallback;  // a shader missing there is built from here (the layer's LEONIDA_SHADERS corpus)
         std::string store;        // where on-demand builds go (<store>/cas)
         std::string tool;         // port/shaderc_msl/tools/shaderc_msl.py
         unsigned builders = 2;
@@ -44,8 +45,12 @@ public:
     // The library of shader `name` (index.json name, "library/..." for the pipeline library's), `stage` vs/ps/cs/ms.
     // A shader the store lacks is queued for a build and `ready` runs on a builder thread when it ends (with or
     // without a library); null library then, with `pending` set. `error` says why there is none otherwise.
+    // `variant` "dual": a pixel shader built with the recipe's --dual-source pass (blend source 1 written at Location
+    // 0 Index 1, for dual-source-blend PSOs); always an on-demand build, kept apart from the store's library.
     Library find(const std::string& name, const std::string& stage, std::function<void()> ready, bool* pending,
-                 std::string* error);
+                 std::string* error, const std::string& variant = {});
+    // A library the manifest names by its store-relative path (the split64 route's mesh and object libraries).
+    Library load_relative(const std::string& relative, std::string* error);
     const gta6rt::shaderc_msl::ShaderEntry* manifest_entry(const std::string& name) const { return catalog_.find(name); }
     bool loaded() const { return catalog_loaded_; }
 
@@ -58,12 +63,13 @@ public:
 
 private:
     struct Job {
-        std::string name, stage;
+        std::string name, stage, variant;
         std::vector<std::function<void()>> waiters;
     };
     Library load_locked(const std::string& path, std::string* error);
     void builder();
-    bool build(const std::string& name, const std::string& stage, std::string& metallib, std::string& error);
+    bool build(const std::string& name, const std::string& stage, const std::string& variant, std::string& metallib,
+               std::string& error);
 
     gpu::Device& device_;
     Config config_;

@@ -1,8 +1,174 @@
 # d3d12_vulkan status
 
 Library `gta6rt_d3d12_vulkan` (static; host/ links it with `-force_load`): leonida's D3D12-on-Vulkan layer ported to
-macOS (S1.6), plus the Vulkan-path work of 2026-11-26 ("first pixels", "round 4", "round 5", newest first). Origins and every
+macOS (S1.6), plus the Vulkan-path work of 2026-11-26 ("first pixels", "round 4", "round 5", "round 6", newest first). Origins and every
 change against leonida: `ORIGIN.md`. Shader corpus: `../shaders_vk/STATUS.md`. Mesh plan: `MESH_PLAN.md`.
+
+## Round 6 (2026-11-26): the landing page, the BRIGHTNESS page, the intro movie's judder
+
+Build `build/polish-x86_64` (all modules, same options as `build/macos`). Runs: `run/logs/pol-*.log`, one gta6rt at a
+time, hidden window, MoltenVK 1.4.2 x86_64, Series S. Each run's frame log is `run/logs/<run>.frames.tsv`
+(`LEONIDA_FRAME_LOG`, below). Load averages are from run.sh's start/end lines.
+
+### 1. Landing page ("ACCOUNT PICKER (Y) / PLAYER (A)"): flat navy is what the title draws
+
+Measured:
+- The title opens exactly one movie at the landing page: `BinkOpenWithOptions(<memory>, flags 0x4104448)` at +14 s
+  (after two open/close probes) and `BinkPause(h, 1)` from exe+0x5536eac; the same handle gets
+  `BinkRegisterFrameBuffers` and `BinkPause(h, 0)` only after A, then 3840x2160 planes and 450 `BinkNextFrame`
+  (`pol-base-a.log`): it is the Rockstar stinger, preloaded and paused. No frame is decoded before A (no frame buffers
+  are registered), so there is no still frame for the page to show.
+- No landing movie exists in the package: `common.rpf`'s `LandingPageVideos` document names only
+  `common:/movies/landingPage/bigValley01_crop` (a Red Dead Redemption 2 leftover; Big Valley is an RDR2 district), and
+  none of the 515 named streams of `movies.rpf` is under `landingPage/`. The UI data (`data.rpf` RBF0, 136 UIScreen
+  resources decoded with leonida's `rbf0_tree.py`) has no landing/engagement screen; menus that do have art name it
+  (`SCRN_SettingsMenu`: `MENU_BACKGROUND_GENERAL_ART_9`).
+- 0x20202c, the landing fill, is the title's own boot backdrop: the Rockstar spinner page after the stinger is drawn on
+  the same colour (`run/present/s2-firstrun/present_001351.png`). leonida's Windows result describes the landing as "a
+  solid background with legible prompts at the lower right" (`leonida/docs/first_run_ui.md`).
+- Plane 0 is only cleared on this page; the census's textured Scaleform kinds are drawn later (first use on the
+  NAVIGATION page, `pol-bright-e.log`), not refused here. The "textures wait for readable memory" counts the round-4
+  census saw are 0 at the landing page in current runs (`play.log`, `pol-*.log`).
+- Frames: before `run/present/pol-base-a/present_001201.png`, after `run/present/pol-final-a/present_000601.png`:
+  identical (328 colours, 99.7 % 0x20202c).
+Inferred: the page is meant to look like this on an offline console; nothing of ours is missing from it.
+
+### 2. Rectangle lists drew nothing on MoltenVK (fixed); BRIGHTNESS symbol still missing
+
+- Measured: with plane 1 hidden (`LEONIDA_PRESENT_PLANE1=0`) plane 0 was black on the BRIGHTNESS page although the
+  title draws a full-screen `PS_BlitColour` (grey, CB 0.247) and `PS_BlitCalibration` into it, both rect lists,
+  0 draws skipped (`pol-bright-p0`, `run/present/pol-bright-p0/present_001561.png`). With rect lists drawn as their
+  first triangle (`LEONIDA_RECT_AS_TRIANGLE=1`, diagnostic) half the plane turned 0x3f3f3f
+  (`run/present/pol-rect-tri/present_001561.png`). So the vertex-stage expansion produced no pixels.
+- Cause: `rect_list_vertex.h` loads each corner's outputs from the Private copies right after that corner's call;
+  SPIRV-Cross (what MoltenVK compiles with) forwards those loads to their uses after the third call, so all three
+  corners were corner 2 and every rectangle was degenerate (seen in the MSL of `VS_Blit_6e5520d1`: `_337.x - _337.x`).
+  Fix: each corner's outputs are stored into Function variables after its call. spirv-val passes for all 33
+  VS_Blit/VS_Clear shaders of the corpus; the MSL now copies per corner.
+- Result: the BRIGHTNESS page's grey field is drawn (before `run/present/pol-bright-a/present_001651.png` black, after
+  `run/present/pol-bright-f/present_001561.png` 0x3f3f3f). Every rect-list blit since round 4 was affected (the
+  landing page's blit into the UI target is covered by the opaque fill, so that page does not change).
+- Still missing: the calibration symbol. Its T# (BC3 512x468 at 0x743f80000, written by the title into console heap
+  0x248c0000 at shader VA 0x100d1a0) never reaches the heap's GPU copy: the copy holds 32 bytes of float data there
+  in every calibration draw (`LEONIDA_LOCAL_DIAGNOSTICS` "DIFFER", `pol-bright-e`, and `pol-bright-g` with the heap
+  textures below off); a full heap copy per submission (`LEONIDA_CONSOLE_HEAP_SCAN=0`, `pol-bright-h`) changes
+  nothing. Not found: what writes those floats (a GPU write into the heap copy's arena range is the lead).
+- `LEONIDA_HEAP_TEXTURES=1` (new, off): title-written T#s with no texture (UI sprites in title memory, 256x1 RGBA32F
+  curves and BC1 arrays inside the console heap's range) are served as slot-70 views of the bytes they name; all
+  were served in `pol-bright-c`, and no dumped page changed, so it stays off (a made image can retire overlapped ones).
+
+### 3. The intro movie's judder
+
+Why it juddered (measured, `pol-base-a`): unpaced, the title ticked at 42 frames/s on average with intervals from 9 to
+84 ms (the title asks for a 33,333 µs interval; `LEONIDA_FRAME_PACING` was off, so WaitFrameEventX never waited).
+The title decodes at most one movie frame a tick, and Bink releases a frame by its own 30 fps clock, so new movie
+frames went out 1, 2, 3 or 4 ticks apart (203 / 147 / 39 / 2): the movie-frame interval had median 39 ms, p90 60 ms,
+max 118 ms. The submitting thread spent 15.8 ms a frame in the layer (2 submissions), 3.8 ms of it hashing and copying
+the movie planes on the CPU, and the compiler's speculative warm-up was building through the movie (32 ms of compile
+time a frame).
+
+Changes:
+- **Frame pacing on by default** (`d3d12_xs_device.cpp`, `LEONIDA_FRAME_PACING=0` restores the old behaviour): the
+  title's interval and origin event go to the device's pacer, as the `--first-run-ui` profile already did.
+- **Movie planes copied on the GPU** (`d3d12_vulkan_device.cpp` `import_plane`/`copy_bink_set`,
+  `d3d12_title_image_upload.h` `copy_buffers`, `vulkan_backend.h` `write_staged_title_images`): the boot movie's 9
+  plane ranges (the title's CPU window, pitches 3840 and 2048) are imported as VkBuffers, and on a set switch the new
+  set (and the one before, and the new one again on the next pass) is copied into the plane images in one transfer;
+  no hashing. Not true in-place sampling (that needs a texture view with the title's pitch through VK_EXT_metal_objects
+  and a swap of the plane images under the bindless table); this removes the CPU cost the same way. Only the first
+  movie group of a run (the stinger) by default: world-phase movies play over memory the title remaps
+  (`LEONIDA_BINK_DIRECT=all|0`). Picture checked: `run/present/pol-fix-a/present_002281.png`,
+  `run/present/pol-final-a/present_000901.png`.
+- **Speculative warm-up paused while a movie plays** (`PipelineCompiler::pause_warmup`; a movie plays from its second
+  set switch until the set index stands still for 48 passes; `LEONIDA_WARMUP_MOVIE_PAUSE=0`). Boot-manifest and
+  demanded builds still run.
+- **Frame log** (`src/frame_log.h`, `LEONIDA_FRAME_LOG=PATH`, off by default): one line per presented frame: interval,
+  submissions and submit phases since the last one, the present call (fence, acquire), pipeline waits, compile time,
+  whether a new movie frame went out, WaitFrameEventX calls and time. Analysis:
+  `python3 -I tools/frame_log_summary.py FRAMES.tsv [--window T0 T1]` (movie window by default).
+
+Movie phase, the 15 s from the first to the last new movie frame (hidden window; "movie frames" = intervals between
+presents that carried a new movie frame):
+
+| run | settings | load | presents/s | present interval mean / p90 / max ms | presents > 33.4 / > 50 ms | movie-frame interval median / p90 / max ms | > 34.5 / > 50 ms | ticks per movie frame (1/2/3/4+) |
+|---|---|---|---:|---|---|---|---|---|
+| `pol-base-a` | before (unpaced, CPU planes, warm-up on) | 32.6 → 21.1 | 41.8 | 23.9 / 38.0 / 84.3 | 85 / 26 | 39.1 / 60.0 / 117.7 | 222 / 95 | 203 / 147 / 39 / 2 |
+| `pol-fix-a` | GPU planes, warm-up paused, unpaced | 12.3 → 10.1 | 57.3 | 17.5 / 27.2 / 80.4 | 17 / 2 | 33.2 / 59.6 / 136.5 | 189 / 67 | 130 / 184 / 75 / 31 |
+| `pol-pace-a` | + pacing (env) | 6.5 → 6.6 | 30.0 | 33.3 / 40.4 / 43.3 | 218 / 0 | 33.3 / 40.6 / 138.0 | 176 / 4 | 439 / 3 / 0 / 1 |
+| `pol-final-a` | final defaults | 6.4 → 4.6 | 30.0 | 33.3 / 39.9 / 43.8 | 205 / 0 | 33.0 / 39.9 / 100.9 | 157 / 3 | 438 / 2 / 1 / 0 |
+| `pol-off-b` | final binary, all three off (`LEONIDA_FRAME_PACING=0 LEONIDA_BINK_DIRECT=0 LEONIDA_WARMUP_MOVIE_PAUSE=0`) | 7.9 → 11.1 | 59.2 | 16.9 / 26.0 / 141.0 | 4 / 3 | 31.7 / 53.8 / 175.9 | 176 / 67 | 129 / 171 / 94 / 34 |
+| `pol-nopause-b` | final binary, warm-up not paused | 11.1 → 8.6 | 29.9 | 33.5 / 40.5 / 89.3 | 206 / 2 | 33.0 / 40.6 / 89.3 | 172 / 5 | 442 / 3 / 0 / 0 |
+
+The same-binary pair (`pol-off-b` against `pol-final-a`/`pol-nopause-b`, load 5-11) shows where the gain is: pacing
+takes the movie from 1-5 ticks per frame to 1; the GPU plane copies take the textures phase from 1.9 (3.8 at load 21-32)
+to 1.0 ms a frame; pausing the warm-up changed little on this lightly loaded machine (compile time during the movie
+17.7 ms a frame without the pause; with it, the boot-manifest builds still ran: 54.7 ms a frame in `pol-final-a`).
+
+Per frame in `pol-final-a`: heaps 1.3, shadows 2.5, textures 1.0, replay 3.6 ms (8.4 ms of layer time against 15.8
+in `pol-base-a`), WaitFrameEventX 24 ms. The three movie-frame gaps over 50 ms in `pol-final-a` are the movie's first
+ticks: the first frame's present waited 583 ms for the Bink pipeline (built at first draw), and Bink skipped ahead
+after it (gaps 141, 68, 64, 101 ms within the first 1.9 s); after that every tick carried a new frame.
+
+Not met / not measured:
+- The <= 50 ms target holds for present intervals (max 43.8 ms) but not for the first 2 s of the movie (above).
+- Present times still vary 25-43 ms around the 33.3 ms grid (the title's work between its frame event and PresentX
+  varies), so on a 120 Hz display a frame can show for 3, 4 or 5 refreshes. Presenting at the grid
+  (VK_GOOGLE_display_timing / presentDrawable:atTime) is the next step; not done. A hidden window does not pace
+  acquire, so nothing here measures the display's own refresh.
+- Warm vs cold pipeline cache: on MoltenVK the only cache that persists is Metal's per-user one, which these runs
+  cannot clear or isolate (round 5, perf fixes); not compared.
+- The `pol-base-a` baseline ran at a higher load than the final runs; see the same-load rows above for the settings
+  toggled on one binary.
+
+### 4. Fix 1 (no shared VkPipelineCache on MoltenVK) and its input regression
+
+`LEONIDA_MVK_PIPELINE_CACHE=none` (new, opt-in) is fix 1's layer half; the host half is
+`MVK_CONFIG_SHOULD_MAXIMIZE_CONCURRENT_COMPILATION=1` in the environment. Runs with the imported save, presses after
+the stinger:
+
+| run | fix 1 | presses (s) | read by the title | world phase |
+|---|---|---|---|---|
+| `pol-fix1-on` | on | 25, 60, 70, 80, 88 | 25, 60.2, 70.0 (run ended at 75 s) | +71.8 s |
+| `pol-fix1-on2` | on | 25, 55, 65, 75, 85 | 25, 55 (delivered late at 63.1: the title did not poll from 55 to 63 s, in the story load), 65.0, 75.1 | +81.4 s |
+| `pol-fix1-off` | off | 25, 60, 70, 80, 88 | 25, 60.0, 70.0, 80 (late, at 82.7) | +76.5 s |
+
+Measured: with fix 1 the title read the pad after the second A in 2 of 2 runs (round 5: 3 of 13); a press can land in a
+stretch of the story load where the title does not poll (55-63 s in `pol-fix1-on2`) and is then delivered when it
+polls again. Inferred: the round-5 regression fits presses landing in such a stretch (faster compiles move the load
+earlier); MVK_CONFIG_SHOULD_MAXIMIZE_CONCURRENT_COMPILATION starving the input thread is not supported by these runs
+(it was on in both). Two runs are not enough to turn it on by default, so it stays opt-in. All three runs ended in the
+known world-phase host SIGSEGV 4-6 s after the world phase began (pc 0x1000013fd93 / 0x100000db36e / 0x100000db2f5;
+the r7 worker's area); the imported saves were not rewritten.
+
+### Builds, tests, files
+
+- `build/polish-x86_64`: rc 0 (`build/polish-x86_64-build*.log`). `d3d12vk_rect_list_vertex_test` + spirv-val: 33 of
+  33 VS_Blit/VS_Clear shaders of the corpus rewrite and validate.
+- With that binary: the S1 check (verify.sh's s1 commands and greps, `run/logs/verify-s1-polish.log`): PASS.
+  `host/tools/s2_firstrun.sh s2-polish 90` (hidden window and a fresh run dir through a wrapper binary, presses
+  a@20,42,50,58,66,74; `run/logs/s2-polish.log`): rc 0, landing prompt +12 s, launch movie 9 video dumps, NAVIGATION
+  EXPERIENCE, UI TEXT SIZE, BRIGHTNESS, FINISH SETUP?, LEGAL NOTICES; 449 BinkNextFrame; 0 unimplemented imports.
+  Frames kept: `run/present/s2-polish/present_000181.png` (landing), `_000661` (movie), `_000931`, `_001051`,
+  `_001531` (BRIGHTNESS, grey field), `_001771`.
+- Then `build/macos` rebuilt incrementally with the live tree: rc 0 (`build/macos-build-r6polish.log`); `./verify.sh s1`
+  on it: PASS, both checks.
+- Files: `src/frame_log.h` (new), `src/submit_phases.h`, `src/vulkan_present.h`, `src/vulkan_backend.h`,
+  `src/vulkan_replay.h`, `src/rect_list_vertex.h`, `shims/d3d12_vulkan_device.cpp`, `shims/d3d12_xs_device.cpp`,
+  `shims/d3d12_pipeline_compile.h`, `shims/d3d12_title_image_upload.h`, `shims/d3d12_com.cpp` (local-diagnostics
+  line only). Note for the world-phase worker: `run/requests/d3d12_vulkan-world-memory.md`.
+
+### Switches added this round
+
+`LEONIDA_FRAME_LOG`, `LEONIDA_FRAME_PACING` (default now on), `LEONIDA_BINK_DIRECT` (`0`, default boot movie only,
+`all`), `LEONIDA_WARMUP_MOVIE_PAUSE`, `LEONIDA_HEAP_TEXTURES` (off), `LEONIDA_MVK_PIPELINE_CACHE=none`,
+`LEONIDA_RECT_AS_TRIANGLE=1` (diagnostic).
+
+### Next, ranked
+
+1. The BRIGHTNESS symbol: what writes float data over the symbol's T# slot in the console heap copy.
+2. Present at the pacer's grid (display timing) so 30 Hz frames do not beat against a 120 Hz display.
+3. Build the Bink pipelines before the first movie frame (583 ms wait at its first draw).
+4. Fix 1: more runs with the late presses (below) before it goes on by default.
 
 ## Round 5 (2026-11-26): GPU memory accounting, stale title copies, the arena, the world-phase device loss
 

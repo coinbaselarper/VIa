@@ -2009,6 +2009,11 @@ private:
                              first_seen ? " (first use)" : "", static_cast<unsigned long long>(render_targets_[0].resource),
                              render_target_count_, static_cast<unsigned long long>(depth_.resource), count, instances,
                              leonida::fsdraw::pipeline(graphics_pipeline_).c_str());
+                std::fprintf(stderr, "[rt] fsdraw: draw #%llu viewport %.0fx%.0f at %.0f,%.0f depth %.2f-%.2f scissor %d,%d-%d,%d "
+                                     "first %u\n",
+                             static_cast<unsigned long long>(n), viewport_.width, viewport_.height, viewport_.x,
+                             viewport_.y, viewport_.min_depth, viewport_.max_depth, scissor_.left, scissor_.top,
+                             scissor_.right, scissor_.bottom, first);
                 std::fprintf(stderr, "[rt] fsdraw: draw #%llu layout %p user data [%s] cbv heap %p base 0x%llx sampler "
                                      "base 0x%llx tables %zu\n",
                              static_cast<unsigned long long>(n), static_cast<const void*>(graphics_.layout),

@@ -94,6 +94,13 @@
 #include <smmintrin.h>
 #endif
 #include <vector>
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+#include <gta6rt/os.h>
+
+namespace d3m {
+std::uint64_t early_arena_reservation(std::uint64_t* end);  // platform/register_metal.cpp
+}
 
 namespace rt::d3d12 {
 namespace {
@@ -2485,9 +2492,47 @@ struct DeviceState {
     bool resolve_xdxr_copy(leonida::CopyAccelerationStructure&) { return false; }
     bool resolve_xdxr_postbuild(leonida::AccelerationStructurePostbuild&) { return false; }
 
+    // A list value write (list_values::Pump::land, labels) to a VA past the arena is stored by the host at that
+    // number. A buffer that missed a full arena has a shader VA in an external block (external_window): the value
+    // goes into the block. Any other VA that is not the title's memory names nothing of the title's: the host store
+    // would land in whatever this process has there, the malloc heap included (the silent SIGABRTs at the world
+    // phase: a tiny free list corrupted, d3m-s4-c; ASAN r8-asan-a: guarded::store64 from Pump::land into the heap).
+    // Dropped and counted instead.
+    leonida::value_sink::Landing land_outside_arena(std::uint64_t va, const void* bytes, unsigned size) {
+        using leonida::value_sink::Landing;
+        if (!bytes || !size) return Landing::refused;
+        // A guest allocation the os layer holds now (not the title-memory cache: the probe behind it also accepts any
+        // private host mapping, the malloc heap's included, and keeps ranges the title has freed).
+        gta6rt_vm_region region{};
+        if (gta6rt_vm_query(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(va)), &region) == GTA6RT_OK &&
+            !region.is_image && region.state != GTA6RT_VM_STATE_FREE && region.allocation_base &&
+            region.allocation_size)
+            return Landing::elsewhere;
+        {
+            std::lock_guard lock(external_mutex);
+            for (ExternalBlock& b : external_blocks) {
+                const std::uint64_t off = va - b.shader_va;
+                if (off >= b.capacity || size > b.capacity - off) continue;
+                std::memcpy(b.mapped + off, bytes, size);
+                return Landing::landed;
+            }
+        }
+        static std::atomic<std::uint64_t> dropped{0};
+        const std::uint64_t n = ++dropped;
+        if (n <= 8 || !(n & (n - 1)))
+            std::fprintf(stderr, "[rt] d3d12-metal: a %u-byte list value write to 0x%llx (no arena VA, no external block, "
+                                 "no guest allocation: %s) is dropped (%llu so far)\n",
+                         size, static_cast<unsigned long long>(va),
+                         gta6rt_vm_query(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(va)), &region) ==
+                                 GTA6RT_OK ? "a host mapping, e.g. the malloc heap" : "unmapped",
+                         static_cast<unsigned long long>(n));
+        return Landing::refused;
+    }
+
     leonida::value_sink::Landing write_arena_value(std::uint64_t va, const void* bytes, unsigned size) {
         using leonida::value_sink::Landing;
-        if (!arena.mapped || va >= arena.size) return Landing::elsewhere;
+        if (!arena.mapped) return Landing::elsewhere;
+        if (va >= arena.size) return land_outside_arena(va, bytes, size);
         std::uint64_t title_lo = 0, title_hi = 0;
         if (leonida::title_va_aliases().title_memory(va, title_lo, title_hi)) return Landing::elsewhere;
         if (!bytes || !size || va < arena.first || size > arena.size - va) return Landing::refused;
@@ -2620,8 +2665,42 @@ struct DeviceState {
     enum class VsharpPath { table, shadow, scratch };
     enum class VsharpResult { unchanged, rebased, empty };
 
+    // On Metal every allocation made after the arena has a shader VA (GPU address - heap_base) from 0x10000000 up,
+    // which is also where the title's own low memory lies, so "heap_base + base is backed" cannot tell a V# the layer
+    // already rewrote from a raw title address. The V# records the layer wrote itself (Create*View) are remembered;
+    // a title-memory base in any other record is the title's (GTA6RT_METAL_VSHARP_TITLE_FIRST=0: the old rule).
+    struct VsharpRecordHash {
+        std::size_t operator()(const std::array<uint32_t, 4>& w) const {
+            return std::size_t((uint64_t(w[0]) | (uint64_t(w[1]) << 32)) * 0x9E3779B97F4A7C15ull ^ w[2] ^ (uint64_t(w[3]) << 17));
+        }
+    };
+    std::mutex layer_vsharp_mutex;
+    std::unordered_set<std::array<uint32_t, 4>, VsharpRecordHash> layer_vsharps;
+    std::atomic<uint64_t> title_first_rebased{0}, title_first_empty{0};
+    static bool vsharp_title_first() {
+        static const bool on = [] {
+            const char* v = std::getenv("GTA6RT_METAL_VSHARP_TITLE_FIRST");
+            return !v || std::strcmp(v, "0") != 0;
+        }();
+        return on;
+    }
+    void note_layer_vsharp(const uint32_t* w) {
+        if (!vsharp_title_first() || (w[3] >> 30) || !w[2]) return;
+        std::lock_guard lock(layer_vsharp_mutex);
+        if (layer_vsharps.size() >= (1u << 21)) {
+            std::fprintf(stderr, "[rt] d3d12-metal: %zu V# records written by the layer: the set starts over\n",
+                         layer_vsharps.size());
+            layer_vsharps.clear();
+        }
+        layer_vsharps.insert({w[0], w[1], w[2], w[3]});
+    }
+    bool layer_vsharp(const uint32_t* w) {
+        std::lock_guard lock(layer_vsharp_mutex);
+        return layer_vsharps.count({w[0], w[1], w[2], w[3]}) != 0;
+    }
+
     uint64_t vsharp_address(uint64_t base, uint64_t bytes, leonida::TitleVaAliases::Kind kind = leonida::TitleVaAliases::created_view,
-                            bool make_window = true, bool try_geometry = false) {
+                            bool make_window = true, bool try_geometry = false, bool title_first = false) {
         if (!base || !bytes) return 0;
         auto& aliases = leonida::title_va_aliases();
         constexpr uint64_t mask = (1ull << 48) - 1;
@@ -2651,6 +2730,25 @@ struct DeviceState {
             aliases.note_translation(kind);
             return to;
         }
+        uint64_t lo{}, hi{};
+        const bool title = aliases.title_memory(base, lo, hi) && bytes <= hi - base;
+        if (title_first && title && base >= arena.size) {
+            to = aliases.resolve(base, bytes, kind);
+            uint64_t mapped{};
+            if (to && aliases.range_of(base, mapped, room) && mapped == to && room >= bytes && backed(to)) {
+                const uint64_t n = title_first_rebased.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (!(n & (n - 1)) && n <= (1u << 20))
+                    std::fprintf(stderr, "[rt] d3d12-metal: title V# base 0x%llx (%llu bytes) -> shader VA 0x%llx (%llu so far)\n",
+                                 (unsigned long long)base, (unsigned long long)bytes, (unsigned long long)to,
+                                 (unsigned long long)n);
+                return to;
+            }
+            const uint64_t n = title_first_empty.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (!(n & (n - 1)) && n <= (1u << 20))
+                std::fprintf(stderr, "[rt] d3d12-metal: title V# base 0x%llx (%llu bytes) has no copy: zero records (%llu so far)\n",
+                             (unsigned long long)base, (unsigned long long)bytes, (unsigned long long)n);
+            return 0;
+        }
         // An already rewritten descriptor carries only the low 48 bits.
         uint64_t offset = base;
         if (signed_vsharp_offsets() && base <= mask && (base & (1ull << 47))) offset |= ~mask;
@@ -2661,8 +2759,7 @@ struct DeviceState {
             to = geometry_va(base, bytes, false);
             if (to && encodable(to)) return to;
         }
-        uint64_t lo{}, hi{};
-        if (make_window && aliases.title_memory(base, lo, hi) && bytes <= hi - base) {
+        if (make_window && title) {
             to = aliases.resolve(base, bytes, kind);
             uint64_t mapped{};
             if (to && aliases.range_of(base, mapped, room) && mapped == to && room >= bytes && backed(to)) return to;
@@ -2672,6 +2769,7 @@ struct DeviceState {
 
     VsharpResult fix_vsharp(uint32_t* w, VsharpPath path) {
         if ((w[3] >> 30) || !w[2]) return VsharpResult::unchanged; // image, empty slot or raw pointer
+        const bool title_first = vsharp_title_first() && path != VsharpPath::scratch && !layer_vsharp(w);
         const uint64_t base = uint64_t(w[0]) | (uint64_t(w[1] & 0xffff) << 32);
         const uint32_t stride = (w[1] >> 16) & 0x3fffu;
         const uint64_t span = uint64_t(w[2]) * (stride ? stride : 1);
@@ -2680,7 +2778,7 @@ struct DeviceState {
         const bool copy_geometry = leonida::gfx10::decode(words, desc) &&
             (path != VsharpPath::scratch || span <= kTitleWindowMax || (desc.format && leonida::gfx10::encode(desc) == words));
         const auto to = vsharp_address(base, span, leonida::TitleVaAliases::table_view,
-                                       path != VsharpPath::scratch, copy_geometry);
+                                       path != VsharpPath::scratch, copy_geometry, title_first);
         if (!to) {
             static std::atomic_flag noted[3]{};
             if (!noted[unsigned(path)].test_and_set(std::memory_order_relaxed)) {
@@ -6486,9 +6584,16 @@ public:
                 std::lock_guard lock(mesh_route_mutex());
                 ++mesh_routes()[route.empty() || route == "-" ? "hw" : route];
             }
-            if (m && !m->mesh_route.empty() && m->mesh_route != "-" && m->mesh_route != "hw")
+            if (m && m->mesh_route == "split64" && m->split.present && split_route_enabled()) {
+                split_mesh_ = true;
+                split_mesh_lib_ = m->split.mesh_metallib;
+                split_object_lib_ = m->split.object_metallib;
+            } else if (m && !m->mesh_route.empty() && m->mesh_route != "-" && m->mesh_route != "hw") {
                 return stream_unsupported(("mesh shader route " + m->mesh_route +
-                                           " (64-vertex split or mesh-as-compute) has no Metal pipeline yet").c_str(), 0);
+                                           (m->mesh_route == "split64" ? " (64-vertex split, GTA6RT_METAL_MESH_SPLIT=0)"
+                                                                       : " (mesh-as-compute)") +
+                                           " has no Metal pipeline yet").c_str(), 0);
+            }
         }
 
         gpu::RenderPipelineDesc& r = render_;
@@ -6526,6 +6631,9 @@ public:
             t.dst_alpha = blend_of(b.DestBlendAlpha);
             t.op_alpha = op_of(b.BlendOpAlpha);
             t.write_mask = b.RenderTargetWriteMask;
+            const auto src1 = [](D3D12_BLEND f) { return f >= D3D12_BLEND_SRC1_COLOR && f <= D3D12_BLEND_INV_SRC1_ALPHA; };
+            if (b.BlendEnable && (src1(b.SrcBlend) || src1(b.DestBlend) || src1(b.SrcBlendAlpha) || src1(b.DestBlendAlpha)))
+                dual_source_ = true;
         }
         const auto& rs = desc.RasterizerState;
         r.raster.cull = gpu::CullMode(std::uint32_t(rs.CullMode));
@@ -6627,8 +6735,12 @@ public:
         device_.context->add_graphics_pipeline(id(), entry);
         registered_ = true;
         is_graphics_ = true;
-        if (mesh) gta6rt::pcache::created(this, cache_key_, label_, md, stage_names_[0], stage_names_[1]);
-        else gta6rt::pcache::created(this, cache_key_, label_, r, stage_names_[0], stage_names_[1]);
+        if (split_mesh_ || dual_source_) {
+        } else if (mesh) {
+            gta6rt::pcache::created(this, cache_key_, label_, md, stage_names_[0], stage_names_[1]);
+        } else {
+            gta6rt::pcache::created(this, cache_key_, label_, r, stage_names_[0], stage_names_[1]);
+        }
         if (probed_) {
             {
                 std::lock_guard lock(probe_mutex());
@@ -6658,7 +6770,12 @@ public:
                                                        [](const leonida::ShaderEntry&) { return true; });
         if (!entry) return refused_at(E_INVALIDARG, __LINE__);
         if (entry->binding_count) register_literal_samplers(device_, *entry);
-        if (entry->lds_bytes > device_.gpu->caps().max_threadgroup_memory) {
+        // index.json's lds_bytes is the translated size; the store's shrink_lds builds (24 shaders, shaderc_msl
+        // STATUS R3.4) declare what fits. The 4 x_buf_device ones need a scratch binding not wired yet: refused.
+        const auto* store_entry = device_.shaders ? device_.shaders->manifest_entry(entry->name) : nullptr;
+        const bool shrunk = store_entry && std::find(store_entry->passes.begin(), store_entry->passes.end(),
+                                                     "shrink_lds") != store_entry->passes.end();
+        if (entry->lds_bytes > device_.gpu->caps().max_threadgroup_memory && !shrunk) {
             std::fprintf(stderr, "[rt] d3d12: %s declares %u bytes of workgroup memory, over Metal's %u\n",
                          entry->name.c_str(), unsigned(entry->lds_bytes), device_.gpu->caps().max_threadgroup_memory);
             return stream_unsupported("compute shader exceeds shared memory limit");
@@ -6703,7 +6820,18 @@ public:
             const char* kind = i == 1 ? "ps" : stage_kinds_[0];
             bool pending = false;
             std::string error;
-            auto lib = shaders.find(stage_names_[i], kind, nullptr, &pending, &error);
+            if (i == 0 && split_mesh_) {
+                auto split = shaders.load_relative(split_mesh_lib_, &error);
+                auto object = split.library ? shaders.load_relative(split_object_lib_, &error) : split;
+                if (!split.library || !object.library) return fail(("split64 library: " + error).c_str());
+                libraries_[0] = split.library;
+                object_library_ = object.library;
+                refs[0] = {split.library.get(), split.entry};
+                object_ref_ = {object.library.get(), object.entry};
+                continue;
+            }
+            auto lib = shaders.find(stage_names_[i], kind, nullptr, &pending, &error,
+                                    i == 1 && dual_source_ && dual_variant_enabled() ? "dual" : "");
             if (!lib.library) {
                 if (!pending) {
                     failed_ = true;
@@ -6711,6 +6839,7 @@ public:
                     if (first_diagnostic("no Metal library for a shader", int(i)) || first_diagnostic(stage_names_[i].c_str(), 0))
                         std::fprintf(stderr, "[rt] d3d12-metal: no Metal library for %s: %s\n", stage_names_[i].c_str(),
                                      error.c_str());
+                    publish_refused("no Metal library: " + error.substr(0, 100));
                 }
                 return false;
             }
@@ -6739,8 +6868,16 @@ public:
             mesh_.not_ready = gpu::NotReady::skip;
             mesh_.priority = probed_ ? gpu::Priority::background : gpu::Priority::demand;
             mesh_.label = label_.c_str();
-            mesh_pso_ = probed_ ? device_.gpu->create_mesh_pipeline(mesh_)
-                                : gta6rt::pcache::make_mesh(*device_.gpu, mesh_, this, stage_names_[0], stage_names_[1]);
+            if (split_mesh_) {
+                mesh_.object = object_ref_;
+                mesh_.payload_bytes = 24;
+                mesh_.object_threads = {1, 1, 1};
+                mesh_.mesh_threads = {128, 1, 1};
+            }
+            mesh_pso_ = probed_ || split_mesh_ || dual_source_
+                            ? device_.gpu->create_mesh_pipeline(mesh_)
+                            : gta6rt::pcache::make_mesh(*device_.gpu, mesh_, this, stage_names_[0], stage_names_[1]);
+            if (mesh_pso_ && split_mesh_) ++split_built();
             if (!mesh_pso_) {
                 ++mesh_build_failed();
                 return fail("mesh pipeline creation failed");
@@ -6748,6 +6885,7 @@ public:
             ++mesh_built();
             leonida::MetalGraphicsPipeline e;
             e.mesh = mesh_pso_.get();
+            e.split = split_mesh_;
             e.code_base = code_base_;
             e.topology_type = topology_type_;
             e.name = label_.c_str();
@@ -6760,7 +6898,9 @@ public:
             render_.not_ready = gpu::NotReady::skip;
             render_.priority = gpu::Priority::demand;
             render_.label = label_.c_str();
-            render_pipeline_ = gta6rt::pcache::make_render(*device_.gpu, render_, this, stage_names_[0], stage_names_[1]);
+            render_pipeline_ = dual_source_
+                                   ? device_.gpu->create_render_pipeline(render_)
+                                   : gta6rt::pcache::make_render(*device_.gpu, render_, this, stage_names_[0], stage_names_[1]);
             if (!render_pipeline_) return fail("render pipeline creation failed");
             publish_render();
         }
@@ -6872,13 +7012,48 @@ public:
         static std::atomic<std::uint64_t> n{0};
         return n;
     }
+    static std::atomic<std::uint64_t>& split_built() {
+        static std::atomic<std::uint64_t> n{0};
+        return n;
+    }
+    // GTA6RT_METAL_MESH_SPLIT=0: split64 mesh PSOs are refused as before (no object stage).
+    static bool split_route_enabled() {
+        static const bool on = [] {
+            const char* v = std::getenv("GTA6RT_METAL_MESH_SPLIT");
+            return !v || std::strcmp(v, "0") != 0;
+        }();
+        return on;
+    }
+    // GTA6RT_METAL_DUAL_SOURCE=0: dual-source-blend PSOs use the store's pixel shader (Metal refuses most of them).
+    static bool dual_variant_enabled() {
+        static const bool on = [] {
+            const char* v = std::getenv("GTA6RT_METAL_DUAL_SOURCE");
+            return !v || std::strcmp(v, "0") != 0;
+        }();
+        return on;
+    }
 
 private:
     bool fail(const char* why) {
         failed_ = true;
         leonida::run_counters::refused(std::string(why) + " (" + label_ + ")");
         std::fprintf(stderr, "[rt] d3d12-metal: %s: %s\n", why, label_.c_str());
+        publish_refused(why);
         return false;
+    }
+    void publish_refused(std::string reason) {
+        fail_reason_ = std::move(reason);
+        if (stage_kinds_[0][0] == 'c') {
+            leonida::MetalComputePipeline e;
+            e.name = fail_reason_.c_str();
+            e.refused = true;
+            device_.context->add_pipeline(id(), e);
+        } else {
+            leonida::MetalGraphicsPipeline e;
+            e.name = fail_reason_.c_str();
+            e.refused = true;
+            device_.context->add_graphics_pipeline(id(), e);
+        }
     }
 
     DeviceState& device_;
@@ -6907,6 +7082,11 @@ private:
     bool rect_failed_ = false;
     std::unique_ptr<leonida::gpu::MeshPipeline> mesh_pso_;
     std::unique_ptr<leonida::gpu::ComputePipeline> compute_pipeline_;
+    bool split_mesh_ = false, dual_source_ = false;
+    std::string fail_reason_;
+    std::string split_mesh_lib_, split_object_lib_;
+    std::shared_ptr<leonida::gpu::ShaderLibrary> object_library_;
+    leonida::gpu::ShaderRef object_ref_;
     VkDeviceSize code_base_ = 0;
     std::size_t code_bytes_ = 0;
 };
@@ -7394,6 +7574,7 @@ private:
 struct TitleTexture {
     std::uint64_t address = 0;              // the GPU address the title names it by
     std::uint64_t cpu = 0;                  // where the CPU reads its bytes (title_gpu_views::to_cpu)
+    std::uint64_t span = 0;                 // title bytes it covers from address (0: not known)
     std::array<std::uint32_t, 14> desc{};   // the console resource words the layout was built from
     rt::xg_xs::Texture layout{};            // valid when layout_known
     bool layout_known = false;
@@ -8112,6 +8293,10 @@ public:
             const std::string root = env("GTA6RT_SOURCE_ROOT", GTA6RT_D3D12_METAL_PORT_ROOT);
             config.manifest = env("GTA6RT_METAL_SHADER_MANIFEST", (root + "/build/shaderc_msl/runs/main/manifest.tsv").c_str());
             config.spirv_root = env("GTA6RT_METAL_SPIRV", (root + "/../spike/s2-make-game/work/shaders/spirv").c_str());
+            // GTA6RT_METAL_SPIRV_FALLBACK: where a shader the store's corpus lacks is built from (default the layer's
+            // LEONIDA_SHADERS corpus: FSR4's programs 03 and 18 are only there); "off": nowhere.
+            config.spirv_fallback = env("GTA6RT_METAL_SPIRV_FALLBACK", env("LEONIDA_SHADERS", "").c_str());
+            if (config.spirv_fallback == "off") config.spirv_fallback.clear();
             config.store = env("GTA6RT_METAL_SHADER_STORE", (root + "/build/d3d12_metal-shader-store").c_str());
             config.tool = env("GTA6RT_METAL_SHADER_TOOL", (root + "/shaderc_msl/tools/shaderc_msl.py").c_str());
             const char* builders = std::getenv("GTA6RT_METAL_SHADER_BUILDERS");
@@ -8225,6 +8410,7 @@ public:
         const std::uint64_t cap = setting("GTA6RT_METAL_FOOTPRINT_CAP_MB", 16384) << 20;
         const unsigned report_s = unsigned(setting("GTA6RT_METAL_MEMORY_REPORT_S", 30));
         const unsigned census_s = std::max(1u, unsigned(setting("GTA6RT_METAL_CENSUS_S", 2)));
+        const unsigned work_s = unsigned(setting("GTA6RT_METAL_WORK_REPORT_S", 10));
         std::uint64_t peak = 0;
         unsigned ticks = 0;
         std::unique_lock lock(state_.guard_mutex);
@@ -8240,6 +8426,7 @@ public:
             }
             ++ticks;
             if (report_s && ticks % report_s == 0) report_gpu_memory("periodic");
+            if (work_s && ticks % work_s == 0) report_work(work_s);
             if (leonida::MetalContext::census_on() && ticks % census_s == 0) {
                 const std::string census = state_.context->take_census();
                 if (!census.empty())
@@ -8249,6 +8436,34 @@ public:
             lock.lock();
         }
     }
+
+    // Every GTA6RT_METAL_WORK_REPORT_S (default 10, 0: off): what replay did with each class of draw and dispatch,
+    // per presented frame, the skip reasons, and the indirect calls the list recorder dropped (indirect_stats).
+    void report_work(unsigned seconds) {
+        namespace is = leonida::indirect_stats;
+        auto& st = state_.context->stats();
+        const std::uint64_t presents = st.presents.load(std::memory_order_relaxed);
+        const std::uint64_t frames = presents - work_presents_;
+        work_presents_ = presents;
+        std::string recorder;
+        for (unsigned r = 0; r < is::reason_count; ++r) {
+            const auto n = is::counts().by_reason[r].load(std::memory_order_relaxed);
+            const auto d = n - work_indirect_[r];
+            work_indirect_[r] = n;
+            if (!d) continue;
+            char text[96];
+            std::snprintf(text, sizeof text, "%s%s %.1f", recorder.empty() ? "" : ", ", is::reason_name(is::Reason(r)),
+                          double(d) / double(frames ? frames : 1));
+            recorder += text;
+        }
+        const std::string work = state_.context->take_work_report(frames);
+        if (work.empty() && recorder.empty()) return;
+        std::fprintf(stderr, "[rt] d3d12-metal work t=%.0fs (last %u s, %llu presents; per frame): %s%s%s\n",
+                     leonida::run_counters::process_age_s(), seconds, static_cast<unsigned long long>(frames),
+                     work.c_str(), recorder.empty() ? "" : " || indirect calls the recorder dropped: ", recorder.c_str());
+    }
+    std::uint64_t work_presents_ = 0;
+    std::array<std::uint64_t, leonida::indirect_stats::reason_count> work_indirect_{};
 
     void report_gpu_memory(const char* why) {
         namespace L = leonida::metal_ledger;
@@ -8364,9 +8579,10 @@ public:
             }
         std::fprintf(stderr,
                      "[rt] gpu-memory titles t=%.0fs: registry %zu; %s; retired awaiting release %zu, %.0f MiB; retired "
-                     "as unmapped %llu (%.0f MiB)\n",
+                     "as unmapped %llu (%.0f MiB); retired as overlapped (memory reused) %llu (%.0f MiB)\n",
                      seconds, registry, text.c_str(), retired_count, L::mib(std::int64_t(retired)),
-                     static_cast<unsigned long long>(gone_retired_), L::mib(std::int64_t(gone_retired_bytes_)));
+                     static_cast<unsigned long long>(gone_retired_), L::mib(std::int64_t(gone_retired_bytes_)),
+                     static_cast<unsigned long long>(overlap_retired_), L::mib(std::int64_t(overlap_retired_bytes_)));
     }
 
     // LEONIDA_ARENA_MB sets its size (src/arena_size.h, default 256 MiB, at most 4095: every console VA fits 32
@@ -8423,7 +8639,44 @@ public:
         std::fprintf(stderr, "[rt] d3d12-metal: GPU address arena %llu MiB (shared), heap_base 0x%llx%s\n",
                      static_cast<unsigned long long>(arena.size >> 20), static_cast<unsigned long long>(arena.address),
                      size.capped ? " (capped)" : "");
+        reserve_arena_va(arena.size);
         return true;
+    }
+
+    // The arena's console VAs are its offsets [0, size), which are no mapping of this process: the title's
+    // allocations with a low address requirement land there (first fit from 8 MiB, d3m-s4-a/-b), and the arena must
+    // then keep out of them (title_overlap_end) until it has no room left (the FSR context's 5 MiB heap refused, the
+    // DLL reads 0). The range is reserved here, no access and no memory, so they go above it.
+    // GTA6RT_METAL_ARENA_RESERVE_VA=0: not reserved.
+    static void reserve_arena_va(std::uint64_t size) {
+        const char* v = std::getenv("GTA6RT_METAL_ARENA_RESERVE_VA");
+        if (v && !std::strcmp(v, "0")) return;
+        constexpr std::uint64_t chunk = 1ull << 20;
+        std::uint64_t early_end = 0;
+        const std::uint64_t early = d3m::early_arena_reservation(&early_end);
+        const std::uint64_t from = std::max<std::uint64_t>({chunk, (kArenaReserved + chunk - 1) & ~(chunk - 1), early_end});
+        if (early)
+            std::fprintf(stderr, "[rt] d3d12-metal: arena console VAs reserved at registration: %llu MiB of 1-%llu MiB\n",
+                         static_cast<unsigned long long>(early >> 20), static_cast<unsigned long long>(early_end >> 20));
+        if (from >= size) return;
+        std::uint64_t reserved = 0, taken = 0;
+        const auto map = [](std::uint64_t at, std::uint64_t bytes) {
+            mach_vm_address_t a = at;
+            return mach_vm_map(mach_task_self(), &a, bytes, 0, VM_FLAGS_FIXED, MEMORY_OBJECT_NULL, 0, FALSE,
+                               VM_PROT_NONE, VM_PROT_NONE, VM_INHERIT_NONE) == KERN_SUCCESS;
+        };
+        if (from < size && map(from, size - from)) {
+            reserved = size - from;
+        } else {
+            for (std::uint64_t at = from; at < size; at += chunk) {
+                if (map(at, std::min(chunk, size - at))) reserved += std::min(chunk, size - at);
+                else taken += std::min(chunk, size - at);
+            }
+        }
+        std::fprintf(stderr, "[rt] d3d12-metal: arena console VAs 0x%llx-0x%llx reserved in the process: %llu MiB "
+                             "(%llu MiB already mapped there)\n",
+                     static_cast<unsigned long long>(from), static_cast<unsigned long long>(size),
+                     static_cast<unsigned long long>(reserved >> 20), static_cast<unsigned long long>(taken >> 20));
     }
 
     ~Device() override {
@@ -8738,8 +8991,25 @@ public:
                 std::lock_guard descriptors(state_.descriptor_mutex);
                 state_.gpu_placements.add(address, texture);
             }
+            if (entry->layout_known) {
+                entry->span = entry->layout.layout.size;
+            } else {
+                rt::xg_xs::ResourceDesc d{};
+                d.dimension = std::uint32_t(desc.Dimension);
+                d.width = desc.Width;
+                d.height = desc.Height;
+                d.depth_or_array = desc.DepthOrArraySize;
+                d.mips = desc.MipLevels;
+                d.format = std::uint32_t(desc.Format);
+                d.samples = 1;
+                rt::xg_xs::Texture layout;
+                const char* why = nullptr;
+                if (title_layout(d, layout, why)) entry->span = layout.layout.size;
+            }
+            retire_overlapped_title_textures(address, entry->span, "a slot-133 texture");
             auto& slot = state_.title_textures[address];
             if (slot && slot->owned) retire_title_texture(*slot);
+            max_title_span_ = std::max(max_title_span_, entry->span);
             slot = std::move(entry);
             ++title_stats_.registered;
         }
@@ -9624,10 +9894,50 @@ private:
         }
         ++title_stats_.made;
         TitleTexture* t = entry.get();
+        t->span = span;
+        retire_overlapped_title_textures(address, span, "an image made for a slot-70 view");
+        max_title_span_ = std::max(max_title_span_, span);
         state_.title_textures[address] = std::move(entry);
         if (title_fill_async() && !t->memory.pending()) queue_title_fill(address);
         return t;
     }
+
+    // Merged from d3d12_vulkan (round 5, "stale copies retired"): the title reuses its texture memory. An image made
+    // for a slot-70 view over bytes that a newer texture now occupies (another made image or a slot-133 placement
+    // overlapping its range at another address) shows what is no longer there: it is retired (its T#s leave the hash
+    // table now, the image goes once the queues passed what was submitted). LEONIDA_TITLE_OVERLAP_RETIRE=0: kept.
+    // Caller holds title_texture_mutex.
+    void retire_overlapped_title_textures(std::uint64_t address, std::uint64_t span, const char* by) {
+        static const bool on = [] {
+            const char* v = std::getenv("LEONIDA_TITLE_OVERLAP_RETIRE");
+            return !v || std::strcmp(v, "0");
+        }();
+        if (!on || !span) return;
+        auto& textures = state_.title_textures;
+        const std::uint64_t from = address > max_title_span_ ? address - max_title_span_ : 0;
+        for (auto it = textures.lower_bound(from); it != textures.end() && it->first < address + span;) {
+            TitleTexture& t = *it->second;
+            if (it->first == address || !t.owned || !t.resource || it->first + t.span <= address) {
+                ++it;
+                continue;
+            }
+            const VkDeviceSize bytes = t.resource->image_backing_bytes() + t.resource->unbound_bytes();
+            ++overlap_retired_;
+            overlap_retired_bytes_ += bytes;
+            static std::atomic<int> logged{0};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 8)
+                std::fprintf(stderr,
+                             "[rt] d3d12-metal: image made for 0x%llx (%llu bytes of title memory, %llux%u format %d) "
+                             "retired: %s at 0x%llx (%llu bytes) now covers part of it\n",
+                             static_cast<unsigned long long>(it->first), static_cast<unsigned long long>(t.span),
+                             static_cast<unsigned long long>(t.resource->desc().Width), t.resource->desc().Height,
+                             int(t.resource->desc().Format), by, static_cast<unsigned long long>(address),
+                             static_cast<unsigned long long>(span));
+            retire_title_texture(t);
+            it = textures.erase(it);
+        }
+    }
+    std::uint64_t max_title_span_ = 0, overlap_retired_ = 0, overlap_retired_bytes_ = 0;
 
     void retire_title_texture(TitleTexture& t) {
         if (!t.owned || !t.resource) return;
@@ -11072,6 +11382,7 @@ public:
             words[3] = 0x0002403Cu;
         }
         std::memcpy(reinterpret_cast<void*>(destination.ptr), words.data(), sizeof(words));
+        state_.note_layer_vsharp(words.data());
         // LOCAL DIAGNOSTIC: the CBVs the title makes, where they go and what V# they get
         if (leonida::local_diagnostics()) {
             static std::atomic<std::uint64_t> made{0};
@@ -11166,6 +11477,7 @@ public:
         }
         const leonida::gfx10::BufferWords words = leonida::gfx10::encode(buffer);
         std::memcpy(reinterpret_cast<void*>(destination.ptr), words.data(), sizeof(words));
+        state_.note_layer_vsharp(words.data());
         return true;
     }
 
@@ -11391,6 +11703,7 @@ public:
         }
         const g::BufferWords words = g::encode(buffer);
         std::memcpy(reinterpret_cast<void*>(destination.ptr), words.data(), sizeof(words));
+        state_.note_layer_vsharp(words.data());
         if (counter_va) {
             g::Buffer counter_buffer{};
             counter_buffer.address = state_.vsharp_address(counter_va, 4);
@@ -11400,6 +11713,7 @@ public:
             const g::BufferWords counter_words = g::encode(counter_buffer);
             std::memcpy(reinterpret_cast<char*>(destination.ptr) + sizeof(words), counter_words.data(),
                         sizeof(counter_words));
+            state_.note_layer_vsharp(counter_words.data());
         }
         return true;
     }
@@ -13829,9 +14143,10 @@ void report_metal(DeviceState& d, const char* when) {
         for (const auto& [k, n] : PipelineState::mesh_results())
             results += (results.empty() ? "" : "; ") + k + " " + std::to_string(n);
         std::fprintf(stderr, "[rt] d3d12-metal %s: mesh PSOs by manifest route: %s; results: %s; Metal mesh pipelines "
-                             "built %llu, refused %llu\n",
+                             "built %llu (split64 %llu), refused %llu\n",
                      when, routes.empty() ? "none" : routes.c_str(), results.empty() ? "none" : results.c_str(),
                      static_cast<unsigned long long>(PipelineState::mesh_built().load()),
+                     static_cast<unsigned long long>(PipelineState::split_built().load()),
                      static_cast<unsigned long long>(PipelineState::mesh_build_failed().load()));
     }
     if (const char* probe = std::getenv("GTA6RT_METAL_MESH_PROBE"); probe && *probe) {
