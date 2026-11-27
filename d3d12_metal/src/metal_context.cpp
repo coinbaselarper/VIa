@@ -2,6 +2,8 @@
 #include "present_dump.h"
 #include "vulkan_gpu_labels.h"
 
+#include <gta6rt_metal/metal_backend.h>
+
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -11,7 +13,10 @@
 
 namespace leonida {
 
-MetalContext::MetalContext(gpu::Device& device) : device_(device) { scene_ = SceneProbe::create(*this); }
+MetalContext::MetalContext(gpu::Device& device) : device_(device) {
+    scene_ = SceneProbe::create(*this);
+    gpu_debug_ = GpuDebug::create(device);
+}
 
 MetalContext::~MetalContext() = default;
 
@@ -291,12 +296,60 @@ static std::int64_t steady_ns() {
         .count();
 }
 
+MetalContext::GuardMode MetalContext::guard_mode() {
+    static const GuardMode mode = [] {
+        const char* v = std::getenv("GTA6RT_METAL_INDIRECT_GUARD");
+        if (!v || !*v || !std::strcmp(v, "producers")) return GuardMode::producers;
+        if (!std::strcmp(v, "window")) return GuardMode::window;
+        if (!std::strcmp(v, "off")) return GuardMode::off;
+        std::fprintf(stderr, "[rt] d3d12-metal: GTA6RT_METAL_INDIRECT_GUARD=%s is not producers, window or off: "
+                             "producers\n", v);
+        return GuardMode::producers;
+    }();
+    return mode;
+}
+
 void MetalContext::note_compute_not_ready() { last_compute_skip_ns_.store(steady_ns(), std::memory_order_relaxed); }
 
 bool MetalContext::producers_settling() const {
+    if (guard_mode() != GuardMode::window) return false;
     const std::int64_t g = guard_ns();
     const std::int64_t last = last_compute_skip_ns_.load(std::memory_order_relaxed);
     return g > 0 && last && steady_ns() - last < g;
+}
+
+void MetalContext::note_unproduced(std::uint64_t lo, std::uint64_t hi, const char* pipeline, bool pointer) {
+    if (hi <= lo) return;
+    const std::uint64_t present = stats_.presents.load(std::memory_order_relaxed);
+    std::lock_guard lock(unproduced_mutex_);
+    if (unproduced_.size() > 4096)
+        std::erase_if(unproduced_, [&](const auto& e) { return e.second.present + 1 < present; });
+    auto& e = unproduced_[lo];
+    e.hi = std::max(e.present + 1 >= present ? e.hi : 0, hi);
+    e.present = present;
+    e.pipeline = pipeline;
+    e.pointer = pointer;
+    unproduced_widest_ = std::max(unproduced_widest_, hi - lo);
+}
+
+void MetalContext::note_guard_pass(std::uint32_t tables, std::uint32_t pointers) {
+    guard_passes_.fetch_add(1, std::memory_order_relaxed);
+    guard_tables_.fetch_add(tables, std::memory_order_relaxed);
+    guard_pointers_.fetch_add(pointers, std::memory_order_relaxed);
+    if (!tables && !pointers) guard_blind_.fetch_add(1, std::memory_order_relaxed);
+}
+
+const char* MetalContext::unproduced(std::uint64_t lo, std::uint64_t hi, bool* pointer) const {
+    const std::uint64_t present = stats_.presents.load(std::memory_order_relaxed);
+    std::lock_guard lock(unproduced_mutex_);
+    if (unproduced_.empty()) return nullptr;
+    auto it = unproduced_.lower_bound(lo > unproduced_widest_ ? lo - unproduced_widest_ : 0);
+    for (; it != unproduced_.end() && it->first < hi; ++it) {
+        if (it->second.hi <= lo || it->second.present + 1 < present) continue;
+        if (pointer) *pointer = it->second.pointer;
+        return it->second.pipeline;
+    }
+    return nullptr;
 }
 
 void MetalContext::note_work(Work w, Fate f, const char* why) {
@@ -311,7 +364,7 @@ void MetalContext::note_work(Work w, Fate f, const char* why) {
 std::string MetalContext::take_work_report(std::uint64_t presents) {
     const double frames = presents ? double(presents) : 1.0;
     std::string out;
-    char text[160];
+    char text[256];
     for (std::size_t w = 0; w < std::size_t(Work::count); ++w) {
         std::string row;
         std::uint64_t total = 0;
@@ -329,6 +382,18 @@ std::string MetalContext::take_work_report(std::uint64_t presents) {
         std::snprintf(text, sizeof text, "%s%s %.1f (", out.empty() ? "" : "; ", work_name(Work(w)), double(total) / frames);
         out += text + row + ")";
     }
+    const std::array<std::uint64_t, 4> guard{guard_passes_.load(), guard_tables_.load(), guard_pointers_.load(),
+                                              guard_blind_.load()};
+    if (guard[0] != guard_seen_[0]) {
+        std::snprintf(text, sizeof text,
+                      "%sguard: %.1f compute passes skipped, ranges marked from tables %.1f and root pointers %.1f, "
+                      "passes naming none %.1f",
+                      out.empty() ? "" : "; ", double(guard[0] - guard_seen_[0]) / frames,
+                      double(guard[1] - guard_seen_[1]) / frames, double(guard[2] - guard_seen_[2]) / frames,
+                      double(guard[3] - guard_seen_[3]) / frames);
+        out += text;
+    }
+    guard_seen_ = guard;
     std::map<std::string, std::uint64_t> why;
     {
         std::lock_guard lock(work_mutex_);
@@ -1116,6 +1181,89 @@ gpu::Texture* SceneProbe::present_source(float& exposure) {
     if (!present_mode_ || !copy_valid_ || !copy_ || frame_ > copy_frame_ + 30) return nullptr;
     exposure = fixed_exposure_ > 0 ? fixed_exposure_ : exposure_;
     return copy_.get();
+}
+
+
+std::unique_ptr<GpuDebug> GpuDebug::create(gpu::Device& device) {
+    const char* v = std::getenv("GTA6RT_METAL_GPU_DEBUG");
+    if (!v || !*v || *v == '0') return nullptr;
+    auto out = std::make_unique<GpuDebug>();
+    gpu::BufferDesc d;
+    d.size = 64 * 1024;
+    d.memory = gpu::MemoryKind::shared;
+    d.usage = gpu::usage::unordered_access | gpu::usage::shader_read;
+    d.label = "gta6rt gpu debug counters";
+    out->buffer_ = device.create_buffer(d);
+    if (!out->buffer_ || !out->buffer_->cpu_pointer()) {
+        std::fprintf(stderr, "[rt] d3d12-metal: GTA6RT_METAL_GPU_DEBUG: the counter buffer could not be made\n");
+        return nullptr;
+    }
+    std::memset(out->buffer_->cpu_pointer(), 0, d.size);
+    if (!gta6rt::metal::set_debug_buffer(&device, out->buffer_.get())) {
+        std::fprintf(stderr, "[rt] d3d12-metal: GTA6RT_METAL_GPU_DEBUG: not a Metal device\n");
+        return nullptr;
+    }
+    std::fprintf(stderr, "[rt] d3d12-metal: GPU debug counters at Metal buffer index 30 (indirect pre-pass, debug "
+                         "shader variants)\n");
+    return out;
+}
+
+std::string GpuDebug::take_report() {
+    auto* w = static_cast<volatile std::uint32_t*>(buffer_->cpu_pointer());
+    std::uint32_t c[512];
+    for (int i = 0; i < 512; ++i) c[i] = w[i];
+    for (int i = 0; i < 512; ++i) w[i] = 0;
+    std::string out;
+    char t[256];
+    for (int k = 0; k < 2; ++k) {
+        const std::uint32_t* b = c + k * 16;
+        if (!b[5]) continue;
+        std::snprintf(t, sizeof t,
+                      "%sindirect %s: calls %u (with a count %u: counts summed %u, zero %u), records %u (within the "
+                      "count %u, with groups %u, past the limits %u), groups %u",
+                      out.empty() ? "" : "; ", k ? "dispatch" : "mesh", b[5], b[6], b[7], b[8], b[0], b[1], b[2], b[3],
+                      b[4]);
+        out += t;
+        const std::uint32_t* s = c + 32 + k * 32;
+        for (std::uint32_t i = 0; i < std::min<std::uint32_t>(b[9], 8); ++i) {
+            std::snprintf(t, sizeof t, "%s%ux%ux%u@%u", i ? " " : " [records ", s[i * 4], s[i * 4 + 1], s[i * 4 + 2],
+                          s[i * 4 + 3]);
+            out += t;
+        }
+        if (b[9]) out += "]";
+        const std::uint32_t* n = c + 96 + k * 8;
+        for (std::uint32_t i = 0; i < std::min<std::uint32_t>(b[10], 8); ++i) {
+            std::snprintf(t, sizeof t, "%s%u", i ? " " : " [counts ", n[i]);
+            out += t;
+        }
+        if (b[10]) out += "]";
+    }
+    if (c[128] || c[133]) {
+        std::snprintf(t, sizeof t,
+                      "%smesh (debug variants): groups %u, with primitives %u, primitives %u (culled by the shader %u), "
+                      "vertices %u",
+                      out.empty() ? "" : "; ", c[128], c[129], c[130], c[132], c[131]);
+        out += t;
+        for (std::uint32_t i = 0; i < std::min<std::uint32_t>(c[133], 16); ++i) {
+            const std::uint32_t* s = c + 256 + i * 16;
+            std::snprintf(t, sizeof t, "%sgroup %u (%u v, %u p) prim %u:", i ? " | " : " [", s[0], s[1], s[2], s[3]);
+            out += t;
+            for (int v = 0; v < 3; ++v) {
+                float f[4];
+                std::memcpy(f, s + 4 + v * 4, sizeof f);
+                std::snprintf(t, sizeof t, " (%.4g %.4g %.4g %.4g -> %.3f %.3f %.4f)", f[0], f[1], f[2], f[3],
+                              f[3] ? f[0] / f[3] : 0.f, f[3] ? f[1] / f[3] : 0.f, f[3] ? f[2] / f[3] : 0.f);
+                out += t;
+            }
+        }
+        if (c[133]) out += "]";
+    }
+    if (c[160]) {
+        std::snprintf(t, sizeof t, "%spixel (debug variants): invocations %u, discards %u, returns %u",
+                      out.empty() ? "" : "; ", c[160], c[161], c[162]);
+        out += t;
+    }
+    return out;
 }
 
 }  // namespace leonida

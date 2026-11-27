@@ -1,11 +1,21 @@
 #include "mtl_internal.h"
 
+#import <QuartzCore/QuartzCore.h>
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+#include <pthread.h>
+
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <map>
+#include <mutex>
+#include <set>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 
 #include <gta6rt_hud/stats.h>
@@ -172,6 +182,447 @@ void encode_invalid_resource(id<MTLDevice> device, id<MTLCommandBuffer> cb) {
     }];
 }
 
+std::uint64_t mono_ns() {
+    return std::uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             std::chrono::steady_clock::now().time_since_epoch())
+                             .count());
+}
+
+bool env_is_zero(const char* name) {
+    const char* v = std::getenv(name);
+    return v && v[0] == '0' && !v[1];
+}
+
+double percentile(std::vector<double>& v, double p) {
+    if (v.empty()) return 0;
+    std::sort(v.begin(), v.end());
+    return v[std::min(v.size() - 1, std::size_t(p * double(v.size())))];
+}
+
+// GTA6RT_METAL_COMMIT_GATE (default on, 0: off). A command buffer that waits on an event another queue or the CPU
+// signals (a D3D12 fence another queue signals, a present's wait for every queue, wait_value's CPU-released gate) is
+// enqueued when it is closed and committed only once each of those events has reached its value, from a listener of
+// its own. Later command buffers of the same queue are committed as usual; Metal holds them on the CPU behind the
+// enqueued one (enqueue order; measured: committed, not scheduled, until the earlier one is committed). So no command
+// buffer waits on the GPU for anything but its own queue, and Metal's watchdog never sees a waiting command buffer
+// (d3m-s7-k: a compute-queue command buffer with GPU time 0 was stopped while it waited on the direct queue).
+class CommitGate {
+public:
+    using Waits = std::vector<std::pair<id<MTLSharedEvent>, std::uint64_t>>;
+    static CommitGate& get() {
+        static CommitGate* self = new CommitGate;
+        return *self;
+    }
+    bool on() const { return on_; }
+    void add(id<MTLCommandBuffer> cb, id<MTLSharedEvent> event, std::uint64_t value) {
+        if (!on_) return;
+        std::lock_guard lock(mutex_);
+        conditions_[(__bridge const void*)cb].emplace_back(event, value);
+    }
+    // The waits of `cb` not met yet: true when it must be deferred.
+    bool unmet(id<MTLCommandBuffer> cb) {
+        std::lock_guard lock(mutex_);
+        ++closed_;
+        auto it = conditions_.find((__bridge const void*)cb);
+        if (it == conditions_.end()) return false;
+        std::erase_if(it->second, [](const auto& w) { return w.first.signaledValue >= w.second; });
+        if (!it->second.empty()) return true;
+        conditions_.erase(it);
+        ++met_at_close_;
+        return false;
+    }
+    void drop(id<MTLCommandBuffer> cb) {
+        std::lock_guard lock(mutex_);
+        conditions_.erase((__bridge const void*)cb);
+    }
+    // Instead of commit, under the queue's submit lock, after unmet() said so: enqueued now, committed once its waits
+    // are met (`before_commit` runs right before the commit).
+    void defer(id<MTLCommandBuffer> cb, std::uint64_t serial, std::string queue, std::function<void()> before_commit) {
+        auto h = std::make_shared<Held>();
+        {
+            std::lock_guard lock(mutex_);
+            auto it = conditions_.find((__bridge const void*)cb);
+            if (it != conditions_.end()) {
+                h->waits = std::move(it->second);
+                conditions_.erase(it);
+            }
+            ++deferred_;
+        }
+        h->cb = cb;
+        h->serial = serial;
+        h->queue = std::move(queue);
+        h->since = mono_ns();
+        h->before_commit = std::move(before_commit);
+        [cb enqueue];
+        {
+            std::lock_guard lock(mutex_);
+            held_.push_back(h);
+        }
+        check(h);
+    }
+    void watch(double budget_ms) {
+        std::vector<std::shared_ptr<Held>> held;
+        {
+            std::lock_guard lock(mutex_);
+            held = held_;
+        }
+        const std::uint64_t now = mono_ns();
+        for (const auto& h : held) {
+            const double ms = double(now - h->since) / 1e6;
+            if (h->told || ms < budget_ms || h->done.load()) continue;
+            h->told = true;
+            std::string what;
+            for (const auto& [ev, v] : h->waits) {
+                char t[96];
+                std::snprintf(t, sizeof t, "%s%s value %llu (at %llu)", what.empty() ? "" : ", ",
+                              ev.label ? ev.label.UTF8String : "event", (unsigned long long)v,
+                              (unsigned long long)ev.signaledValue);
+                what += t;
+            }
+            log("command buffer %llu (%s) has been held on the CPU for %.0f ms, not committed: it waits for %s",
+                (unsigned long long)h->serial, h->queue.c_str(), ms, what.c_str());
+        }
+    }
+    std::string report() {
+        std::vector<double> ms;
+        std::uint64_t closed, met, deferred, now_held;
+        double longest;
+        {
+            std::lock_guard lock(mutex_);
+            ms.swap(hold_ms_);
+            closed = closed_ - seen_closed_;
+            met = met_at_close_ - seen_met_;
+            deferred = deferred_ - seen_deferred_;
+            seen_closed_ = closed_, seen_met_ = met_at_close_, seen_deferred_ = deferred_;
+            now_held = held_.size();
+            longest = longest_ms_;
+        }
+        char text[320];
+        std::snprintf(text, sizeof text,
+                      "commit gate%s: %llu of %llu command buffers held on the CPU for their waits (%llu more had "
+                      "theirs met at close); held ms p50 %.2f p95 %.2f max %.2f (longest so far %.0f); held now %llu",
+                      on_ ? "" : " (off: GTA6RT_METAL_COMMIT_GATE=0)", (unsigned long long)deferred,
+                      (unsigned long long)closed, (unsigned long long)met, percentile(ms, 0.5), percentile(ms, 0.95),
+                      ms.empty() ? 0.0 : ms.back(), longest, (unsigned long long)now_held);
+        return text;
+    }
+
+private:
+    struct Held {
+        id<MTLCommandBuffer> cb = nil;
+        Waits waits;
+        std::uint64_t serial = 0;
+        std::string queue;
+        std::uint64_t since = 0;
+        std::function<void()> before_commit;
+        std::atomic<bool> done{false};
+        bool told = false;
+    };
+    CommitGate() {
+        on_ = !env_is_zero("GTA6RT_METAL_COMMIT_GATE");
+        queue_ = dispatch_queue_create("gta6rt.metal.commit-gate", DISPATCH_QUEUE_SERIAL);
+        listener_ = [[MTLSharedEventListener alloc] initWithDispatchQueue:queue_];
+    }
+    void check(const std::shared_ptr<Held>& h) {
+        for (const auto& [ev, v] : h->waits)
+            if (ev.signaledValue < v) {
+                std::shared_ptr<Held> keep = h;
+                [ev notifyListener:listener_
+                           atValue:v
+                             block:^(id<MTLSharedEvent>, uint64_t) {
+                               CommitGate::get().check(keep);
+                             }];
+                return;
+            }
+        if (h->done.exchange(true)) return;
+        if (h->before_commit) h->before_commit();
+        [h->cb commit];
+        const double ms = double(mono_ns() - h->since) / 1e6;
+        std::lock_guard lock(mutex_);
+        hold_ms_.push_back(ms);
+        longest_ms_ = std::max(longest_ms_, ms);
+        std::erase(held_, h);
+        h->cb = nil;
+    }
+
+    bool on_ = true;
+    dispatch_queue_t queue_ = nullptr;
+    MTLSharedEventListener* listener_ = nil;
+    std::mutex mutex_;
+    std::unordered_map<const void*, Waits> conditions_;
+    std::vector<std::shared_ptr<Held>> held_;
+    std::vector<double> hold_ms_;
+    double longest_ms_ = 0;
+    std::uint64_t closed_ = 0, met_at_close_ = 0, deferred_ = 0, seen_closed_ = 0, seen_met_ = 0, seen_deferred_ = 0;
+};
+
+// GPU time by queue (the union of its command buffers' GPUStartTime..GPUEndTime) and over all queues, per presented
+// frame, printed with the budget monitor's report every GTA6RT_METAL_GPU_REPORT_S (default 10, 0: off).
+class GpuTime {
+public:
+    static GpuTime& get() {
+        static GpuTime* self = new GpuTime;
+        return *self;
+    }
+    void add(MetalDevice* device, const void* queue, const std::string& label, double start, double end,
+             double held_ms) {
+        std::lock_guard lock(mutex_);
+        device_ = device;
+        Queue& q = queues_[queue];
+        if (q.label.empty()) q.label = label;
+        ++q.cbs;
+        q.held_ms += held_ms;
+        if (!(start > 0) || !(end > start)) {
+            ++q.no_time;
+            return;
+        }
+        const double s = std::max(start, q.last_end);
+        if (end > s) q.busy += end - s;
+        q.last_end = std::max(q.last_end, end);
+        q.longest = std::max(q.longest, end - start);
+        spans_.emplace_back(start, end);
+    }
+    std::string report(double window_s) {
+        std::lock_guard lock(mutex_);
+        const std::uint64_t presents = device_ ? device_->counters().presents.load() : 0;
+        const double frames = double(presents - seen_presents_);
+        seen_presents_ = presents;
+        std::sort(spans_.begin(), spans_.end());
+        double all = 0, end = 0;
+        for (const auto& [s, e] : spans_) {
+            const double from = std::max(s, end);
+            if (e > from) all += e - from;
+            end = std::max(end, e);
+        }
+        spans_.clear();
+        const double f = frames > 0 ? frames : 1;
+        char text[256];
+        std::snprintf(text, sizeof text, "GPU time last %.0f s, %.0f presents: any queue busy %.0f ms (%.1f%%), %.1f ms "
+                      "a frame |", window_s, frames, all * 1e3, 100.0 * all / window_s, all * 1e3 / f);
+        std::string out = text;
+        for (auto& [key, q] : queues_) {
+            if (!q.cbs) continue;
+            std::snprintf(text, sizeof text, " %s %p: %llu cbs, busy %.0f ms (%.1f ms a frame), longest %.0f ms, %llu "
+                          "without GPU time, held on the CPU %.0f ms;", q.label.c_str(), key,
+                          (unsigned long long)q.cbs, q.busy * 1e3, q.busy * 1e3 / f, q.longest * 1e3,
+                          (unsigned long long)q.no_time, q.held_ms);
+            out += text;
+            const double last_end = q.last_end;
+            const std::string label = q.label;
+            q = Queue{};
+            q.label = label;
+            q.last_end = last_end;
+        }
+        return out;
+    }
+
+private:
+    struct Queue {
+        std::string label;
+        std::uint64_t cbs = 0, no_time = 0;
+        double busy = 0, last_end = 0, longest = 0, held_ms = 0;
+    };
+    std::mutex mutex_;
+    MetalDevice* device_ = nullptr;
+    std::map<const void*, Queue> queues_;
+    std::vector<std::pair<double, double>> spans_;
+    std::uint64_t seen_presents_ = 0;
+};
+
+// The title's pool allocator keeps a chunk's node in the last 0x18 bytes of each 64 KiB chunk (exe+0x4e9b480 writes
+// {next 0, object, count} there and a later walk reads it); the fault at exe+0x4e9b54a is that node overwritten with
+// 0 or ~0 (d3m-s7-a/c/d/g). Two diagnostics, both naming what wrote title memory:
+// - GPU commands of this backend whose destination is title memory (a bytesNoCopy buffer: "title memory in place",
+//   "slot-133 window", "title texture in place") are counted by kind; one that covers such a tail is logged (first 32,
+//   then powers of two) and kept for the watch below. Always on (GTA6RT_METAL_TITLE_WRITES=0: off).
+// - GTA6RT_METAL_TAIL_WATCH=<lo>,<hi> (hex VAs): a thread reads every 64 KiB tail in [lo, hi) every 20 ms; a node that
+//   was valid and is now a clear value is logged with the command buffers that completed since the previous scan and the
+//   logged GPU writes covering it.
+class TitleWrites {
+public:
+    static TitleWrites& get() {
+        static TitleWrites* self = new TitleWrites;
+        return *self;
+    }
+    bool on() const { return on_; }
+    void note(MetalBuffer* b, std::uint64_t offset, std::uint64_t size, const char* what, std::uint64_t value,
+              std::uint64_t serial, id<MTLCommandBuffer> cb) {
+        if (!on_ || !b || !size) return;
+        NSString* label = b->mtl().label;
+        if (!label || !([label hasPrefix:@"title"] || [label hasPrefix:@"slot-133"])) return;
+        NSString* queue_label = cb.commandQueue.label;
+        const std::string queue = queue_label ? queue_label.UTF8String : "queue";
+        const std::uint64_t host = std::uint64_t(reinterpret_cast<std::uintptr_t>(b->mtl().contents)) + offset;
+        const std::uint64_t block_end = (host | 0xffff) + 1;
+        const bool tail = host + size > block_end - 0x18;
+        std::lock_guard lock(mutex_);
+        ++kinds_[what];
+        if (!tail) return;
+        const std::uint64_t n = ++tails_;
+        Record r{host, size, what, value, serial, queue, CACurrentMediaTime(), label.UTF8String};
+        if (n <= 32 || !(n & (n - 1)))
+            log("title-memory write over a 64 KiB tail (%llu so far): %s [0x%llx, 0x%llx) value 0x%llx in %s, command "
+                "buffer %llu (%s)", (unsigned long long)n, what, (unsigned long long)host,
+                (unsigned long long)(host + size), (unsigned long long)value, r.buffer.c_str(),
+                (unsigned long long)serial, queue.c_str());
+        records_.push_back(std::move(r));
+        if (records_.size() > 4096) records_.erase(records_.begin(), records_.begin() + 1024);
+    }
+    std::string report() {
+        std::lock_guard lock(mutex_);
+        std::string out = "GPU writes into title memory by kind:";
+        if (kinds_.empty()) out += " none";
+        for (const auto& [k, n] : kinds_) out += " " + k + " " + std::to_string(n) + ";";
+        out += " covering a 64 KiB tail " + std::to_string(tails_);
+        return out;
+    }
+    void completed(const std::string& queue, std::uint64_t serial, double start, double end,
+                   const std::string& summary) {
+        if (!watch_on_) return;
+        std::lock_guard lock(mutex_);
+        recent_.push_back({queue, serial, start, end, CACurrentMediaTime(), summary.substr(0, 600)});
+        if (recent_.size() > 2048) recent_.erase(recent_.begin(), recent_.begin() + 512);
+    }
+    void start_watch() {
+        std::call_once(watch_once_, [this] {
+            const char* v = std::getenv("GTA6RT_METAL_TAIL_WATCH");
+            if (!v || !*v) return;
+            char* end = nullptr;
+            lo_ = std::strtoull(v, &end, 16);
+            hi_ = end && *end == ',' ? std::strtoull(end + 1, nullptr, 16) : 0;
+            if (!lo_ || hi_ <= lo_) return;
+            watch_on_ = true;
+            log("tail watch: 64 KiB tails in [0x%llx, 0x%llx) every 20 ms", (unsigned long long)lo_,
+                (unsigned long long)hi_);
+            std::thread([this] { watch(); }).detach();
+        });
+    }
+
+private:
+    struct Record {
+        std::uint64_t host, size;
+        std::string what;
+        std::uint64_t value, serial;
+        std::string queue;
+        double t;
+        std::string buffer;
+    };
+    struct Done {
+        std::string queue;
+        std::uint64_t serial;
+        double start, end, at;
+        std::string summary;
+    };
+    struct Tail {
+        std::uint8_t bytes[24];
+        bool valid;
+    };
+    TitleWrites() { on_ = !env_is_zero("GTA6RT_METAL_TITLE_WRITES"); }
+    static bool node_valid(const std::uint8_t* b) {
+        std::uint64_t object;
+        std::uint32_t count;
+        std::memcpy(&object, b + 8, 8);
+        std::memcpy(&count, b + 16, 4);
+        return object >= 0x10000 && object < 0x800000000000ull && count < (1u << 20);
+    }
+    static bool node_cleared(const std::uint8_t* b) {
+        std::uint64_t object;
+        std::uint32_t count;
+        std::memcpy(&object, b + 8, 8);
+        std::memcpy(&count, b + 16, 4);
+        return (object == 0 || object == ~0ull) && (count == 0 || count == ~0u);
+    }
+    static std::string hex(const std::uint8_t* b) {
+        char t[64];
+        std::string s;
+        for (int i = 0; i < 24; i += 8) {
+            std::uint64_t q;
+            std::memcpy(&q, b + i, 8);
+            std::snprintf(t, sizeof t, "%s%016llx", i ? " " : "", (unsigned long long)q);
+            s += t;
+        }
+        return s;
+    }
+    void watch() {
+        pthread_setname_np("gta6rt-tail-watch");
+        std::unordered_map<std::uint64_t, Tail> tails;
+        double last = CACurrentMediaTime();
+        unsigned reports = 0;
+        for (;;) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            const double now = CACurrentMediaTime();
+            mach_vm_address_t addr = lo_;
+            while (addr < hi_) {
+                mach_vm_size_t size = 0;
+                vm_region_basic_info_data_64_t info{};
+                mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+                mach_port_t object = MACH_PORT_NULL;
+                if (mach_vm_region(mach_task_self(), &addr, &size, VM_REGION_BASIC_INFO_64,
+                                   reinterpret_cast<vm_region_info_t>(&info), &count, &object) != KERN_SUCCESS)
+                    break;
+                if (addr >= hi_) break;
+                const std::uint64_t end = std::min<std::uint64_t>(addr + size, hi_);
+                if (info.protection & VM_PROT_READ) {
+                    for (std::uint64_t b = (addr | 0xffff) + 1; b <= end; b += 0x10000) {
+                        const std::uint64_t at = b - 0x18;
+                        if (at < addr) continue;
+                        std::uint8_t now_bytes[24];
+                        mach_vm_size_t got = 0;
+                        if (mach_vm_read_overwrite(mach_task_self(), at, 24, mach_vm_address_t(now_bytes), &got) !=
+                                KERN_SUCCESS || got != 24)
+                            continue;
+                        auto [it, fresh] = tails.try_emplace(at);
+                        Tail& t = it->second;
+                        if (!fresh && t.valid && node_cleared(now_bytes) && reports < 24) {
+                            ++reports;
+                            report_change(at, t.bytes, now_bytes, last, now);
+                        }
+                        std::memcpy(t.bytes, now_bytes, 24);
+                        t.valid = node_valid(now_bytes);
+                    }
+                }
+                addr += size;
+            }
+            last = now;
+        }
+    }
+    void report_change(std::uint64_t at, const std::uint8_t* before, const std::uint8_t* after, double last, double now) {
+        log("tail watch: the node at 0x%llx (chunk 0x%llx) went from {%s} to {%s} between %.1f and %.1f ms ago",
+            (unsigned long long)at, (unsigned long long)(at + 0x18 - 0x10000), hex(before).c_str(), hex(after).c_str(),
+            (CACurrentMediaTime() - last) * 1e3, (CACurrentMediaTime() - now) * 1e3);
+        std::lock_guard lock(mutex_);
+        unsigned shown = 0;
+        for (auto it = records_.rbegin(); it != records_.rend() && shown < 8; ++it)
+            if (it->host <= at && it->host + it->size > at) {
+                ++shown;
+                log("  GPU write covering it: %s [0x%llx, 0x%llx) value 0x%llx in %s, command buffer %llu (%s), "
+                    "encoded %.1f ms ago", it->what.c_str(), (unsigned long long)it->host,
+                    (unsigned long long)(it->host + it->size), (unsigned long long)it->value, it->buffer.c_str(),
+                    (unsigned long long)it->serial, it->queue.c_str(), (now - it->t) * 1e3);
+            }
+        if (!shown) log("  no logged GPU write of this backend covers it");
+        shown = 0;
+        for (auto it = recent_.rbegin(); it != recent_.rend() && shown < 24; ++it) {
+            if (it->at < last - 0.010) break;
+            ++shown;
+            log("  completed since the previous scan: %s command buffer %llu, GPU %.1f..%.1f ms ago: %s",
+                it->queue.c_str(), (unsigned long long)it->serial, (now - it->start) * 1e3, (now - it->end) * 1e3,
+                it->summary.c_str());
+        }
+        if (!shown) log("  no command buffer completed since the previous scan (a CPU writer, or a GPU write not yet "
+                        "reported complete)");
+    }
+
+    bool on_ = true, watch_on_ = false;
+    std::uint64_t lo_ = 0, hi_ = 0;
+    std::once_flag watch_once_;
+    std::mutex mutex_;
+    std::map<std::string, std::uint64_t> kinds_;
+    std::uint64_t tails_ = 0;
+    std::vector<Record> records_;
+    std::vector<Done> recent_;
+};
+
 }  // namespace
 
 id<MTLCommandBuffer> MetalQueue::begin_command_buffer() {
@@ -210,7 +661,10 @@ id<MTLCommandBuffer> MetalQueue::begin_command_buffer() {
     }
     {
         std::lock_guard lock(mutex_);
-        for (auto& [ev, v] : pending_waits_) [cb encodeWaitForEvent:ev value:v];
+        for (auto& [ev, v] : pending_waits_) {
+            [cb encodeWaitForEvent:ev value:v];
+            if (!fail) CommitGate::get().add(cb, ev, v);
+        }
         pending_waits_.clear();
     }
     if (fail) encode_invalid_resource(device_->mtl(), cb);
@@ -245,13 +699,21 @@ public:
         return *self;
     }
     bool on() const { return budget_ms_ > 0; }
-    void committed(const void* queue, std::uint64_t serial, const std::string& summary) {
+    // `held`: enqueued, not committed yet (CommitGate); its queue is not watched until release().
+    void committed(const void* queue, std::uint64_t serial, const std::string& summary, bool held = false) {
         std::lock_guard lock(mutex_);
-        live_[{queue, serial}] = Entry{now_ns(), summary, false};
+        live_[{queue, serial}] = Entry{now_ns(), summary, false, 0, held};
         if (!started_) {
             started_ = true;
             std::thread([this] { watch(); }).detach();
         }
+    }
+    void release(const void* queue, std::uint64_t serial) {
+        std::lock_guard lock(mutex_);
+        auto it = live_.find({queue, serial});
+        if (it == live_.end()) return;
+        it->second.held = false;
+        it->second.committed_ns = now_ns();
     }
     void completed(const void* queue, std::uint64_t serial, double gpu_ms) {
         std::lock_guard lock(mutex_);
@@ -271,10 +733,13 @@ private:
         std::string summary;
         bool told = false;
         std::uint64_t start_ns = 0;
+        bool held = false;
     };
     InFlight() {
         const char* v = std::getenv("GTA6RT_METAL_CB_BUDGET_MS");
         budget_ms_ = v && *v ? std::strtod(v, nullptr) : 1500.0;
+        const char* r = std::getenv("GTA6RT_METAL_GPU_REPORT_S");
+        report_s_ = r && *r ? std::strtod(r, nullptr) : 10.0;
     }
     static std::uint64_t now_ns() {
         return std::uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -282,14 +747,24 @@ private:
                                  .count());
     }
     void watch() {
+        TitleWrites::get().start_watch();
+        std::uint64_t next_report = now_ns() + std::uint64_t(report_s_ * 1e9);
         for (;;) {
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            CommitGate::get().watch(budget_ms_);
+            if (report_s_ > 0 && now_ns() >= next_report) {
+                next_report = now_ns() + std::uint64_t(report_s_ * 1e9);
+                log("%s", GpuTime::get().report(report_s_).c_str());
+                log("%s", CommitGate::get().report().c_str());
+                if (TitleWrites::get().on()) log("%s", TitleWrites::get().report().c_str());
+            }
             std::lock_guard lock(mutex_);
             const std::uint64_t now = now_ns();
             const void* queue = nullptr;
             for (auto& [key, e] : live_) {
                 if (key.first == queue) continue;
                 queue = key.first;
+                if (e.held) continue;
                 const auto done = last_done_ns_.find(queue);
                 e.start_ns = std::max(e.committed_ns, done == last_done_ns_.end() ? 0 : done->second);
                 const double ms = double(now - e.start_ns) / 1e6;
@@ -308,7 +783,7 @@ private:
     std::map<std::pair<const void*, std::uint64_t>, Entry> live_;
     std::map<const void*, std::uint64_t> last_done_ns_;
     bool started_ = false;
-    double budget_ms_ = 0;
+    double budget_ms_ = 0, report_s_ = 10;
     std::uint64_t over_ = 0;
 };
 }  // namespace
@@ -337,10 +812,18 @@ void MetalQueue::end_command_buffer(id<MTLCommandBuffer> cb, std::span<const Eve
     if (open_) --open_;
     const void* queue_key = this;
     InFlight* in_flight = &InFlight::get();
-    if (in_flight->on()) in_flight->committed(queue_key, serial, summary);
+    CommitGate& gate = CommitGate::get();
+    const bool held = cb != injected_ && gate.unmet(cb);
+    if (!held) gate.drop(cb);
+    if (in_flight->on()) in_flight->committed(queue_key, serial, summary, held);
+    const std::string queue_label = queue_.label ? queue_.label.UTF8String : "queue";
+    MetalDevice* device = device_;
+    auto held_ms = std::make_shared<double>(0.0);
     [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
       const double gpu = done.GPUStartTime > 0 && done.GPUEndTime > done.GPUStartTime ? done.GPUEndTime - done.GPUStartTime : 0;
       if (in_flight->on()) in_flight->completed(queue_key, serial, gpu * 1000.0);
+      GpuTime::get().add(device, queue_key, queue_label, done.GPUStartTime, done.GPUEndTime, *held_ms);
+      TitleWrites::get().completed(queue_label, serial, done.GPUStartTime, done.GPUEndTime, summary);
       if (gta6rt_hud_active() && gpu > 0) gta6rt_hud_note_gpu_ns(std::uint64_t(gpu * 1e9));
       if (slow_ms > 0 && gpu * 1000.0 >= slow_ms) {
           std::lock_guard l(errors->mutex);
@@ -410,7 +893,15 @@ void MetalQueue::end_command_buffer(id<MTLCommandBuffer> cb, std::span<const Eve
     }];
     for (const auto& [ev, v] : signals) [cb encodeSignalEvent:ev value:v];
     [cb encodeSignalEvent:timeline_ value:serial];
-    [cb commit];
+    if (held) {
+        const std::uint64_t since = mono_ns();
+        gate.defer(cb, serial, queue_label, [in_flight, queue_key, serial, held_ms, since] {
+            *held_ms = double(mono_ns() - since) / 1e6;
+            if (in_flight->on()) in_flight->release(queue_key, serial);
+        });
+    } else {
+        [cb commit];
+    }
     if (cb == injected_) {
         injected_ = nil;
         [cb waitUntilCompleted];
@@ -493,6 +984,13 @@ std::uint64_t MetalQueue::timestamp_frequency() const { return device_->caps().t
 
 void inject_command_buffer_failure(gpu::Queue* queue, bool as_victim) {
     if (queue) static_cast<MetalQueue*>(queue)->inject_failure(as_victim);
+}
+
+bool set_debug_buffer(gpu::Device* device, gpu::Buffer* buffer) {
+    auto* d = dynamic_cast<MetalDevice*>(device);
+    if (!d) return false;
+    d->set_debug_buffer(buffer ? static_cast<MetalBuffer*>(buffer)->mtl() : nil);
+    return true;
 }
 
 // ---- encoding ----
@@ -888,6 +1386,7 @@ void Encoder::visit(const Cmd& cmd) {
     } else if (auto* c = std::get_if<CmdCopyBuffer>(&cmd)) {
         if (render_) end_encoder();
         flush_clears();
+        TitleWrites::get().note(c->dst, c->dst_offset, c->size, "copy_buffer", 0, q_->last_serial() + 1, cb_);
         [blit() copyFromBuffer:c->src->mtl()
                    sourceOffset:c->src_offset
                        toBuffer:c->dst->mtl()
@@ -922,6 +1421,8 @@ void Encoder::visit(const Cmd& cmd) {
                   destinationOrigin:MTLOriginMake(k.x, k.y, z)
                             options:opt];
         } else {
+            TitleWrites::get().note(b, k.offset, std::uint64_t(pitch) * rows, "copy_texture_to_buffer", 0,
+                                    q_->last_serial() + 1, cb_);
             [blit() copyFromTexture:t->mtl()
                              sourceSlice:slice
                              sourceLevel:k.mip
@@ -955,6 +1456,7 @@ void Encoder::visit(const Cmd& cmd) {
     } else if (auto* c = std::get_if<CmdFillU32>(&cmd)) {
         if (render_) end_encoder();
         flush_clears();
+        TitleWrites::get().note(c->buffer, c->offset, c->size, "fill_u32", c->value, q_->last_serial() + 1, cb_);
         const std::uint32_t byte = c->value & 0xffu;
         if (c->value == byte * 0x01010101u) {
             [blit() fillBuffer:c->buffer->mtl() range:NSMakeRange(c->offset, c->size) value:std::uint8_t(byte)];
@@ -977,6 +1479,7 @@ void Encoder::visit(const Cmd& cmd) {
         flush_clears();
         const std::uint32_t slot = next_constant_++;
         static_cast<std::uint64_t*>(constants_.contents)[slot] = c->value;
+        TitleWrites::get().note(c->buffer, c->offset, c->bytes, "write_value", c->value, q_->last_serial() + 1, cb_);
         [blit() copyFromBuffer:constants_
                    sourceOffset:slot * 8
                        toBuffer:c->buffer->mtl()
@@ -992,6 +1495,8 @@ void Encoder::visit(const Cmd& cmd) {
         for (std::size_t i = 0; i < event_on_cb_.size(); ++i)
             if (event_on_cb_[i]) [cb_ pushDebugGroup:@"(continued)"];
         [cb_ encodeWaitForEvent:gate value:1];
+        gate.label = @"wait_value gate";
+        CommitGate::get().add(cb_, gate, 1);
         auto* base = static_cast<const volatile std::uint8_t*>(c->buffer->cpu_pointer());
         d_->pump().add(base + c->offset, c->bytes, c->value, c->compare, gate, 1);
         d_->counters().value_waits++;
@@ -1426,6 +1931,7 @@ bool Encoder::bind_common(const DrawState& s, MetalRenderPipeline* p, bool rect)
         if (p->fragment_plan().push_index >= 0)
             [render_ setFragmentBytes:block.data() length:block.size() atIndex:p->fragment_plan().push_index];
     }
+    if (id<MTLBuffer> dbg = d_->debug_buffer()) [render_ setFragmentBuffer:dbg offset:0 atIndex:30];
     return bind_tables(s, p->vertex_plan(), 0) && bind_tables(s, p->fragment_plan(), 1);
 }
 
@@ -1547,10 +2053,11 @@ Prepared Encoder::groups_prepass(const IndirectDesc& d) {
         const char* v = std::getenv("GTA6RT_METAL_INDIRECT_CS_GROUPS");
         return std::uint32_t(v && *v ? std::strtoul(v, nullptr, 0) : (1u << 20));
     }();
+    id<MTLBuffer> dbg = d_->debug_buffer();
     struct {
-        std::uint32_t stride_words, max_count, count_word, has_count, mesh, mesh_max, cs_max;
+        std::uint32_t stride_words, max_count, count_word, has_count, mesh, mesh_max, cs_max, debug;
     } params{d.stride / 4, d.max_count, 0, d.count_buffer ? 1u : 0u, d.kind == IndirectKind::dispatch_mesh ? 1u : 0u,
-             mesh_max, cs_max};
+             mesh_max, cs_max, dbg ? 1u : 0u};
     id<MTLComputeCommandEncoder> e = compute();
     auto* args = static_cast<MetalBuffer*>(d.arguments);
     auto* count = static_cast<MetalBuffer*>(d.count_buffer);
@@ -1560,6 +2067,7 @@ Prepared Encoder::groups_prepass(const IndirectDesc& d) {
     [e setBuffer:count ? count->mtl() : args->mtl() offset:count ? d.count_offset : 0 atIndex:1];
     [e setBuffer:out.buffer offset:out.offset atIndex:2];
     [e setBytes:&params length:sizeof(params) atIndex:3];
+    [e setBuffer:dbg ? dbg : out.buffer offset:dbg ? 0 : out.offset atIndex:4];
     [e dispatchThreads:MTLSizeMake(d.max_count, 1, 1) threadsPerThreadgroup:MTLSizeMake(std::min<std::uint32_t>(64, d.max_count), 1, 1)];
     d_->counters().indirect_prepasses++;
     return out;
@@ -1986,6 +2494,30 @@ bool Encoder::bind_mesh(const DrawState& s, MetalMeshPipeline* p) {
         if (p->fragment_plan().push_index >= 0)
             [render_ setFragmentBytes:block.data() length:block.size() atIndex:p->fragment_plan().push_index];
     }
+    if (id<MTLBuffer> dbg = d_->debug_buffer()) {
+        [render_ setObjectBuffer:dbg offset:0 atIndex:30];
+        [render_ setMeshBuffer:dbg offset:0 atIndex:30];
+        [render_ setFragmentBuffer:dbg offset:0 atIndex:30];
+        static std::mutex logged_mutex;
+        static std::set<const void*> logged;
+        const MeshPipelineDesc& md = p->desc();
+        if (md.rt_count >= 4) {
+            std::lock_guard lock(logged_mutex);
+            if (logged.size() < 24 && logged.insert(p).second) {
+                const DepthStencilDesc& ds = md.depth_stencil;
+                log("debug: mesh pipeline %s: rts %u (f%u..), depth f%u test %d write %d func %u, cull %u front_ccw %d "
+                    "depth_clip %d, viewport %s %.0f,%.0f %.0fx%.0f [%.2f,%.2f], scissor %s %d,%d-%d,%d, pass %ux%u, "
+                    "object %u mesh %ux%ux%u",
+                    p->label_text.c_str(), md.rt_count, md.rt_formats[0], md.depth_format, int(ds.depth_test),
+                    int(ds.depth_write), unsigned(ds.depth_func), unsigned(md.raster.cull), int(md.raster.front_ccw),
+                    int(md.raster.depth_clip), s.viewport_set ? "set" : "unset", s.viewport.x, s.viewport.y,
+                    s.viewport.width, s.viewport.height, s.viewport.min_depth, s.viewport.max_depth,
+                    s.scissor_set ? "set" : "unset", s.scissor.left, s.scissor.top, s.scissor.right, s.scissor.bottom,
+                    pass_w_, pass_h_, p->object_threads()[0], p->mesh_threads()[0], p->mesh_threads()[1],
+                    p->mesh_threads()[2]);
+            }
+        }
+    }
     return bind_tables(s, p->object_plan(), 3) && bind_tables(s, p->mesh_plan(), 4) &&
            bind_tables(s, p->fragment_plan(), 1);
 }
@@ -2218,6 +2750,9 @@ void Encoder::resolve(const CmdResolveQueries& c) {
     join_ = true;
     MetalQueryHeap* h = c.heap;
     keep(h->results());
+    TitleWrites::get().note(c.dst, c.offset,
+                            std::uint64_t(c.count) * (h->type() == QueryType::pipeline_statistics ? 88 : 8),
+                            "resolve_queries", 0, q_->last_serial() + 1, cb_);
     switch (h->type()) {
     case QueryType::occlusion:
     case QueryType::binary_occlusion:

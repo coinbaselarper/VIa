@@ -119,6 +119,7 @@ struct QueryHeapEntry {
 
 class MetalQueue;
 class SceneProbe;
+class GpuDebug;
 
 class MetalContext {
 public:
@@ -238,11 +239,25 @@ public:
         recorded, pso_refused, pso_unknown, library_pending, compiling, metal_refused, target_unknown,
         vertex_unknown, index_unknown, arguments_unknown, not_implemented, producer_not_ready, count
     };
-    // A dispatch skipped because its pipeline or library is not ready yet: GPU-driven indirect work in the next
-    // GTA6RT_METAL_INDIRECT_GUARD_MS (default 2000, 0: off) is skipped too, since its records may come from that
-    // dispatch and were never written (garbage grids: GPU timeouts, d3m-s4-g/-h).
+    // The producer guard. A compute pass replay skips (pipeline compiling or refused) leaves its outputs unwritten,
+    // and GPU-driven indirect work whose records it would have written must not run on them (garbage grids: GPU
+    // timeouts, d3m-s4-g/-h, d3m-s7-h). GTA6RT_METAL_INDIRECT_GUARD:
+    //   producers (default): the buffer ranges the skipped pass's descriptor tables and root pointers name are marked
+    //     unproduced until the present after next (note_unproduced, by replay); indirect work whose arguments or
+    //     count lie in one is skipped (unproduced). A skipped pass whose tables name no buffer replay knows makes
+    //     replay skip the indirect work after it in the same command list instead.
+    //   window: round 6's rule, every indirect call skipped for GTA6RT_METAL_INDIRECT_GUARD_MS (default 2000) after
+    //     any compute pass was not ready.
+    //   off.
+    enum class GuardMode : std::uint8_t { producers, window, off };
+    static GuardMode guard_mode();
     void note_compute_not_ready();
     bool producers_settling() const;
+    void note_unproduced(std::uint64_t lo, std::uint64_t hi, const char* pipeline, bool pointer);
+    // The skipped pass that marked a range overlapping [lo, hi), or null.
+    const char* unproduced(std::uint64_t lo, std::uint64_t hi, bool* pointer = nullptr) const;
+    // A skipped pass and how many ranges its tables and root pointers gave (for the work report).
+    void note_guard_pass(std::uint32_t tables, std::uint32_t pointers);
     static const char* work_name(Work w);
     static const char* fate_name(Fate f);
     void note_work(Work w, Fate f, const char* why = nullptr);
@@ -258,6 +273,8 @@ public:
 
     // Null unless a scene switch is set (SceneProbe).
     SceneProbe* scene() const { return scene_.get(); }
+    // Null unless GTA6RT_METAL_GPU_DEBUG is set (GpuDebug).
+    GpuDebug* gpu_debug() const { return gpu_debug_.get(); }
 
 private:
     friend class MetalQueue;
@@ -303,9 +320,35 @@ private:
     std::mutex work_mutex_;
     std::map<std::string, std::uint64_t> work_why_;
     std::atomic<std::int64_t> last_compute_skip_ns_{0};
+    struct Unproduced {
+        std::uint64_t hi;
+        std::uint64_t present;
+        const char* pipeline;
+        bool pointer;
+    };
+    mutable std::mutex unproduced_mutex_;
+    std::map<std::uint64_t, Unproduced> unproduced_;
+    std::uint64_t unproduced_widest_ = 0;
+    std::atomic<std::uint64_t> guard_passes_{0}, guard_tables_{0}, guard_pointers_{0}, guard_blind_{0};
+    std::array<std::uint64_t, 4> guard_seen_{};
     mutable std::mutex submitted_mutex_;
     std::map<gpu::Fence*, std::uint64_t> submitted_;
     std::unique_ptr<SceneProbe> scene_;
+    std::unique_ptr<GpuDebug> gpu_debug_;
+};
+
+// GTA6RT_METAL_GPU_DEBUG=1: a 64 KiB shared buffer bound at Metal buffer index 30 of every object, mesh and fragment
+// stage and handed to the indirect pre-pass (port/metal set_debug_buffer). The pre-pass counts the records of every
+// indirect mesh draw and indirect dispatch there; the debug shader variants (d3d12_metal/tools/msl_instrument.py,
+// GTA6RT_METAL_SHADER_DEBUG_OVERLAY) count mesh groups, primitives and pixel invocations. take_report prints and
+// clears it (the device's work report).
+class GpuDebug {
+public:
+    static std::unique_ptr<GpuDebug> create(gpu::Device& device);
+    std::string take_report();
+
+private:
+    std::unique_ptr<gpu::Buffer> buffer_;
 };
 
 // The frame's render-resolution targets, seen by replay (GTA6RT_METAL_SCENE_SIZE, default 1280x720): the HDR colour

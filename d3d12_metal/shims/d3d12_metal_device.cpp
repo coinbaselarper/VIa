@@ -8413,6 +8413,16 @@ public:
             config.tool = env("GTA6RT_METAL_SHADER_TOOL", (root + "/shaderc_msl/tools/shaderc_msl.py").c_str());
             const char* builders = std::getenv("GTA6RT_METAL_SHADER_BUILDERS");
             config.builders = builders ? unsigned(std::strtoul(builders, nullptr, 10)) : 2u;
+            // GTA6RT_METAL_SHADER_DEBUG_OVERLAY (only with GTA6RT_METAL_GPU_DEBUG: its shaders write the debug buffer)
+            // first, then GTA6RT_METAL_SHADER_OVERLAY ("off": none; default the mesh shaders packed or split under
+            // Metal's threadgroup limit, d3d12_metal/tools/mesh_tg_pack.py + msl_overlay.py).
+            if (const char* d = std::getenv("GTA6RT_METAL_SHADER_DEBUG_OVERLAY"); d && *d) {
+                if (state_.context->gpu_debug()) config.overlays.push_back(d);
+                else std::fprintf(stderr, "[rt] d3d12-metal: GTA6RT_METAL_SHADER_DEBUG_OVERLAY ignored without "
+                                          "GTA6RT_METAL_GPU_DEBUG=1\n");
+            }
+            const std::string overlay = env("GTA6RT_METAL_SHADER_OVERLAY", (root + "/build/d3d12_metal-msl-overrides/manifest.tsv").c_str());
+            if (overlay != "off" && std::filesystem::exists(overlay)) config.overlays.push_back(overlay);
             state_.shaders = std::make_unique<leonida::MetalShaders>(*state_.gpu, config);
         }
         {
@@ -8570,6 +8580,13 @@ public:
             recorder += text;
         }
         const std::string work = state_.context->take_work_report(frames);
+        if (auto* dbg = state_.context->gpu_debug()) {
+            const std::string counts = dbg->take_report();
+            if (!counts.empty())
+                std::fprintf(stderr, "[rt] d3d12-metal gpu-debug t=%.0fs (last %u s, %llu presents): %s\n",
+                             leonida::run_counters::process_age_s(), seconds, static_cast<unsigned long long>(frames),
+                             counts.c_str());
+        }
         if (work.empty() && recorder.empty()) return;
         std::fprintf(stderr, "[rt] d3d12-metal work t=%.0fs (last %u s, %llu presents; per frame): %s%s%s\n",
                      leonida::run_counters::process_age_s(), seconds, static_cast<unsigned long long>(frames),
@@ -8980,6 +8997,17 @@ public:
     }
     // ---- Textures the title keeps in its own memory (TitleTexture) ----
 
+    // The 14 dwords of a slot-70 description are a D3D12_RESOURCE_DESC as the title built it: dword 1 (after
+    // Dimension) and dword 13 (after Flags) are its alignment holes and hold whatever the title's stack held. The
+    // registry compares descriptions whole, so they are zeroed first; LEONIDA_TITLE_DESC_PADDING=keep compares them.
+    static bool title_desc_canonical() {
+        static const bool on = [] {
+            const char* v = std::getenv("LEONIDA_TITLE_DESC_PADDING");
+            return !(v && std::strcmp(v, "keep") == 0);
+        }();
+        return on;
+    }
+
     // Xbox device slot 70 with a texture description (rt::d3d12::write_placed_texture_view): the view's T#, of the
     // slot-133 texture placed at `address` or of an image made for that memory and filled from it. False leaves the
     // slot a null view (zeros); every reason is counted and logged once per format and layout.
@@ -8994,6 +9022,7 @@ public:
         std::array<std::uint32_t, 14> words{};
         std::memcpy(words.data(), resource_words, sizeof(words));
         words[2] = words[3] = 0;  // the alignment says nothing about the texels
+        if (title_desc_canonical()) words[1] = words[13] = 0;
         bool written = false;
         {
             std::lock_guard lock(state_.title_texture_mutex);

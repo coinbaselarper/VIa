@@ -51,4 +51,10 @@ void inject_command_buffer_failure(gpu::Queue* queue, bool as_victim = false);
 // gta6rt_d24_probe writes out[i] = quantise(in[i]) for i < user[2], in at heap_base + user[0], out at heap_base + user[1].
 std::string d24_quantize_probe_msl();
 
+// Diagnostics: `buffer` (shared storage, at least 4 KiB) is bound at Metal buffer index 30 of every object, mesh and
+// fragment stage (no translated shader uses that index; instrumented debug variants write counters there), and the
+// indirect mesh/compute pre-pass adds its record counters to words 0-127. Set before the first command list is
+// encoded; null (the default) binds nothing. False for a device of another backend.
+bool set_debug_buffer(gpu::Device* device, gpu::Buffer* buffer);
+
 }  // namespace gta6rt::metal

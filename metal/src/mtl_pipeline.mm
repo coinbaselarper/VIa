@@ -376,6 +376,40 @@ static id<MTLFunction> function_of(ShaderLibrary* library, const std::string& en
     return f;
 }
 
+// Metal needs a fragment output's type class to match its attachment's; port/shaderc_msl's pixel libraries carry
+// `<entry>_o<code>` entries for that (one char per colour location: f float, u uint, i sint; trailing f dropped).
+static id<MTLFunction> fragment_of(ShaderLibrary* library, const std::string& entry,
+                                   const std::array<std::uint32_t, 8>& formats, std::uint32_t count, std::string& err) {
+    std::string code;
+    for (std::uint32_t i = 0; i < count && i < 8; ++i) {
+        NativeFormat nf;
+        char c = 'f';
+        if (native_format(formats[i], nf)) switch (nf.pixel) {
+            case MTLPixelFormatR8Uint: case MTLPixelFormatR16Uint: case MTLPixelFormatRG8Uint:
+            case MTLPixelFormatR32Uint: case MTLPixelFormatRG16Uint: case MTLPixelFormatRGBA8Uint:
+            case MTLPixelFormatRGB10A2Uint: case MTLPixelFormatRG32Uint: case MTLPixelFormatRGBA16Uint:
+            case MTLPixelFormatRGBA32Uint: c = 'u'; break;
+            case MTLPixelFormatR8Sint: case MTLPixelFormatR16Sint: case MTLPixelFormatRG8Sint:
+            case MTLPixelFormatR32Sint: case MTLPixelFormatRG16Sint: case MTLPixelFormatRGBA8Sint:
+            case MTLPixelFormatRG32Sint: case MTLPixelFormatRGBA16Sint: case MTLPixelFormatRGBA32Sint: c = 'i'; break;
+            default: break;
+            }
+        code += c;
+    }
+    while (!code.empty() && code.back() == 'f') code.pop_back();
+    if (!code.empty()) {
+        std::string verr;
+        if (id<MTLFunction> f = function_of(library, entry + "_o" + code, verr)) return f;
+        static std::atomic<std::uint64_t> missing{0};
+        const std::uint64_t n = ++missing;
+        if (n <= 8 || (n & (n - 1)) == 0)
+            log("integer colour attachment (output code %s) and no %s_o%s in the pixel library: Metal will refuse a float "
+                "output there (shaderc_msl --output-variants %s; %llu so far)",
+                code.c_str(), entry.c_str(), code.c_str(), code.c_str(), static_cast<unsigned long long>(n));
+    }
+    return function_of(library, entry, err);
+}
+
 // ---- compile state ----
 
 PipelineCore::PipelineCore(MetalDevice* device, CompileMode mode, NotReady not_ready, Priority priority)
@@ -714,7 +748,7 @@ MTLRenderPipelineDescriptor* MetalRenderPipeline::make_descriptor(bool for_rect,
         }
         pd.fragmentFunction = [lib newFunctionWithName:@(d24_wrapper_.entry.c_str())];
     } else if (desc_.ps.library) {
-        pd.fragmentFunction = function_of(desc_.ps.library, desc_.ps.entry, err);
+        pd.fragmentFunction = fragment_of(desc_.ps.library, desc_.ps.entry, desc_.rt_formats, desc_.rt_count, err);
         if (!pd.fragmentFunction) return nil;
     }
     if (!for_rect && !desc_.inputs.empty()) {
@@ -998,7 +1032,7 @@ void MetalMeshPipeline::build() {
     }
     pd.maxTotalThreadsPerMeshThreadgroup = mesh_threads_[0] * mesh_threads_[1] * mesh_threads_[2];
     if (desc_.ps.library) {
-        pd.fragmentFunction = function_of(desc_.ps.library, desc_.ps.entry, err);
+        pd.fragmentFunction = fragment_of(desc_.ps.library, desc_.ps.entry, desc_.rt_formats, desc_.rt_count, err);
         if (!pd.fragmentFunction) {
             finish_fail(Status::pipeline_failed, "fragment " + err, now_seconds() - t0);
             return;
@@ -1273,25 +1307,37 @@ Status MetalDevice::open_pipeline_cache(const PipelineCacheDesc& desc, std::stri
     std::snprintf(hex, sizeof(hex), "%016llx", (unsigned long long)fnv1a(key));
     const std::string dir = desc.directory;
     const std::string base = std::string("gta6rt-") + hex;
-    std::vector<std::string> names;
-    std::error_code ec;
-    for (const auto& de : std::filesystem::directory_iterator(dir, ec)) {
-        const std::string name = de.path().filename().string();
-        const std::size_t sl = std::strlen(kShardSuffix);
-        if (name.rfind(base, 0) != 0 || name.size() <= base.size() + sl) continue;
-        if (name.compare(name.size() - sl, sl, kShardSuffix) != 0) continue;
-        names.push_back(name);
-    }
-    std::sort(names.begin(), names.end());
+    struct Found {
+        std::string path;
+        bool own;
+    };
+    std::vector<Found> found;
+    const std::size_t sl = std::strlen(kShardSuffix);
+    auto scan = [&](const std::string& d, bool own) {
+        std::vector<std::string> names;
+        std::error_code ec;
+        for (const auto& de : std::filesystem::directory_iterator(d, ec)) {
+            const std::string name = de.path().filename().string();
+            if (name.rfind(base, 0) != 0 || name.size() <= base.size() + sl) continue;
+            if (name.compare(name.size() - sl, sl, kShardSuffix) != 0) continue;
+            names.push_back(name);
+        }
+        std::sort(names.begin(), names.end());
+        for (const auto& n : names) found.push_back({d + "/" + n, own});
+    };
+    scan(dir, true);
+    std::error_code same_ec;
+    for (const std::string& ro : desc.read_only)
+        if (!ro.empty() && !std::filesystem::equivalent(ro, dir, same_ec)) scan(ro, false);
     std::vector<id<MTLBinaryArchive>> shards;
     std::vector<std::string> files;
     std::uint64_t bytes = 0;
     std::uint32_t unreadable = 0, seq = 0;
     const double t0 = now_seconds();
-    for (const std::string& name : names) {
-        seq = std::max(seq, shard_seq(name, base.size()));
+    for (const Found& f : found) {
+        const std::string& path = f.path;
+        if (f.own) seq = std::max(seq, shard_seq(path.substr(dir.size() + 1), base.size()));
         if (!desc.load) continue;
-        const std::string path = dir + "/" + name;
         const std::string recorded = read_text(path + ".key");
         if (recorded.rfind(key, 0) != 0 || recorded.find('\n') != key.size()) continue;
         NSError* le = nil;
@@ -1299,10 +1345,15 @@ Status MetalDevice::open_pipeline_cache(const PipelineCacheDesc& desc, std::stri
         id<MTLBinaryArchive> a = intact ? open_file(device_, path, &le) : nil;
         if (!intact) le = [NSError errorWithDomain:@"gta6rt" code:1 userInfo:@{NSLocalizedDescriptionKey : @"size or content hash differs from its .key file (or none recorded)"}];
         if (!a) {
-            const std::string aside = path + ".unreadable";
-            std::rename(path.c_str(), aside.c_str());
-            log("pipeline archive shard %s does not load (%s): moved to %s", path.c_str(),
-                ns_error(le, "unknown").c_str(), aside.c_str());
+            if (f.own) {
+                const std::string aside = path + ".unreadable";
+                std::rename(path.c_str(), aside.c_str());
+                log("pipeline archive shard %s does not load (%s): moved to %s", path.c_str(),
+                    ns_error(le, "unknown").c_str(), aside.c_str());
+            } else {
+                log("read-only pipeline archive shard %s does not load (%s): not used", path.c_str(),
+                    ns_error(le, "unknown").c_str());
+            }
             ++unreadable;
             continue;
         }

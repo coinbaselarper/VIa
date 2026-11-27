@@ -5036,6 +5036,23 @@ struct DeviceState {
     std::multimap<std::uint64_t, leonida::DescriptorKey> image_keys;  // by the texture's address
     std::vector<ImageEntry> replaced_images;  // kept until their texture goes: work in flight may still use them
     std::map<leonida::DescriptorKey, VkSampler> sampler_entries;
+    std::uint64_t image_entry_inserts = 0, sampler_entry_inserts = 0;  // descriptor_mutex
+    // The fields bind_image and bind_sampler read, everything else zero: keys equal here make the same view or sampler.
+    static leonida::DescriptorKey canonical_key(const leonida::DescriptorKey& key) {
+        namespace g = leonida::gfx10;
+        if (key[4] == ~0u && key[5] == ~0u && key[6] == ~0u && key[7] == ~0u) {
+            const g::SamplerWords s = g::encode(g::decode(g::SamplerWords{key[0], key[1], key[2], key[3]}));
+            return leonida::make_ssharp_key(s.data());
+        }
+        g::Image image{};
+        if (!g::is_image(key) || !g::decode(key, image)) return key;
+        g::ImageWords out = g::encode(image);
+        out[1] = (out[1] & ~(0xfffu << 8)) | (key[1] & (0xfffu << 8));
+        out[4] |= key[4] & g::volume_uav_flag;
+        out[5] |= key[5] & 0xfu;
+        if (key[4] & g::volume_uav_flag) out[7] = key[7];
+        return out;
+    }
     struct CustomBorderColor {
         bool is_int = false;
         VkClearColorValue value{};
@@ -5365,6 +5382,7 @@ struct DeviceState {
         } else {
             image_entries.emplace(words, entry);
             image_keys.emplace(image.address, words);
+            ++image_entry_inserts;
         }
         bindless->insert_key(words, entry.index);
         leonida::fsdraw::note_tsharp(words.data());  // LOCAL DIAGNOSTIC
@@ -5473,6 +5491,7 @@ struct DeviceState {
             return false;
         }
         sampler_entries.emplace(key, vk_sampler);
+        ++sampler_entry_inserts;
         bindless->insert_key(key, index);
         return true;
     }
@@ -13195,6 +13214,22 @@ public:
         }
     }
 
+    // The 14 dwords of a slot-70 description are a D3D12_RESOURCE_DESC as the title built it: dword 1 (after
+    // Dimension) and dword 13 (after Flags) are its alignment holes and hold whatever the title's stack held. The
+    // registry compares descriptions whole, so they are zeroed first; LEONIDA_TITLE_DESC_PADDING=keep compares them.
+    static constexpr std::size_t kDescPadding[2] = {1, 13};
+    static bool title_desc_canonical() {
+        static const bool on = [] {
+            const char* v = std::getenv("LEONIDA_TITLE_DESC_PADDING");
+            return !(v && std::strcmp(v, "keep") == 0);
+        }();
+        return on;
+    }
+    static std::array<std::uint32_t, 14> without_padding(std::array<std::uint32_t, 14> words) {
+        words[kDescPadding[0]] = words[kDescPadding[1]] = 0;
+        return words;
+    }
+
     // Xbox device slot 70 with a texture description (rt::d3d12::write_placed_texture_view): the view's T#, of the
     // slot-133 texture placed at `address` or of an image made for that memory and filled from it. False leaves the
     // slot a null view (zeros); every reason is counted and logged once per format and layout.
@@ -13209,11 +13244,14 @@ public:
         std::array<std::uint32_t, 14> words{};
         std::memcpy(words.data(), resource_words, sizeof(words));
         words[2] = words[3] = 0;  // the alignment says nothing about the texels
+        const bool padded = words[kDescPadding[0]] || words[kDescPadding[1]];
+        if (title_desc_canonical()) words[kDescPadding[0]] = words[kDescPadding[1]] = 0;
         bool written = false;
         {
             std::lock_guard lock(state_.title_texture_mutex);
             const InTitleTextures inside;
             TitleTextureStats& stats = title_stats_;
+            title_totals_.padded_views += padded;
             ++stats.views;
             ++stats.asked[{d.format, d.layout, d.dimension, d.mips}];
             const std::uint64_t refusals = stats.refusals;
@@ -13973,6 +14011,10 @@ private:
     TitleTextureStats title_stats_;                                 // under title_texture_mutex
     struct TitleTotals {
         std::uint64_t overlap_retired = 0, overlap_retired_bytes = 0, gone_retired = 0, gone_retired_bytes = 0;
+        // Slot-70 descriptions with non-zero padding (D3D12_RESOURCE_DESC's two 4-byte holes), images remade at one
+        // address because the description differed (and of them, those whose descriptions differed in the padding
+        // alone), and slot-133 textures laid out and hashed again for the same reason.
+        std::uint64_t padded_views = 0, remade = 0, remade_padding_only = 0, relayout = 0, relayout_padding_only = 0;
     } title_totals_;                                                // likewise, never reset
     bool title_pass_ = false;                                      // in refresh_title_textures, likewise
     std::atomic<std::int64_t> title_refreshed_{0};                 // steady_clock ticks of the last pass
@@ -14291,7 +14333,110 @@ public:
                      static_cast<unsigned long long>(state_.context ? state_.context->idle_postponed() : 0));
         report_aliases(seconds);
         report_title_classes(seconds);
+        report_view_tables(seconds);
     }
+
+    // Every table keyed by a view's or descriptor's bytes: how many entries, how fast they come, what they hold, and
+    // how many would be one entry if the bytes no consumer reads were zero (DeviceState::canonical_key).
+    void report_view_tables(double seconds) {
+        namespace L = leonida::gpu_ledger;
+        using Key = leonida::DescriptorKey;
+        constexpr std::size_t kNode = 32;
+        std::size_t images = 0, image_canon = 0, views = 0, addresses = 0, most = 0, samplers = 0, sampler_canon = 0;
+        std::size_t replaced = 0, pending_images = 0, borders = 0, table_keys = 0, table_canon = 0, table_slots = 0;
+        std::uint64_t image_inserts = 0, sampler_inserts = 0, table_gpu = 0;
+        {
+            std::lock_guard lock(state_.descriptor_mutex);
+            images = state_.image_entries.size();
+            std::set<Key> canon;
+            for (const auto& [key, entry] : state_.image_entries) {
+                canon.insert(DeviceState::canonical_key(key));
+                views += (entry.sampled != VK_NULL_HANDLE) + (entry.storage != VK_NULL_HANDLE);
+            }
+            image_canon = canon.size();
+            for (auto it = state_.image_keys.begin(); it != state_.image_keys.end();) {
+                const auto next = state_.image_keys.upper_bound(it->first);
+                most = std::max<std::size_t>(most, std::distance(it, next));
+                ++addresses;
+                it = next;
+            }
+            canon.clear();
+            samplers = state_.sampler_entries.size();
+            for (const auto& [key, sampler] : state_.sampler_entries) canon.insert(DeviceState::canonical_key(key));
+            sampler_canon = canon.size();
+            replaced = state_.replaced_images.size();
+            pending_images = 0;
+            for (const auto& [image, pending] : state_.pending_image_keys) pending_images += pending.keys.size();
+            borders = state_.border_color_table.size();
+            image_inserts = state_.image_entry_inserts;
+            sampler_inserts = state_.sampler_entry_inserts;
+            if (state_.bindless) {
+                const std::vector<std::uint32_t> keys = state_.bindless->table().export_keys();
+                canon.clear();
+                for (std::size_t i = 0; i + 9 <= keys.size(); i += 9) {
+                    Key key{};
+                    std::copy_n(keys.begin() + std::ptrdiff_t(i), 8, key.begin());
+                    canon.insert(DeviceState::canonical_key(key));
+                    ++table_keys;
+                }
+                table_canon = canon.size();
+                table_slots = state_.bindless->table().capacity();
+                table_gpu = state_.bindless->table_memory_bytes();
+            }
+        }
+        std::size_t pending_samples = 0, heap_tsharps = 0;
+        {
+            std::lock_guard lock(state_.pending_view_mutex);
+            pending_samples = state_.pending_samples.size();
+        }
+        {
+            std::lock_guard lock(state_.heap_tsharp_mutex);
+            heap_tsharps = state_.heap_tsharp_words.size() + state_.heap_tsharp_asked.size();
+        }
+        std::size_t registry = 0;
+        std::uint64_t made = 0, slot70 = 0;
+        TitleTotals totals{};
+        {
+            std::lock_guard lock(state_.title_texture_mutex);
+            registry = state_.title_textures.size();
+            made = title_stats_.made;
+            slot70 = title_stats_.views;
+            totals = title_totals_;
+        }
+        const std::size_t view_cache = state_.context ? state_.context->view_cache_size() : 0;
+        const double dt = seconds - view_mark_.seconds;
+        const auto rate = [dt](std::uint64_t now, std::uint64_t before) {
+            return dt > 0 && now >= before ? double(now - before) / dt : 0.0;
+        };
+        const double image_bytes = double(images) * (kNode + sizeof(Key) + sizeof(DeviceState::ImageEntry)) +
+                                   double(images) * (kNode + 8 + sizeof(Key));
+        const double sampler_bytes = double(samplers) * (kNode + sizeof(Key) + sizeof(VkSampler));
+        const double registry_bytes = double(registry) * (kNode + 8 + 16 + sizeof(TitleTexture));
+        const double cache_bytes = double(view_cache) * (kNode + 40 + sizeof(VkImageView));
+        std::fprintf(stderr,
+                     "[rt] gpu-memory views t=%.0fs: image T#s %zu (%zu once unread bits are zeroed; %zu textures, at "
+                     "most %zu T#s of one; %zu VkImageViews; %.1f/s new; host %.2f MiB), replaced views kept %zu, "
+                     "pending T#s %zu + %zu; samplers %zu (%zu once zeroed; %.2f/s new; %.2f MiB), border colours %zu; "
+                     "hash table keys %zu (%zu once zeroed) in %zu slots (host %.1f MiB, GPU %.0f MiB); title registry "
+                     "%zu (%.1f MiB host; slot-70 views %.1f/s, images made %.1f/s); slot-70 descriptions with padding "
+                     "%llu, images remade at one address %llu (padding only %llu), slot-133 relayouts %llu (padding "
+                     "only %llu); attachment view cache %zu (%.2f MiB); heap T# requests %zu\n",
+                     seconds, images, image_canon, addresses, most, views, rate(image_inserts, view_mark_.image_inserts),
+                     image_bytes / 1048576.0, replaced, pending_images, pending_samples, samplers, sampler_canon,
+                     rate(sampler_inserts, view_mark_.sampler_inserts), sampler_bytes / 1048576.0, borders, table_keys,
+                     table_canon, table_slots, double(table_slots) * 40 / 1048576.0, L::mib(table_gpu), registry,
+                     registry_bytes / 1048576.0, rate(slot70, view_mark_.slot70), rate(made, view_mark_.made),
+                     static_cast<unsigned long long>(totals.padded_views), static_cast<unsigned long long>(totals.remade),
+                     static_cast<unsigned long long>(totals.remade_padding_only),
+                     static_cast<unsigned long long>(totals.relayout),
+                     static_cast<unsigned long long>(totals.relayout_padding_only), view_cache, cache_bytes / 1048576.0,
+                     heap_tsharps);
+        view_mark_ = {seconds, image_inserts, sampler_inserts, made, slot70};
+    }
+    struct ViewTableMark {
+        double seconds = 0;
+        std::uint64_t image_inserts = 0, sampler_inserts = 0, made = 0, slot70 = 0;
+    } view_mark_;
 
     std::uint64_t bindless_table_bytes() const {
         return state_.bindless ? state_.bindless->table_memory_bytes() : 0;
@@ -14603,6 +14748,10 @@ private:
         }
         if (t && !t->owned) {  // the title's slot-133 texture
             ++title_stats_.of_slot133;
+            if (!t->gpu_written && !t->layout_guessed && !t->layout_from_xg && t->layout_known && t->desc != words) {
+                ++title_totals_.relayout;
+                title_totals_.relayout_padding_only += without_padding(t->desc) == without_padding(words);
+            }
             if (!t->gpu_written && (t->layout_guessed || t->layout_from_xg || !t->layout_known || t->desc != words)) {
                 const char* why = nullptr;
                 rt::xg_xs::Texture layout;
@@ -14632,6 +14781,11 @@ private:
             return write(*t);
         }
         if (t && !title_texture_matches(*t, words, srv)) {
+            ++title_totals_.remade;
+            title_totals_.remade_padding_only +=
+                t->desc != words && without_padding(t->desc) == without_padding(words) &&
+                (srv.Format == DXGI_FORMAT_UNKNOWN ||
+                 std::find(t->formats.begin(), t->formats.end(), srv.Format) != t->formats.end());
             std::vector<DXGI_FORMAT> formats = t->formats;
             const bool same_shape = [&] {
                 auto a = t->desc, b = words;

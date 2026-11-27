@@ -912,8 +912,12 @@ private:
 public:
     void set_archive_tag(const std::string& tag);
     void set_compile_limits(std::uint32_t active, std::uint32_t background) { compiler_.set_limits(active, background); }
+    // set_debug_buffer (metal_backend.h): set before the first command list is encoded, never changed after.
+    void set_debug_buffer(id<MTLBuffer> buffer) { debug_buffer_ = buffer; }
+    id<MTLBuffer> debug_buffer() const { return debug_buffer_; }
 
 private:
+    id<MTLBuffer> debug_buffer_ = nil;
     mutable std::mutex pressure_mutex_;
     std::map<std::uint64_t, std::function<void(MemoryPressure)>> pressure_handlers_;
     std::uint64_t next_pressure_token_ = 1;

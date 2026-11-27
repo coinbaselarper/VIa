@@ -146,6 +146,7 @@ int main(int argc, char** argv) {
     const fs::path dir = argc > 1 ? argv[1] : "pcache-archive-tmp";
     fs::remove_all(dir);
     fs::create_directories(dir);
+    ::setenv("GTA6RT_METAL_ARCHIVE_TIERS", "off", 1);
     sc::Catalog catalog;
     if (!catalog.load(port + "/build/shaderc_msl/runs/main/manifest.tsv") || !catalog.find("VS_Blit_6e5520d1_Wrapped")) {
         std::printf("SKIP: no shader store\n");
@@ -235,6 +236,26 @@ int main(int argc, char** argv) {
     const Run concurrent_warm = build(catalog, dir.string(), "version A", conc);
     show("their next run", concurrent_warm);
     CHECK(concurrent_warm.ok == conc.formats.size() && concurrent_warm.hits == conc.formats.size());
+
+    const fs::path own = dir.string() + "-own";
+    fs::remove_all(own);
+    ::setenv("GTA6RT_METAL_ARCHIVE_TIERS", (dir.string() + ":" + own.string() + ":/nonexistent").c_str(), 1);
+    const Snapshot s5 = shards_of(dir);
+    const Run tiered = build(catalog, own.string(), "version A", conc);
+    show("empty directory + read-only tier", tiered);
+    CHECK(tiered.ok == conc.formats.size() && tiered.hits == conc.formats.size() && tiered.written == 0);
+    CHECK(unchanged(s5, shards_of(dir)) && shards_of(dir).size() == s5.size());
+    Opts conc2 = conc;
+    conc2.formats.push_back(29u);
+    const Run tier_grow = build(catalog, own.string(), "version A", conc2);
+    show("read-only tier + 1 new", tier_grow);
+    CHECK(tier_grow.hits == conc.formats.size() && tier_grow.written == 1 && shards_of(own).size() == 1);
+    CHECK(unchanged(s5, shards_of(dir)) && shards_of(dir).size() == s5.size());
+    ::setenv("GTA6RT_METAL_ARCHIVE_TIERS", "off", 1);
+    const Run untiered = build(catalog, own.string(), "version A", conc2);
+    show("tiers off", untiered);
+    CHECK(untiered.hits == 1);
+    fs::remove_all(own);
 
     std::printf("%s (%d failures)\n", failures ? "FAIL" : "PASS", failures);
     return failures ? 1 : 0;

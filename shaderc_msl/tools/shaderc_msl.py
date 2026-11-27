@@ -123,6 +123,13 @@ def prepare(words, stage, opts):
         w, r = spv.dual_source(w)
         if r["moved"]:
             passes.append({"pass": "dual_source"})
+    if opts.get("output_variants") and stage == "ps":
+        import out_types
+        info = out_types.analyze(w, opts.get("output_signature"))
+        codes = sorted({out_types.normalize(c).rstrip("f") for c in opts["output_variants"]} - {""})
+        codes = [c for c in codes if out_types.needs_variant(info, c)]
+        if codes:
+            passes.append({"pass": "output_variants", "codes": codes, "version": out_types.VERSION})
     extra = []
     if stage == "vs" and vs_lane_used(w):
         route = opts.get("vs_route", "lane")
@@ -404,8 +411,25 @@ def msl_fixups(text, passes):
     return (text if changed else None), info
 
 
+def declared_output_variants(spv_path, opts):
+    """Pixel shaders: the output-type variant the HLSL signature asks for (an integer SV_Target, read from the
+    shader's DXBC beside the SPIR-V corpus) joins opts["output_variants"] (tools/out_types.py)."""
+    import out_types
+    opts = dict(opts)
+    if "output_signature" not in opts:
+        opts["output_signature"] = out_types.dxbc_targets(os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(spv_path))), "dxbc", os.path.basename(spv_path)[:-4] + ".dxbc"))
+    sig = opts["output_signature"] or {}
+    code = "".join({"uint": "u", "int": "i"}.get(sig.get(loc), "f") for loc in range(max(sig) + 1 if sig else 0))
+    if code.rstrip("f"):
+        opts["output_variants"] = sorted(set(opts.get("output_variants") or []) | {code.rstrip("f")})
+    return opts
+
+
 def compile_one(spv_path, stage, cas, translator, opts=None, tmp=None, keep_msl=False):
     opts = opts or {}
+    if stage == "ps" and opts.get("declared_output_variants", True):
+        opts = declared_output_variants(spv_path, opts)
     t_start = time.monotonic()
     raw = open(spv_path, "rb").read()
     words = list(spv.struct.unpack("<%dI" % (len(raw) // 4), raw))
@@ -469,6 +493,17 @@ def compile_one(spv_path, stage, cas, translator, opts=None, tmp=None, keep_msl=
         with gzip.open(os.path.join(d, key + ".metal.gz"), "wb", compresslevel=1) as g:
             g.write(msl)
     air = base + ".air"
+    airs = [air]
+    for ov in (p for p in passes if p["pass"] == "output_variants"):
+        r["output_variants"] = {}
+        for c in ov["codes"]:
+            vr = output_variant_air(w, c, base, passes, extra, r["plan"])
+            r["output_variants"][c] = vr
+            if vr["status"] != "ok":
+                r["status"] = "variant_fail"
+                r["error"] = "output variant %s: %s" % (c, vr.get("error", ""))
+                return _finish(r, meta_path, base, t_start)
+            airs.append(vr.pop("air"))
     rc, out, err, dt = run([tool("metal"), "-std=" + RECIPE["std"], *RECIPE["metal"], base + ".metal", "-o", air],
                            RECIPE["metal_timeout"])
     r["metal_s"] = round(dt, 3)
@@ -493,7 +528,7 @@ def compile_one(spv_path, stage, cas, translator, opts=None, tmp=None, keep_msl=
         return _finish(r, meta_path, base, t_start)
     lib = os.path.join(d, key + ".metallib")
     part = "%s.%d.%d.part" % (lib, os.getpid(), threading.get_ident())
-    rc, out, err, dt = run([tool("metallib"), air, "-o", part], RECIPE["metal_timeout"])
+    rc, out, err, dt = run([tool("metallib"), *airs, "-o", part], RECIPE["metal_timeout"])
     r["metallib_s"] = round(dt, 3)
     if rc != 0:
         r["status"] = "metallib_fail"
@@ -505,7 +540,53 @@ def compile_one(spv_path, stage, cas, translator, opts=None, tmp=None, keep_msl=
     return _finish(r, meta_path, base, t_start)
 
 
+def output_variant_air(w, code, base, passes, extra, plan):
+    """One output-type variant (tools/out_types.py) of the prepared pixel shader `w`, compiled to AIR with the entry
+    main0_o<code>; its binding plan must equal the base entry's."""
+    import out_types
+    entry = "main0_o" + code
+    vw, rep = out_types.output_types(w, code)
+    vr = {"entry": entry, "report": rep}
+    if not rep["applied"]:
+        vr.update(status="not_applied", error=rep.get("why", ""))
+        return vr
+    vb = base + "_o" + code
+    open(vb + ".spv", "wb").write(spv.to_bytes(vw))
+    rc, out, err, dt = run([SPIRV_CROSS, vb + ".spv", *RECIPE["cross"], "--msl-version", str(RECIPE["msl_version"]), *extra,
+                            "--rename-entry-point", "main", entry, "frag", "--output", vb + ".metal"], RECIPE["cross_timeout"])
+    if rc != 0 or not os.path.exists(vb + ".metal"):
+        vr.update(status="cross_fail", error=("TIMEOUT" if rc is None else err.decode("utf-8", "replace").strip())[:400])
+        return vr
+    text = open(vb + ".metal", encoding="utf-8", errors="replace").read()
+    fixed, _ = msl_fixups(text, passes)
+    text = fixed if fixed is not None else text
+    open(vb + ".metal", "w").write(text)
+    vplan = msl_plan(text.replace(entry + "(", "main0(").replace(entry + "_out", "main0_out").replace(entry + "_in", "main0_in"))
+    for k in ("sets", "discrete", "push", "other_buffers", "textures", "samplers"):
+        if vplan.get(k) != plan.get(k):
+            vr.update(status="plan_mismatch", error="binding plan differs from main0 in %s" % k)
+            return vr
+    vr["colors"] = vplan.get("features", {}).get("colors")
+    rc, out, err, dt = run([tool("metal"), "-std=" + RECIPE["std"], *RECIPE["metal"], vb + ".metal", "-o", vb + ".air"],
+                           RECIPE["metal_timeout"])
+    vr["metal_s"] = round(dt, 3)
+    if rc != 0:
+        e = err.decode("utf-8", "replace")
+        vr.update(status="metal_fail", error="TIMEOUT" if rc is None else
+                  next((l.strip() for l in e.splitlines() if "error:" in l), e.strip())[:400])
+        return vr
+    vr["status"] = "ok"
+    vr["air"] = vb + ".air"
+    return vr
+
+
 def _finish(r, meta_path, base, t_start):
+    for v in (r.get("output_variants") or {}):
+        for ext in (".spv", ".metal", ".air"):
+            try:
+                os.remove(base + "_o" + v + ext)
+            except OSError:
+                pass
     for ext in (".spv", ".metal", ".air"):
         try:
             os.remove(base + ext)
@@ -531,8 +612,17 @@ def main():
     ap.add_argument("--force", action="store_true")
     ap.add_argument("--dual-source", action="store_true",
                     help="ps: blend source 1 from Location 1 to Location 0 Index 1 (dual-source-blend PSOs)")
+    ap.add_argument("--output-variants", default="",
+                    help="ps: comma-separated output-type codes (f/u/i per colour location, tools/out_types.py); the "
+                         "library gets an entry main0_o<code> for each that needs one")
     a = ap.parse_args()
     opts = {"vs_route": a.vs_route, "force": a.force, "dual_source": a.dual_source}
+    if a.output_variants:
+        import out_types
+        opts["output_variants"] = [c for c in a.output_variants.split(",") if c]
+        sd = a.spirv_dir or os.path.dirname(a.spv)
+        opts["output_signature"] = out_types.dxbc_targets(os.path.join(
+            os.path.dirname(os.path.abspath(sd)), "dxbc", os.path.basename(a.spv)[:-4] + ".dxbc"))
     if a.drop:
         opts["drop_outputs"] = [int(x) for x in a.drop.split(",")]
     tr = translator_id(a.spirv_dir or os.path.dirname(a.spv))

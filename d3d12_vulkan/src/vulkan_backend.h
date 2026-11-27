@@ -2030,6 +2030,10 @@ public:
     }
 
     std::uint64_t deferred_requeued() const { return deletion_queue_.requeued(); }
+    std::size_t view_cache_size() {
+        std::lock_guard lock(views_mutex_);
+        return views_.size();
+    }
     // port/: LEONIDA_DEFERRED_FREE_IDLE=1 destroys nothing while a submission of this device is still running: the
     // queue is drained only at a moment when every submitted ticket is done (MoltenVK keeps every live allocation in
     // one MTLResidencySet that each command buffer uses, so a free while any command buffer runs may hit it).

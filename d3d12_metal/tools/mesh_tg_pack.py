@@ -8,6 +8,9 @@ manifest with those rows pointing at them (GTA6RT_METAL_SHADER_MANIFEST=OUT/mani
 
   mesh_tg_pack.py OUT --scan [--jobs N]     every hw-route mesh shader of the store, sized; packed where over
   mesh_tg_pack.py OUT NAME...               these only
+  mesh_tg_pack.py OUT --force NAME...       these packed even when the estimate of threadgroup + mesh output passes
+                                            61,440 (the estimate of the output part is high; check with
+                                            mesh_pso_probe and the paired pixel shader)
   mesh_tg_pack.py OUT --split NAME...       these through the store's meshlet split instead (route split64: object
                                             stage + 64-vertex mesh groups, 7 chunks), for shaders whose staged
                                             outputs alone pass Metal's 61,440-byte threadgroup + mesh output limit
@@ -191,7 +194,7 @@ def build(out_dir, name, row, force):
     packed, n = pack(msl, arrays)
     after, _ = tg_bytes(packed)
     r.update(after=after, packed_arrays=n)
-    if after is None or over(after, mesh):
+    if after is None or after > LIMIT or (over(after, mesh) and not force):
         r["status"] = "still_over"
         return r
     key = hashlib.sha256((VERSION + "\n" + packed).encode()).hexdigest()

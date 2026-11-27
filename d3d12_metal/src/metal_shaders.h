@@ -32,6 +32,9 @@ public:
         std::string store;        // where on-demand builds go (<store>/cas)
         std::string tool;         // port/shaderc_msl/tools/shaderc_msl.py
         unsigned builders = 2;
+        // Manifests (same root as `manifest`) whose rows replace the store's by name, the first listed winning:
+        // d3d12_metal/tools/msl_overlay.py and msl_instrument.py write them.
+        std::vector<std::string> overlays;
     };
     MetalShaders(gpu::Device& device, Config config);
     ~MetalShaders();
@@ -51,7 +54,11 @@ public:
                  std::string* error, const std::string& variant = {});
     // A library the manifest names by its store-relative path (the split64 route's mesh and object libraries).
     Library load_relative(const std::string& relative, std::string* error);
-    const gta6rt::shaderc_msl::ShaderEntry* manifest_entry(const std::string& name) const { return catalog_.find(name); }
+    const gta6rt::shaderc_msl::ShaderEntry* manifest_entry(const std::string& name) const {
+        for (const auto& o : overlays_)
+            if (const auto* e = o.find(name)) return e;
+        return catalog_.find(name);
+    }
     bool loaded() const { return catalog_loaded_; }
 
     struct Stats {
@@ -74,6 +81,7 @@ private:
     gpu::Device& device_;
     Config config_;
     gta6rt::shaderc_msl::Catalog catalog_;
+    std::vector<gta6rt::shaderc_msl::Catalog> overlays_;
     bool catalog_loaded_ = false;
     mutable std::mutex mutex_;
     std::condition_variable wake_;

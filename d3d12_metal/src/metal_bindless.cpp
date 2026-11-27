@@ -219,7 +219,7 @@ bool MetalBindless::generation_free(Generation& g, std::chrono::steady_clock::ti
 bool MetalBindless::flush() {
     std::unique_lock lock(mutex_);
     if (!table_dirty_ && current_ != SIZE_MAX) return true;
-    const std::size_t bytes = table_.size_bytes();
+    std::size_t bytes = table_.size_bytes();
     auto now = std::chrono::steady_clock::now();
     std::size_t pick = SIZE_MAX;
     // GTA6RT_METAL_TABLE_GENERATIONS (default 8, 0: no cap): at that many live generations a flush waits (up to 2 s)
@@ -256,6 +256,7 @@ bool MetalBindless::flush() {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
         lock.lock();
         if (!table_dirty_ && current_ != SIZE_MAX) return true;
+        bytes = table_.size_bytes();
         now = std::chrono::steady_clock::now();
     }
     if (now != wait_start) {
@@ -313,6 +314,12 @@ bool MetalBindless::flush() {
         journal_seq_ += changes.slots.size();
     }
     Generation& g = generations_[pick];
+    if (g.buffer->size() < table_.size_bytes()) {
+        std::fprintf(stderr, "[rt] d3d12-metal: descriptor hash table: generation of %llu bytes picked for a table of "
+                             "%zu bytes; not written\n",
+                     static_cast<unsigned long long>(g.buffer->size()), table_.size_bytes());
+        return false;
+    }
     g.retired = g.settled = false;
     auto* words = static_cast<std::uint32_t*>(g.buffer->cpu_pointer());
     if (g.epoch != table_epoch_ || !g.written || g.synced < journal_base_) {

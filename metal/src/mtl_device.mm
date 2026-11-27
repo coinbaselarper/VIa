@@ -128,12 +128,13 @@ kernel void gta6rt_rect_indirect(device const uint* args [[buffer(0)]], device c
     w[3] = draw[3];
     for (uint k = 0; k < 8u; ++k) w[4u + k] = p.strides[k];
 }
-struct IndirectGroupsParams { uint stride_words; uint max_count; uint count_word; uint has_count; uint mesh; uint mesh_max; uint cs_max; };
+struct IndirectGroupsParams { uint stride_words; uint max_count; uint count_word; uint has_count; uint mesh; uint mesh_max; uint cs_max; uint debug; };
 kernel void gta6rt_indirect_groups(device const uint* args [[buffer(0)]], device const uint* count [[buffer(1)]],
                                    device uint* out [[buffer(2)]], constant IndirectGroupsParams& p [[buffer(3)]],
-                                   uint i [[thread_position_in_grid]]) {
+                                   device atomic_uint* dbg [[buffer(4)]], uint i [[thread_position_in_grid]]) {
     if (i >= p.max_count) return;
-    const uint n = p.has_count != 0u ? min(count[p.count_word], p.max_count) : p.max_count;
+    const uint raw_count = p.has_count != 0u ? count[p.count_word] : p.max_count;
+    const uint n = min(raw_count, p.max_count);
     device const uint* a = args + i * p.stride_words;
     uint3 g = i < n ? uint3(a[0], a[1], a[2]) : uint3(0u);
     const ulong groups = ulong(g.x) * ulong(g.y) * ulong(g.z);
@@ -143,6 +144,30 @@ kernel void gta6rt_indirect_groups(device const uint* args [[buffer(0)]], device
     out[i * 3u + 0u] = g.x;
     out[i * 3u + 1u] = g.y;
     out[i * 3u + 2u] = g.z;
+    if (p.debug == 0u) return;
+    const uint b = p.mesh != 0u ? 0u : 16u;
+    atomic_fetch_add_explicit(&dbg[b + 0u], 1u, memory_order_relaxed);
+    if (i < n) atomic_fetch_add_explicit(&dbg[b + 1u], 1u, memory_order_relaxed);
+    if (!legal) atomic_fetch_add_explicit(&dbg[b + 3u], 1u, memory_order_relaxed);
+    if (legal && groups != 0ul) {
+        atomic_fetch_add_explicit(&dbg[b + 2u], 1u, memory_order_relaxed);
+        atomic_fetch_add_explicit(&dbg[b + 4u], uint(groups), memory_order_relaxed);
+        const uint s = atomic_fetch_add_explicit(&dbg[b + 9u], 1u, memory_order_relaxed);
+        if (s < 8u) {
+            atomic_store_explicit(&dbg[32u + b * 2u + s * 4u + 0u], g.x, memory_order_relaxed);
+            atomic_store_explicit(&dbg[32u + b * 2u + s * 4u + 1u], g.y, memory_order_relaxed);
+            atomic_store_explicit(&dbg[32u + b * 2u + s * 4u + 2u], g.z, memory_order_relaxed);
+            atomic_store_explicit(&dbg[32u + b * 2u + s * 4u + 3u], i, memory_order_relaxed);
+        }
+    }
+    if (i != 0u) return;
+    atomic_fetch_add_explicit(&dbg[b + 5u], 1u, memory_order_relaxed);
+    if (p.has_count == 0u) return;
+    atomic_fetch_add_explicit(&dbg[b + 6u], 1u, memory_order_relaxed);
+    atomic_fetch_add_explicit(&dbg[b + 7u], n, memory_order_relaxed);
+    if (n == 0u) atomic_fetch_add_explicit(&dbg[b + 8u], 1u, memory_order_relaxed);
+    const uint s = atomic_fetch_add_explicit(&dbg[b + 10u], 1u, memory_order_relaxed);
+    if (s < 8u) atomic_store_explicit(&dbg[96u + b / 2u + s], raw_count, memory_order_relaxed);
 }
 struct QuadParams { uint first_byte; uint index_bytes; uint readable; uint quads; };
 kernel void gta6rt_quad_expand(device const uchar* ib [[buffer(0)]], device uint* out [[buffer(1)]],

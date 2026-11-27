@@ -28,7 +28,7 @@ namespace gta6rt::pcache {
 
 namespace {
 
-enum class HeldState { queued, waiting_lib, building, ready, failed, dropped, adopted };
+enum class HeldState { queued, waiting_lib, building, ready, failed, dropped, released, adopted };
 
 struct Held {
     Spec spec;
@@ -38,7 +38,8 @@ struct Held {
     HeldState state = HeldState::queued;
     bool hold = true;
     bool bootstrap = false;
-    double t_start = 0;
+    double t_start = 0, t_ready = 0;
+    double expect_rel = 0;  // recorded first use, seconds after its phase began
     std::unique_ptr<gpu::RenderPipeline> render;
     std::unique_ptr<gpu::MeshPipeline> mesh;
     std::unique_ptr<gpu::ComputePipeline> compute;
@@ -66,6 +67,7 @@ struct Stats {
     std::uint64_t first_uses = 0, adopted_ready = 0, adopted_compiling = 0, created = 0, demanded_queued = 0;
     std::uint64_t demand_ready_from_archive = 0, demand_compiled = 0, demand_failed = 0;
     std::uint64_t prebuilt = 0, prebuilt_from_archive = 0, prebuild_failed = 0, dropped = 0, bootstrap_matched = 0;
+    std::uint64_t released_unused = 0, tier_entries = 0;
     std::uint64_t waits = 0;
     double wait_sum = 0, wait_longest = 0, prebuild_seconds = 0;
     std::string wait_longest_label;
@@ -90,6 +92,8 @@ struct State {
     std::vector<Held*> in_flight;
     std::vector<Watch> watch;
     Phase phase = Phase::boot;
+    double phase_t0[8] = {};
+    double release_s = 60;
     bool movie = false;
     double quiet_until = 0, quiet_s = 10;
     double world_t0 = 0, world_next = 0;
@@ -223,7 +227,7 @@ std::string report_locked(State& s) {
                   "t=%.0fs phase=%s: first uses %llu (adopted ready %llu, adopted compiling %llu, created at use %llu: "
                   "%llu from the archive, %llu compiled, %llu failed); prebuild: %zu known, %llu built (%llu archive "
                   "hits, %.1f s), %llu failed, %zu queued, %zu waiting for a shader, %zu holding, %llu dropped after "
-                  "build, %llu bootstrap matches; first-use waits %llu (sum %.0f ms, longest %.0f ms: %s); manifest "
+                  "build, %llu released unused, %zu tier entries, %llu bootstrap matches; first-use waits %llu (sum %.0f ms, longest %.0f ms: %s); manifest "
                   "%zu earlier + %zu this run",
                   process_age_s(), phase_name(s.phase), (unsigned long long)t.first_uses,
                   (unsigned long long)t.adopted_ready, (unsigned long long)t.adopted_compiling,
@@ -231,7 +235,7 @@ std::string report_locked(State& s) {
                   (unsigned long long)t.demand_compiled, (unsigned long long)t.demand_failed, s.table.size(),
                   (unsigned long long)t.prebuilt, (unsigned long long)t.prebuilt_from_archive, t.prebuild_seconds,
                   (unsigned long long)t.prebuild_failed, queued, waiting, held, (unsigned long long)t.dropped,
-                  (unsigned long long)t.bootstrap_matched, (unsigned long long)t.waits, t.wait_sum * 1e3,
+                  (unsigned long long)t.released_unused, std::size_t(t.tier_entries), (unsigned long long)t.bootstrap_matched, (unsigned long long)t.waits, t.wait_sum * 1e3,
                   t.wait_longest * 1e3, t.wait_longest_label.empty() ? "-" : t.wait_longest_label.c_str(),
                   s.prior.size(), s.run.size());
     std::string out = buf;
@@ -410,6 +414,7 @@ void poll_locked(State& s) {
         if (p->from_archive()) ++s.stats.prebuilt_from_archive;
         s.stats.prebuild_seconds += now - h.t_start;
         h.state = HeldState::ready;
+        h.t_ready = now;
         if (!h.hold) {
             h.release();
             h.state = HeldState::dropped;
@@ -458,10 +463,34 @@ void poll_locked(State& s) {
     }
 }
 
+// A held pipeline not used within release_s of when its recording says it is first used (seconds after its phase
+// began), or of being ready, is released: the archive keeps it, a later first use costs an archive lookup.
+void release_unused_locked(State& s) {
+    if (s.release_s <= 0) return;
+    const double now = process_age_s();
+    std::uint64_t n = 0;
+    for (auto& [k, hp] : s.table) {
+        Held& h = *hp;
+        if (h.state != HeldState::ready || int(h.phase) > int(s.phase)) continue;
+        const double due = int(h.phase) < int(s.phase) ? s.phase_t0[int(s.phase)] : s.phase_t0[int(h.phase)] + h.expect_rel;
+        if (now < std::max(due, h.t_ready) + s.release_s) continue;
+        h.release();
+        h.state = HeldState::released;
+        if (h.hold) --s.held_count;
+        ++n;
+    }
+    if (n) {
+        s.stats.released_unused += n;
+        log_line("released %llu prebuilt pipelines unused %.0f s after their recorded first use (%llu in all, %zu held)",
+                 (unsigned long long)n, s.release_s, (unsigned long long)s.stats.released_unused, s.held_count);
+    }
+}
+
 void set_phase_locked(State& s, Phase p) {
     if (p == s.phase) return;
     const Phase before = s.phase;
     s.phase = p;
+    s.phase_t0[int(p)] = process_age_s();
     if (p != Phase::landing) s.movie = false;
     if (p == Phase::world) {
         s.quiet_until = process_age_s() + s.quiet_s;
@@ -512,6 +541,7 @@ void monitor_main() {
         }
         // Every 2 s while there is something new: the world's first seconds are where runs end in a crash.
         if (tick % 200 == 0 && (s.dirty || !s.run_lines.empty())) write_locked(s, "periodic");
+        if (tick % 100 == 0) release_unused_locked(s);
         // The world's first seconds: what was handed over ready, what is still compiling, draws dropped meanwhile.
         if (s.world_t0 > 0 && s.cfg.device && process_age_s() >= s.world_next) {
             const double rel = process_age_s() - s.world_t0;
@@ -658,6 +688,57 @@ std::unique_ptr<P> make_any(gpu::Device& device, const D& desc, const void* owne
     return out;
 }
 
+std::vector<std::string>& tier_dirs() {
+    static auto* v = new std::vector<std::string>;
+    return *v;
+}
+
+bool is_dir(const std::string& path) {
+    struct stat sb {};
+    return ::stat(path.c_str(), &sb) == 0 && S_ISDIR(sb.st_mode);
+}
+
+bool same_dir(const std::string& a, const std::string& b) {
+    struct stat x {}, y {};
+    return ::stat(a.c_str(), &x) == 0 && ::stat(b.c_str(), &y) == 0 && x.st_dev == y.st_dev && x.st_ino == y.st_ino;
+}
+
+// GTA6RT_METAL_ARCHIVE_TIERS: "off", or directories separated by ':'. Unset: the world tier
+// (<port>/build/pc7/arch-world) when it exists.
+std::vector<std::string> resolve_tiers(const std::string& own) {
+    std::vector<std::string> out, want;
+    const char* v = std::getenv("GTA6RT_METAL_ARCHIVE_TIERS");
+    if (v && std::string(v) == "off") return out;
+    if (v && *v) {
+        std::string cur;
+        for (const char* c = v;; ++c) {
+            if (*c == ':' || !*c) {
+                if (!cur.empty()) want.push_back(cur);
+                cur.clear();
+                if (!*c) break;
+            } else {
+                cur += *c;
+            }
+        }
+    } else {
+        const char* root = std::getenv("GTA6RT_SOURCE_ROOT");
+#ifdef GTA6RT_D3D12_METAL_PORT_ROOT
+        if (!root) root = GTA6RT_D3D12_METAL_PORT_ROOT;
+#endif
+        if (root) want.push_back(std::string(root) + "/build/pc7/arch-world");
+    }
+    for (const auto& d : want)
+        if (is_dir(d) && !same_dir(d, own)) out.push_back(d);
+    return out;
+}
+
+void set_expected_rel(std::vector<Entry>& entries) {
+    double t0[8];
+    for (double& t : t0) t = 1e30;
+    for (const Entry& e : entries) t0[int(e.phase)] = std::min(t0[int(e.phase)], e.t);
+    for (Entry& e : entries) e.t -= t0[int(e.phase)];
+}
+
 }  // namespace
 
 bool enabled() {
@@ -678,6 +759,7 @@ void start(const StartConfig& config) {
     if (const char* v = std::getenv("GTA6RT_METAL_PCACHE_INFLIGHT")) s.cfg.max_in_flight = unsigned(std::atoi(v));
     if (const char* v = std::getenv("GTA6RT_METAL_PCACHE_HOLD")) s.max_hold = std::size_t(std::atol(v));
     if (const char* v = std::getenv("GTA6RT_METAL_PCACHE_QUIET_S")) s.quiet_s = std::atof(v);
+    if (const char* v = std::getenv("GTA6RT_METAL_PCACHE_RELEASE_S")) s.release_s = std::atof(v);
     ::mkdir(config.directory.c_str(), 0755);
     s.manifest_path = config.directory + "/pcache-manifest.txt";
     {
@@ -699,14 +781,45 @@ void start(const StartConfig& config) {
         }
     }
     std::size_t bad = 0;
-    for (const Entry& e : s.prior.ordered()) {
-        Spec spec;
-        if (!decode(e.text, spec, &error)) {
-            ++bad;
+    auto add_all = [&](std::vector<Entry> entries) {
+        std::vector<Entry> rel = entries;
+        set_expected_rel(rel);
+        std::size_t added = 0;
+        for (std::size_t i = 0; i < entries.size(); ++i) {
+            const Entry& e = entries[i];
+            Spec spec;
+            if (!decode(e.text, spec, &error)) {
+                ++bad;
+                continue;
+            }
+            const bool fresh = !s.table.count(e.key);
+            Held& h = add_locked(s, e.key, e.text, spec, e.phase, false);
+            if (!fresh) {
+                h.expect_rel = std::min(h.expect_rel, rel[i].t);
+                continue;
+            }
+            h.seq = std::uint64_t(rel[i].t * 1000);
+            h.expect_rel = rel[i].t;
+            ++added;
+        }
+        return added;
+    };
+    add_all(s.prior.ordered());
+    // Tiers (read-only, open_archive): their manifest is prebuilt like this directory's, but never written here.
+    for (const std::string& d : tier_dirs()) {
+        Manifest tier;
+        std::string terr;
+        const std::string path = is_dir(d) && ::access((d + "/pcache-tier.txt").c_str(), R_OK) == 0
+                                     ? d + "/pcache-tier.txt"
+                                     : d + "/pcache-manifest.txt";
+        if (::access(path.c_str(), R_OK) != 0) continue;
+        if (!tier.load(path, &terr)) {
+            log_line("tier manifest %s not used: %s", path.c_str(), terr.c_str());
             continue;
         }
-        Held& h = add_locked(s, e.key, e.text, spec, e.phase, false);
-        h.seq = std::uint64_t(e.t * 1000);
+        const std::size_t added = add_all(tier.ordered());
+        s.stats.tier_entries += added;
+        log_line("tier manifest %s: %zu pipelines, %zu not in this directory's manifest", path.c_str(), tier.size(), added);
     }
     s.queue.clear();
     for (auto& [k, h] : s.table) s.queue.emplace(queue_key(*h));
@@ -816,6 +929,8 @@ gpu::Status open_archive(gpu::Device& device, const std::string& directory, cons
                          std::string* log) {
     gpu::PipelineCacheDesc pc;
     pc.directory = directory.c_str();
+    tier_dirs() = resolve_tiers(directory);
+    pc.read_only = tier_dirs();
     pc.translator_version = version;
     pc.load = load;
     if (const char* v = std::getenv("GTA6RT_METAL_PCACHE_SHARD_MB")) pc.shard_bytes = std::uint64_t(std::atof(v) * 1e6);
@@ -828,6 +943,7 @@ gpu::Status open_archive(gpu::Device& device, const std::string& directory, cons
                       static_cast<unsigned long long>(stats.file_bytes), stats.load_seconds,
                       stats.shards_unreadable ? (", " + std::to_string(stats.shards_unreadable) + " unreadable moved aside").c_str() : "");
         *log = stats.path + "-*: " + gpu::status_name(status) + (stats.loaded ? ", loaded" : ", new") + buf;
+        for (const auto& d : tier_dirs()) *log += "; read-only tier " + d;
         if (status != gpu::Status::ok) *log += ": " + error;
     }
     return status;

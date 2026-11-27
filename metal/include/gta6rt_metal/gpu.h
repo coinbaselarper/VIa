@@ -937,6 +937,7 @@ struct PipelineCacheDesc {
     bool load = true;                     // read the existing shards with the same key
     std::uint64_t shard_bytes = 150'000'000;  // a writer flushes before the in-memory shard would pass this (estimate)
     std::string tag = "run";              // name part of the shards this process writes (set_pipeline_cache_tag)
+    std::vector<std::string> read_only;   // more directories whose shards with this key are looked up, never written
 };
 
 struct PipelineCacheStats {

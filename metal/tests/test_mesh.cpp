@@ -1,5 +1,7 @@
 #include "test_util.h"
 
+#include <gta6rt_metal/metal_backend.h>
+
 #include <chrono>
 #include <cstring>
 #include <fstream>
@@ -117,6 +119,11 @@ void draws(Env& e) {
     BufferDesc cd{16, MemoryKind::shared, usage::indirect, "mesh count"};
     auto count = e.dev->create_buffer(cd);
     *static_cast<std::uint32_t*>(count->cpu_pointer()) = 1;
+    BufferDesc gd{64 * 1024, MemoryKind::shared, usage::unordered_access, "debug counters"};
+    auto dbg = e.dev->create_buffer(gd);
+    auto* dw = static_cast<std::uint32_t*>(dbg->cpu_pointer());
+    std::memset(dw, 0, 64 * 1024);
+    CHECK(gta6rt::metal::set_debug_buffer(e.dev, dbg.get()), "set_debug_buffer");
     for (int with_count = 1; with_count >= 0; --with_count) {
         l = e.dev->create_command_list(QueueType::direct);
         begin(e, *l, ms.get(), {0, 0, 1});
@@ -135,7 +142,15 @@ void draws(Env& e) {
                     with_count ? "count 1" : "no count buffer", blue,
                     (unsigned long long)(after.prepasses_hoisted - before.prepasses_hoisted));
         CHECK(blue == (with_count ? 256 : 512), "indirect mesh draw records");
+        std::printf("debug counters: calls %u (with a count %u, counts summed %u), records %u (within the count %u, "
+                    "with groups %u, past the limits %u), groups %u, first record %ux%ux%u\n",
+                    dw[5], dw[6], dw[7], dw[0], dw[1], dw[2], dw[3], dw[4], dw[32], dw[33], dw[34]);
+        CHECK(dw[5] == 1 && dw[6] == std::uint32_t(with_count) && dw[7] == std::uint32_t(with_count) && dw[0] == 2 &&
+                  dw[1] == (with_count ? 1u : 2u) && dw[2] == dw[1] && dw[3] == 0 && dw[4] == (with_count ? 4u : 12u),
+              "indirect pre-pass debug counters");
+        std::memset(dw, 0, 4096);
     }
+    gta6rt::metal::set_debug_buffer(e.dev, nullptr);
 }
 
 void refusals(Env& e) {

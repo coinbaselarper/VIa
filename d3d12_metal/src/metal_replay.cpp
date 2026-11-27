@@ -587,6 +587,68 @@ private:
         out_.set_user_data(0, user_data);
         out_.set_code_base(p.code_base);
     }
+    // The producer guard (MetalContext::guard_mode): a compute pass not recorded marks the buffer ranges its
+    // descriptor tables (any user-data word as a 32-bit table address, its first 16 descriptors decoded as V#s) and
+    // root pointers (a word pair resolving to a known buffer: from there to the buffer's end) name; when none, the
+    // indirect work after it in this list is skipped instead.
+    void producer_skipped(const char* name, Fate fate, const std::array<std::uint32_t, 32>& user_data) {
+        if (fate == Fate::compiling || fate == Fate::library_pending) context_.note_compute_not_ready();
+        if (MetalContext::guard_mode() != MetalContext::GuardMode::producers) return;
+        std::uint32_t tables = 0, pointers = 0;
+        for (std::uint32_t i = 0; i < 32; ++i) {
+            const std::uint64_t t = user_data[i] & ~3ull;
+            if (t < 0x10000) continue;
+            std::uint32_t words[64];
+            if (read_va(t, words, sizeof words))
+                for (int k = 0; k < 64; k += 4) {
+                    gfx10::BufferWords bw{words[k], words[k + 1], words[k + 2], words[k + 3]};
+                    gfx10::Buffer v{};
+                    if (!gfx10::decode(bw, v) || !v.num_records) continue;
+                    const std::uint64_t base = std::uint64_t(std::int64_t(v.address << 16) >> 16);
+                    const std::uint64_t bytes = v.stride ? std::uint64_t(v.stride) * v.num_records : v.num_records;
+                    if (!base || bytes > (1ull << 32) || !context_.knows_buffer_va(base)) continue;
+                    context_.note_unproduced(base, base + bytes, name, false);
+                    ++tables;
+                }
+            const std::uint64_t a = user_data[i] | (i + 1 < 32 ? std::uint64_t(user_data[i + 1]) << 32 : 0);
+            ResourceId id = 0;
+            std::uint64_t start = 0, size = 0;
+            if (context_.buffer_resource_at(a, 4, id, start, size, {})) {
+                context_.note_unproduced(a, start + size, name, true);
+                ++pointers;
+            }
+        }
+        context_.note_guard_pass(tables, pointers);
+        if (!tables && !pointers) list_unknown_producer_ = name ? name : "?";
+    }
+    Fate guard(ResourceId args, std::uint64_t args_offset, std::uint64_t args_bytes, ResourceId count,
+               std::uint64_t count_offset, const char*& why) {
+        switch (MetalContext::guard_mode()) {
+        case MetalContext::GuardMode::off: return Fate::recorded;
+        case MetalContext::GuardMode::window:
+            return context_.producers_settling() ? Fate::producer_not_ready : Fate::recorded;
+        case MetalContext::GuardMode::producers: break;
+        }
+        const auto unproduced = [&](ResourceId id, std::uint64_t offset, std::uint64_t bytes, bool& pointer) -> const char* {
+            const MetalBinding* b = id ? binding(id, false) : nullptr;
+            if (!b || !b->va) return nullptr;
+            return context_.unproduced(b->va + offset, b->va + offset + std::max<std::uint64_t>(bytes, 4), &pointer);
+        };
+        bool pointer = false;
+        const char* by = unproduced(args, args_offset, args_bytes, pointer);
+        if (!by && count) by = unproduced(count, count_offset, 4, pointer);
+        if (by) {
+            guard_why_ = std::string(pointer ? "a root pointer of " : "a table of ") + by;
+            why = guard_why_.c_str();
+            return Fate::producer_not_ready;
+        }
+        if (list_unknown_producer_) {
+            guard_why_ = std::string("earlier in the list, tables unknown: ") + list_unknown_producer_;
+            why = guard_why_.c_str();
+            return Fate::producer_not_ready;
+        }
+        return Fate::recorded;
+    }
     void record(const Dispatch& c) {
         auto& st = context_.stats();
         MetalComputePipeline p;
@@ -595,7 +657,7 @@ private:
         scene_dispatch(p.name, fate == Fate::recorded);
         if (const Fate f = fate; f != Fate::recorded) {
             st.dispatches_skipped.fetch_add(1, std::memory_order_relaxed);
-            if (f == Fate::compiling || f == Fate::library_pending) context_.note_compute_not_ready();
+            producer_skipped(p.name, f, c.user_data);
             context_.note_work(Work::dispatch, f, why);
             if (MetalContext::census_on()) context_.note_census(p.name, "dispatch-skipped");
             return;
@@ -617,8 +679,9 @@ private:
         const char* why = nullptr;
         Fate f = c.pipeline ? compute(c.pipeline, p, why) : Fate::pso_unknown;
         scene_dispatch(p.name, f == Fate::recorded);
-        if (f == Fate::compiling || f == Fate::library_pending) context_.note_compute_not_ready();
-        else if (f == Fate::recorded && context_.producers_settling()) f = Fate::producer_not_ready;
+        if (f != Fate::recorded) producer_skipped(p.name, f, c.user_data);
+        else f = guard(c.argument_buffer, c.argument_offset, std::uint64_t(c.stride) * c.max_count, c.count_buffer,
+                       c.count_offset, why);
         if (f != Fate::recorded) {
             st.dispatches_skipped.fetch_add(1, std::memory_order_relaxed);
             context_.note_work(Work::indirect_dispatch, f, why);
@@ -828,7 +891,9 @@ private:
         const char* why = nullptr;
         Fate f = graphics(draw, p, why);
         const Work work = work_of(draw, p, true);
-        if (f == Fate::recorded && context_.producers_settling()) f = Fate::producer_not_ready;
+        if (f == Fate::recorded)
+            f = guard(a.argument_buffer, a.argument_offset, std::uint64_t(a.stride) * a.max_count, a.count_buffer,
+                      a.count_offset, why);
         if (f == Fate::recorded && !p.mesh && work != Work::indirect_rect &&
             (draw.topology == gpu::topology::quad_list || draw.topology > gpu::topology::triangle_strip)) {
             unsupported("indirect quad-list or adjacency draw");
@@ -1120,6 +1185,8 @@ private:
     bool rt_dirty_ = true;
     gpu::ComputePipeline* bound_compute_ = nullptr;
     std::uint32_t event_depth_ = 0;
+    const char* list_unknown_producer_ = nullptr;
+    std::string guard_why_;
 };
 
 }  // namespace

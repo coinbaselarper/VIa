@@ -1,6 +1,7 @@
 #include "metal_shaders.h"
 
 #include <chrono>
+#include <climits>
 #include <cstdio>
 #include <cstdlib>
 #include <cerrno>
@@ -37,6 +38,22 @@ MetalShaders::MetalShaders(gpu::Device& device, Config config) : device_(device)
     else
         std::fprintf(stderr, "[rt] d3d12-metal: shader store not loaded (%s): every shader is built on demand\n",
                      error.empty() ? config_.manifest.c_str() : error.c_str());
+    for (const std::string& path : config_.overlays) {
+        gta6rt::shaderc_msl::Catalog o;
+        std::string why;
+        char a[PATH_MAX], b[PATH_MAX];
+        if (!catalog_loaded_ || !o.load(path, &why))
+            std::fprintf(stderr, "[rt] d3d12-metal: shader overlay %s NOT loaded: %s\n", path.c_str(),
+                         catalog_loaded_ ? why.c_str() : "no store");
+        else if (!::realpath(o.root().c_str(), a) || !::realpath(catalog_.root().c_str(), b) || std::strcmp(a, b))
+            std::fprintf(stderr, "[rt] d3d12-metal: shader overlay %s NOT loaded: its root %s is not the store's %s\n",
+                         path.c_str(), o.root().c_str(), catalog_.root().c_str());
+        else {
+            std::fprintf(stderr, "[rt] d3d12-metal: shader overlay: %zu rows from %s replace the store's\n", o.size(),
+                         path.c_str());
+            overlays_.push_back(std::move(o));
+        }
+    }
     if (!config_.store.empty()) ::mkdir(config_.store.c_str(), 0755);
     for (unsigned i = 0; i < std::max(1u, config_.builders); ++i) threads_.emplace_back([this] { builder(); });
 }
@@ -97,7 +114,7 @@ MetalShaders::Library MetalShaders::find(const std::string& name, const std::str
     const std::string job_key = variant.empty() ? name : name + "|" + variant;
     std::lock_guard lock(mutex_);
     if (catalog_loaded_ && variant.empty())
-        if (const auto* e = catalog_.find(name)) {
+        if (const auto* e = manifest_entry(name)) {
             ++stats_.store_hits;
             return load_locked(catalog_.library_path(*e), error);
         }

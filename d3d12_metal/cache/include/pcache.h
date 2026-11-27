@@ -84,6 +84,9 @@ std::string archive_version(const std::string& port_root, const std::string& cat
 
 // Opens the archive shards with this key in `directory` (all of them, read-only) and starts an in-memory shard for
 // new pipelines. A shard Metal cannot read is moved aside to <file>.unreadable by the backend. `log` gets one line.
+// Tiers: the shards of GTA6RT_METAL_ARCHIVE_TIERS (dirs separated by ':', or "off"; default <port>/build/pc7/arch-world
+// when it exists) are looked up too, read-only, and start() prebuilds their pcache-tier.txt (else pcache-manifest.txt).
+// GTA6RT_METAL_PCACHE_RELEASE_S (60): a prebuilt pipeline unused that long after its recorded first use is released.
 gpu::Status open_archive(gpu::Device& device, const std::string& directory, const std::string& version, bool load,
                          std::string* log);
 
