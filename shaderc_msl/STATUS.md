@@ -7,6 +7,132 @@ Host: M4 Pro, macOS 27.0.1, Metal compiler 32023.922 (`metal -c`), Homebrew `spi
 also as x86_64 under Rosetta). Numbers are measured in this module unless a spike is named. The machine was shared
 with other workers (load average 10-42 during this round); all timings below are loaded timings.
 
+## Round 15, speckle / correctness worker (2026-11-27 14:00-16:45): the speckle is two faults that both come before lighting — (A) the G-buffer fixup kernel `lib_cs_01107` re-encodes pixels whose stencil it misreads (1/16 of every surface, the sea, whole objects), (B) single-pixel sun-shadow drop-outs; refusing 01107 removes (A) (dots -35..-40%, turquoise sea, no horizon stripe) but blackens the true 2-G-buffer objects, so the fix belongs to the stencil plane on Metal (request filed); the four translator gaps are implemented and proven offline, none default
+
+Tree `port/build/speckle-x86_64` (binary `gta6rt.play1241` = the canonical 12:41 build, the same binary in every world
+run; private run dir; launcher `run_world.sh` / `ab_run.sh` under the post-panic rules: slot + tmem probe lock, cap
+14,848 / 13,312 with a heavy job, `GTA6RT_METAL_CB_ABORT_MS=2000`, first-GPU-error stop, 4 Hz wired stop 9,728 MiB,
+machine guard 15,360, gpuEvent count after each run and probe). Tools (new, mine): `tools/speckle_msl.py` (overlay
+rows, census, `--safe-math`), `tools/speckle_dots.py` (dot counter on scene-probe raws), probes `tools/speckle_atomic64.mm`,
+`speckle_early.mm`, `speckle_lod.mm` (binaries `build/speckle-x86_64/probe/gta6rt_speckle_*`, run through
+`tmem_slot.sh`); fork module `shaders_vk/translator-fork/tools/speckle_fix.py` + hooks in `rdna2spirv.py` behind
+`--image-atomic64`, `--cs-implicit-lod`, `--mesh-index-clamp` (`ORIGIN.md`). M = measured, I = inferred. Machine shared
+with four workers all along (load 4-11; their title runs, builds); my world runs often backed off on collisions.
+No shared source edited; nothing default; 0 failed command buffers in every run; gpuEvent-gta6rt 9 -> 10 during the
+round, the new report `gpuEvent-gta6rt_wrounds_p-2026-11-27-154134.ips` is the wave-rounds worker's probe, none mine.
+
+### 1. Where the dots come from (M unless marked)
+
+Method: scene-probe raws of one world frame (`GTA6RT_METAL_SCENE_RAW=1`: G-buffer targets at the upscaler, render targets
+after named passes, the composite = the upscaler's colour input at render resolution), `speckle_dots.py` (a texel
+darker than 0.25 x the median of its 8 neighbours while the second-darkest neighbour is not dark), G-buffer signatures
+per pixel. Earlier this round (spk-a..e, 14:42 note): single render-resolution texels, at the same positions frame to
+frame, already in the lit colour after TiledLighting, not made by MetalFX; no x/y period 2..16 and no checkerboard
+parity ((x+y) even 536 / odd 498 in the left-house roof box).
+
+On the roof in spk-f4 frame 20 (box 450..540 x 218..245, 2,430 texels, 112 dark dots) there are two kinds:
+
+- **(A) 51 dots are G-buffer corruption with one signature, "material 5", at the roof's own depth.** The roof writes RT0
+  alpha 0 and RT3 (112, 0, 173, 3); 176 isolated roof pixels hold RT0 alpha 5 (= 5/255), RT3 (128, 0, 255, 255), RT2
+  rgb 24, RT1 red 0, with the roof's albedo and depth (119 of 176 within 0.1% of the neighbours' depth). Over the lower
+  frame such pixels are 4-8% of every surface (80x60 blocks), up to 44-68% in a few blocks.
+  **Writer: `library/lib_cs_01107` = `deferred_to_gbuffer_fill:CS_2GBufFixupAndClearTemp`** (velocity twin `01108`): for
+  each pixel it loads the stencil (`image_load dmask:0x2` of the T# at table +0x40), and where `stencil & 0x17 == 3`
+  (the console's compact "2-G-buffer" pixels) it re-encodes the G-buffer and writes alpha 5/255
+  (`v_cndmask_b32 v19, 0, 0x3ca0a0a1`); it is the only world kernel with that test. A random byte passes it with
+  probability 1/16 = 6.25%, the background density measured. spk-h4 (no change; RTs dumped right after the main G-buffer
+  pass `%PS_DeferredTextured_942fcba4~9`, which follows 01107 in the frame): 52,076 material-5 pixels, and in the
+  lower-left sea, which no G-buffer draw had touched yet, RT0 is non-zero **only** at material-5 pixels, 5-6% of them.
+- **(B) 61 dots have a G-buffer identical to their neighbours** (all RTs within 8 of both horizontal neighbours, same
+  depth): sky-lit only, colour ~(1.8, 3.1, 5.5) against ~10x that around them, i.e. the sun term is 0: single-pixel
+  drop-outs in the shadow mask. 655 such dots frame-wide, no position pattern (x%8, y%8, (x%2, y%2) flat). The frame's
+  shadow-mask chain: `02016` GenerateShadowMasks_HairOnly, `02017` GenerateShadowMasks_Checkerboard_NoHair (wave32),
+  `21482` TraceShadowRays_Checkerboard (wave32, `image_bvh_intersect_ray`), `02028` DenoiseShadowMaskLDSPacked, `03008`
+  ShadowMaskPrune. Two of them read the same per-pixel stencil class before shading (`02017`: `(s & 7) == 4`; `21482`:
+  `(s & 7) == 5`, `(s & 3) == 1`), so a misread stencil also explains (B) (I). Not the cause of (B), as far as one run
+  each shows: refusing the RT tracer `21482` (spk-h1, roof dots remain) and compiling the 9 shadow-chain kernels
+  without fast math (spk-h3, roof still speckled; the store compiles with Metal's default fast math).
+
+### 2. The fixup kernel refused (spk-h6: `GTA6RT_METAL_REFUSE_CS=library/lib_cs_01107,library/lib_cs_01108`, same binary and launcher as spk-g0)
+
+- Dots (composite, frames 15 / 20): whole frame 0.41% / 0.39% against 0.63% / 0.60% in g0; left-house roof box 2.7% /
+  2.9% against 4.9% / 4.7%: -35..-40%, the size of kind (A) on the f4 roof (51 of 112). Kind (B) stays.
+- Same view (camera a few frames apart): the sea is turquoise instead of flat white-grey, the magenta stripe at the
+  horizon is gone, the left house's walls are white instead of black — and the right house, light blue in g0 (and in
+  f0/f4/g6), is black. So 01107 does needed work on true 2-G-buffer objects (the right house) and corrupts the rest (the
+  left house, the sea, 1/16 of every surface): the stencil it reads is right in some places and wrong in others.
+  **Refusing the kernel is a diagnostic, not a fix.** PNGs (keep):
+  `/Users/a/Desktop/Projects/GTA-VI/port/build/speckle-x86_64/evidence/fixup-refused-composite-g0-vs-h6.png`
+  (render-resolution composites of frame 15, g0 left, h6 right; still wrong on the right: the black right house, kind
+  (B) dots, the dark blocks of the visible-faults list) and
+  `/Users/a/Desktop/Projects/GTA-VI/port/build/speckle-x86_64/evidence/fixup-refused-presented-g0-vs-h6.png` (presented
+  frames of both runs; the camera is further along in h6).
+- Why the stencil is misread (M: every world run's log): "Xbox depth/stencil UAV planes are not implemented on Metal;
+  format 19 / 45 / 53" and "a title-placed depth-stencil texture is made without unordered access; format 53 / 19 / 118
+  / 39": the title's depth-stencil targets (R32G8X24 family = DXGI 19, the D32S8 the frame uses) are created with
+  unordered access on the console, and the Metal layer makes them without (`Resource::enable_depth_stencil_uav` returns
+  E_NOTIMPL; the Vulkan path has a provider). 01107's descriptors, captured in the world (spk-h5,
+  `GTA6RT_METAL_CS_CAPTURE`, decoded with `tools/speckle_capt.py`; `build/speckle-x86_64/evidence/lib_cs_01107-tsharps.txt`):
+  table +0x20 = the depth, T# format 146 (X24_8_32_FLOAT), dst_sel (X,0,0,1); table +0x40 = **the stencil, T# format 5
+  (8_UINT), dst_sel (0,X,0,1), 1280x720, at the same address 0x108231800**. In the code (which path this T# takes is not
+  logged, I): the Metal layer has a stencil view only for D3D12 SRVs (plane 1, G channel); a title T# goes through
+  `bind_title_image`, which refuses depth/stencil formats and views of another element size, and T#s with no image get
+  a texture over their title memory (`make_orphan_textures`, `dxgi_of_gfx10(5)` = R8_UINT).
+  I: the stencil byte 01107 reads is not the Metal depth texture's stencil (which the layer's draws write) but bytes the
+  GPU does not keep current, coherent in some regions and noise in others, as measured. About 256 world shaders (243
+  PS, 12 CS) test bit fields of such a `.y` read (`dmask:0x2`, then `and`/`bfe`), most of them likely this stencil (I).
+  Request to the device-shim owner filed (requests file, this round).
+
+### 3. The four translator gaps
+
+| fix | offline proof (M) | world shaders touched (census, `speckle_msl.py census`) | rows (not default) | in the world (same binary) |
+|---|---|---|---|---|
+| (a) exact 64-bit image atomics (fork `--image-atomic64` -> MSL pass `atomic64_texture`: `texture2d<ulong>::atomic_max/min` on the same RG32Uint descriptor, high dword decides; only found descriptors of format 32_32_UINT) | native 64-bit texture atomics on this GPU: compute (direct and argument table) and fragment (argument table), with and without `MTLTextureUsageShaderAtomic`: 0 of 65,536 texels differ from the exact 64-bit max (a low-dword max picks another key in 64,523) — `probe/atomic64.out` | 4 kernels with two-VGPR image atomics: alpha prepasses `!PS_AlphaPrepass_26a320a2~17`, `eb34a03f~33`, `CS_VisHair` (`lib_cs_02228`), and `lib_cs_03408` (3D, not lowered) | `a64` 3 rows (`a64ps` 2 PS, `a64cs` 1), 3 pipelines prebuilt | no verdict: spk-f3 (3 rows) had the broken scene state (section 4), spk-g5 (2 PS rows) never left game state 2 (200 s watchdog). Today the keys go to the 1x1 r32ui fallback (an RG32Uint UAV has no r32ui view): hair visibility / alpha-velocity keys are never written on Metal. Not the speckle (the alpha prepass runs after lighting). |
+| (b) early fragment tests (MSL pass `early_fragment_tests` on PS rows whose FSSM `DB_SHADER_CONTROL` has DEPTH_BEFORE_SHADER, bit 12, and no Z export) | stencil and depth tests with a UAV-writing fragment function: without the attribute the UAV is written at 262,144 of 262,144 pixels (131,072 where the test fails), with it at the 131,072 passing ones — `probe/early.out` | 393 PS have the bit without Z export; 148 write UAVs (121 TiledWeathering, 6 TexturedDeferred, the alpha prepasses, water/mirror/portal resolves, ...), only those can change; 14 of the 148 also KILL_ENABLE | `ed` 150 rows (283 pipelines), split `edw` 128 (TiledWeathering) / `edo` 22 | spk-f1 (all 150): a magenta band over water and horizon (harmful; an `edo` row, I); spk-f4 (`edw`): no band, dots unchanged; spk-g4 (`edw`): broken scene state. **Not proposed**; TiledWeathering is not the speckle source (skipping it, spk-f2, leaves the dots). |
+| (c) implicit-LOD samples in compute (fork `--cs-implicit-lod`: coarse quad gradients lane1-lane0 / lane2-lane0, x 2^bias, instead of LOD 0) | `speckle_lod.mm` (lanes 4k..4k+3 = one 2x2 quad, against a fragment shader's implicit LOD, 256x256, nearest mips): affine maps, biases 0 / +1 / -1.5: 0 of 65,536 pixels differ (coarse and fine); quadratic maps: 11-27% differ by exactly one level, 0 by more, coarse within 0.5% of fine (Metal's gradient path rounds LOD near level boundaries differently from its implicit path); LOD 0 (the store) differs at 99.8-100% — `probe/lod.out` | 303 compute kernels, 763 implicit-LOD sample instructions; 282 are `CS_RaytracingResolve` material kernels (lanes are rays, left at LOD 0); 21 others | `lod` 21 rows (indirect_light_probes x7, ProjDecalResolve 03136/03137, DummyResolve, ...), 21 pipelines | spk-g6: roof dots 2.7-3.1% vs 4.5-4.9% (g0), frame 0.49-0.69% vs 0.59-0.63%, but trees had streamed in (other scene state): no verdict. |
+| (d) mesh primitive index clamp (fork `--mesh-index-clamp`: three indices clamped below the vertex count; no vertices, no primitives) | mesh probe on `_MS_VS_TransformD_c5fd36bb~23`, 2,048 groups, zero and foliage inputs: 0 differing output words, time within noise — `mclamp.log` | every hw mesh epilogue: 404 world mesh shaders | none (it changes nothing on in-range data; build only with a fault to fix) | none |
+
+### 4. World runs (all the canonical 12:41 binary, tiers `pc7/arch-world:speckle-x86_64/arch`, my overlay before the 7 defaults)
+
+| run | change | ended | dots, whole frame / roof box | note |
+|---|---|---|---|---|
+| spk-f0 | none | footprint cap 13,312 (heavy job) | 0.47% / 4.46% | f reference |
+| spk-f1 | `ed` 150 early-depth rows | cap | 1.33% / 3.37% | magenta band over water/horizon |
+| spk-f2 | skip TiledWeathering (diag.) | cap | 0.58% / 4.56% | dots unchanged |
+| spk-f3 | `a64` 3 rows | cap 14,848 | 0.07% / 0.06% | broken scene state: not comparable |
+| spk-f4 | `edw` 128 rows | cap | 0.77% / 3.58% | G-buffer raws: section 1 |
+| spk-g0 | none | wired 9,734 | 0.59-0.63% / 4.5-4.9% (frames 15-30) | g/h reference |
+| spk-g4 | `edw` | wired | 0.05-0.09% / 0.01-0.08% | broken scene state |
+| spk-g5 | `a64ps` 2 rows | 200 s watchdog | - | never left game state 2 |
+| spk-g6 | `lod` 21 rows | wired | 0.49-0.69% / 2.7-3.1% | other scene state (trees) |
+| spk-h1 | refuse `lib_cs_21482` (diag.) | cap | 0.20-0.22% / 2.4-2.6% | very different exposure; roof dots remain |
+| spk-h4 | none; RTs after the main G-buffer pass | wired | - | broken scene state; material-5 evidence |
+| spk-h6 | refuse `01107`/`01108` (diag.) | wired | 0.39-0.41% / 2.7-2.9% | section 2 |
+| spk-h5 | refuse the hair resolve (`01238`-`01246`, diag.) + capture of 01107 | footprint cap 14,848 before the world (the capture's 152 MiB) | - | capture: section 2 |
+| spk-h3 | `smsafe` 9 shadow-chain rows (`01090` `01094` `02011` `02016` `02017` `02021` `02028` `03008` `21482`), `-fno-fast-math` (diag.) | wired 9,786 | 0.22% / 3.0% (frame 15), 0.36% / 3.1% (20) | roof still speckled; a tree covers part of the box (as in g6) and the right of the frame is washed out: no clear effect, fast math is not shown to cause (B) |
+
+**Broken scene state (for the lead / visible-faults worker):** in 3 of the 11 f/g/h runs that reached the world (f3, g4,
+h4; h4 had no change at all; same binary) the frame at world+5..15 s is another state: most of the houses and props are missing from the
+G-buffer (RT0 27% covered after the main G-buffer pass in h4 against ~75% otherwise), the sea/sky reflection fills the
+frame, a magenta stripe at the horizon. One run per variant cannot be compared while this happens; it is not caused by
+any of my rows.
+
+### 5. Deliverables, commands, what is not done
+
+- Fork flags (off unless given; only under `--wave64-emulate`; without them the fork writes the corpus byte for byte):
+  `--image-atomic64`, `--cs-implicit-lod`, `--mesh-index-clamp`. MSL passes (`speckle_msl.py`): `atomic64_texture`
+  (refuses a library with a marker left), `early_fragment_tests` (refuses a depth output), `--safe-math` (diagnostic,
+  `-fno-fast-math`). `speckle_msl.py rows OUT NAME... [--spv FORK_SPV_DIR] [--atomic64] [--early-depth] [--cs-lod]
+  [--mesh-clamp] [--safe-math]`; `speckle_msl.py census`.
+- Overlays (none default; pipelines in `build/speckle-x86_64/arch`, listed after `pc7/arch-world` in
+  `GTA6RT_METAL_ARCHIVE_TIERS`; catalogs `catalog-*.tsv`, manifests `prebuild-*.manifest.txt`): `a64` 3, `a64ps` 2,
+  `a64cs` 1, `a64ed` 2, `ed` 150, `edw` 128, `edo` 22, `lod` 21, `smsafe` 9, `all` 173.
+- A/B: `build/speckle-x86_64/ab_run.sh NAME OVERLAY|- [ENV=...]` (same binary, overlay first, composite raws of frames
+  15/20(/25/30), upscaler probe); numbers: `cmp_multi.sh RUN...`.
+- Not done: no fix for (A)/(B) in my files (the stencil plane is the layer's: request filed); no world verdict for
+  (a)-(c) (single runs, broken scene state); no rows for (d); the edo row that makes the magenta band in f1 is not
+  isolated.
+
 ## Round 15, wave-rounds worker (2026-11-27 14:05-16:05): exchange census by cause; read-alone/uniform first-lane reads, gated and fall-through votes, in-half shuffles and SGPR spill lanes in the fork; 19 mesh rows bit-identical offline; in the world the 19 rows take 25-26% off their geometry (the round-14 rows and mine alike: my increment is not measurable there); the round-14 boot stalls were not the rows; pairwise rendezvous terminates but costs 2x a barrier (not used); console-heap T# table specified, shader side behind a flag
 
 Tree `port/build/wrounds-x86_64` (binary `gta6rt` = `gta6rt.play1241`, the canonical 12:41 build, the same binary in every

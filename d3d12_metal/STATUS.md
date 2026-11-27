@@ -1,5 +1,98 @@
 # port/d3d12_metal status (round 7)
 
+## Round 15, visible-faults worker (2026-11-27 14:10-17:05): the dark blocks / sawtooth / pale rectangle are NOT the hair copy (measured) but are already in the pre-upscale colour; the "T# view refused" class is the 2D storage index range (4,096) running full; minimap, water and albedo not fixed; no before/after from the hand-over view
+
+Tree `build/vfx-x86_64` (kept: `gta6rt.b6` = live sources of 15:57 + the bindless line below, the binary of the A/B
+pair; `gta6rt.b9` = b6 + two opt-in diagnostics since removed again), launcher `run_world2.sh` (the S4 settings, cap
+14,848 / 13,312, CB abort 2000, fault_stop, 4 Hz wired stop 9,728, machine guard 15,360, tmem probe lock, a per-run
+binary copy, waits for machine wired < 4,200 MiB before starting), `tpair.sh` (scene probe + draw trace), `tlite.sh`
+(presents only). Runs vfx-t0..t21. **0 failed command buffers, 0 GPU page faults.** gpuEvent-gta6rt 10 before and
+after every run (the 10th, `gpuEvent-gta6rt_wrounds_p-...-154134.ips`, is the wave-rounds probe's at 15:41).
+**Incidents:** (1) t0 and t2 ran AT THE SAME TIME for 59 s before the world (my second queue did not wait, and both
+launchers copied to one path so neither saw the other); both ended on the machine guard (wired 8,280 + compressor
+7,094 MiB), no GPU error. Fixed in my launcher (per-run copy path). (2) t10 ended at world+6 s on SIGABRT `mutex lock
+failed: Invalid argument` in port/metal `MetalDescriptorHeap::residency_for_submit` from `Encoder::close_command_buffer`
+on the release thread (a descriptor heap used after it was destroyed; first time seen; log
+`run/logs/vfx-t10-crash.log`); not reproduced in 11 later runs; not my code (b8 differed from b6 by log lines only).
+**Every world run ended 12-75 s into the world on the 4 Hz machine-wired stop** (9,730-9,897 MiB; 2.8-3.4 GiB before
+the game), i.e. before the hand-over (world+57-105 s): **no frame of the hand-over view on the deck exists from my
+runs, so the requested before/after pair from that camera was not produced.** All frames below are the pre-hand-over
+stilt-house view at world+10..50 s. M = measured, I = inferred; load 3-11 at run starts.
+
+### 1. Dark block, sawtooth, pale rectangle (M)
+
+- My predecessor's attribution to `PS_HairCopy` (14:58 note) is wrong. The hair tile list the copy and the blur draw
+  (s8+0 V#, read back in vfx-t12) holds 12-19 tiles of 16 px at 1280x720 around the head ((43..47, 17..20) of the
+  80x45 grid, `0x0011002b`...), the VS constants are 1280x720, so both draws cover small tiles only. With
+  `GTA6RT_METAL_SKIP_DRAWS=PS_HairCopy` (t15) the blocks are unchanged against t16 (same binary, no skip):
+  `/Users/a/Desktop/Projects/GTA-VI/port/run/present/vfx-t15-haircopy-skipped-blocks-remain.png`,
+  `/Users/a/Desktop/Projects/GTA-VI/port/run/present/vfx-t16-haircopy-on-same-blocks.png` (same faults in both).
+- **The block and the sawtooth are already in the 1280x720 scene colour before the upscaler** (t17 per-pass dumps,
+  `/Users/a/Desktop/Projects/GTA-VI/port/run/present/vfx-t17-colour-before-upscale-block-and-sawtooth.png`, after
+  `PS_DistantLights`; top-left block [0,512)x[168,336) mean 6.3 against 22.9 elsewhere, 50% zero). They appear between
+  `PS_ResolveDeferred_*` (pass 1423, block 83% zero but so is most of the frame) and `PS_DistantLights` (1689); between
+  them run only compute (scattering/volumetrics 019xx, sr_tracing 028xx, `CS_ApplyCombinedDeferred` lib_cs_01976, sky
+  `CS_SkyMain` 02099) and moon/stars. Refusing `lib_cs_01976` (t20) leaves every surface below the horizon black, so the
+  lit geometry comes from that compute composite; refusing the sr denoiser 02909 (t19) leaves the sawtooth.
+- **`TiledLighting` writes nothing** (t17: after the 180 indirect rect-list draws of pass 1227 f10 is 0.0% non-zero,
+  rt1 0.2%; `SSSResolve`, also indirect rect-list, then writes 11.3%). Lighting owner: worth a draw trace of its
+  rect-list counts (my `GTA6RT_METAL_INDIRECT_ARGS_DUMP` does not see rect-list draws: they return before it).
+- Inferred, not proven: the tile-shaped regions are tiles a tiled compute pass (ApplyCombinedDeferred or one of its
+  inputs) does not write, so they keep another aliased target's bytes (content of another view, hard tile edges).
+  Next: per-dispatch dumps (the scene probe dumps after draws only) of f10 around 01976/02099.
+- Not caused by T# resource choice: an opt-in census of every T# and slot-70 view of at least 640x360 (t9, t10, t13)
+  found 0 addresses with more than one placement of the same size, so no aliasing ambiguity there (removed again).
+
+### 2. "T# view refused" / "no view for the T#'s format or range": the 2D storage index range is full (M)
+
+- 35,473 refusals in vfx-snap1c are not format mismatches (T# format 20 on DXGI 42, 11 on 57, 5 on 62, 15 on 51,
+  13 on 54, 56 on 28 are the same formats). They are storage-capable textures (render targets / UAVs) whose bindless
+  index must lie below the storage count, 4,096: `a bindless image array is full; dimension 0` at world+41 s (t1),
+  and the 1D array (4,096, sampled and storage) full before world entry. New line every 10 s (device shim, default):
+  `bindless: N images live, M refused (an index array was full)`: t3 (off) 2,090 refused on the first line after the array
+  filled, 109,752 by world+49 s (refusals are retries every refresh, not distinct T#s); t5 35,423.
+- Same binary b6, `GTA6RT_METAL_BINDLESS_WIDE=1 GTA6RT_METAL_VIEW_SHARE=1 GTA6RT_METAL_TSHARP_TWINS=1` (my
+  predecessor's switches): **0 refused** (t4/t6/t8: 34,881 images live, 5,596 T#s took a shared view), "no view"
+  15,915 -> 202 a 10 s window (t7 -> t8). Format twins are a small class (10-11 made, 13-14 binds, t6/t8).
+- Presented frames t7 (off) / t8 (on) are of different moments of the same view; both show the blocks, sawtooth and
+  dark tiles; no visible difference attributable to the switches was established, so **nothing is default-on**.
+  Proposal: make WIDE + SHARE default after one same-camera pair (I expect them to matter for post-process inputs read
+  after world+40 s and for every 1D T#).
+- `GTA6RT_METAL_TSHARP_PLACEMENT_FORMAT` (a format-preferring pick among same-address placements): 0 picks in t1, removed.
+
+### 3. Minimap, water, albedo (not fixed)
+
+- **Minimap (offline + logs):** drawn by mesh pipelines `(MSNC_VS_TransformUnlit_65e26d92` + `PS_MinimapDraw_65e26d92`
+  and `(MSNC_VS_TransformUnlit_1c76317a` + `%PS_MinimapWaterDraw_1c76317a` (vector shapes, colours from constant data,
+  no textures; 2 BGRA8 targets + D32S8), plus `!VS_TransformMap`/`PS_MapBGSheen` (made, in the tier). The mesh shaders
+  are in the store (route hw) but in no tier (`build/pc7/arch-world/pcache-tier.txt` has none), so they compile at first
+  use; the skip census of snap1c after the hand-over shows no skipped mesh draw except split64 TG-memory (5/frame) and
+  conservative raster (1/frame). Whether the minimap draws run and what the HUD samples was not measured: no run of
+  mine reached the HUD.
+- **Water:** `PS_ResolveWaterSurface` (360 vertices = 60 tiles, indirect) leaves both targets 0.0% non-zero (t8 dump).
+  Its 40+ T#s sit at s8+0x300..0x12e0 (my table trace covered 0x20-0xc0); not traced further.
+- **Albedo:** the "format" T#-made skips (223 in snap1c) are not textures (GFX10 formats 0/34/47/496 on 1x1/4x1 T#s
+  with words like `7f003e03 ff003400 00000000 87fc0001`): resolved as nothing to do. Black-albedo shares by run vary
+  with streaming time (t3-t8: 5.7-57% of the frame at different moments), so no on/off albedo effect was measurable;
+  WIDE/SHARE do not touch sampled-only 2D textures (that range never filled: ~40k of 65,536 live).
+
+### Files (shared, this round)
+
+- `shims/d3d12_metal_device.cpp`: one line every 10 s in the title-texture refresh census (`bindless: ... refused`).
+  Everything else I added there was removed again (placement switch, two ambiguity censuses).
+- Unchanged from my predecessor and still opt-in: `GTA6RT_METAL_TSHARP_TWINS`, `GTA6RT_METAL_VIEW_SHARE`,
+  `GTA6RT_METAL_BINDLESS_WIDE` (`src/metal_bindless.cpp`), `GTA6RT_METAL_INDIRECT_ARGS_DUMP` (`src/metal_replay.cpp`),
+  `GTA6RT_METAL_WORLD_PRESENT_DUMP`'s 4th field (`src/metal_present.cpp`; dumps only while a scene probe exists, e.g.
+  `GTA6RT_METAL_SCENE_LOG=1`).
+
+### Next (ranked)
+
+1. Per-dispatch colour dumps around `CS_ApplyCombinedDeferred` / `CS_SkyMain` for the tile block; why `TiledLighting`
+   writes nothing (its rect-list indirect counts).
+2. A same-camera pair for WIDE + SHARE, then default-on.
+3. Water: trace `PS_ResolveWaterSurface`'s T#s (s8+0x300..0x12e0) and its tile list; minimap: a run that reaches the HUD
+   (needs the machine-wired stop not to end runs at world+50 s).
+
 ## Round 15, submission-CPU worker (2026-11-27 14:10-16:20): CPU-only ceiling 3.9 -> 4.65 fps at the new defaults (within run-to-run spread); the resolve skip made the shadow copies 7x slower and is now off; the zero-copy pool mirror cuts shadows to 0.5 ms but draws a black world; CreatePlacedView's title threads -40% CPU
 
 Tree `build/subcpu-x86_64` (attach.cmake super-build), binaries kept `gta6rt.b5` (15:31 sources) and `gta6rt.b6` (16:05:
