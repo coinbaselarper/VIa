@@ -31,10 +31,34 @@ gpu::DescriptorKind kind_of(std::uint32_t binding) {
     return gpu::DescriptorKind::texture;
 }
 
+// GTA6RT_METAL_TABLE_HASH=fnv1a (default) | fnv1a_fmix32: the hash the table places keys with. Every module the store
+// and its overlays hand out must probe with the same kind (shaderc_msl `--hash-kind`, d3d12_metal/tools/rehash_world.sh);
+// the Metal store of round 14 is all bare FNV-1a.
+DescriptorHashKind table_hash_kind() {
+    const char* v = std::getenv("GTA6RT_METAL_TABLE_HASH");
+    const std::string k = v ? v : "";
+    if (k.empty() || k == "fnv1a") return DescriptorHashKind::fnv1a;
+    if (k == "fnv1a_fmix32" || k == "fmix32") {
+        std::fprintf(stderr, "[rt] d3d12-metal: descriptor hash table: fnv1a_fmix32 (GTA6RT_METAL_TABLE_HASH)\n");
+        return DescriptorHashKind::fnv1a_fmix32;
+    }
+    std::fprintf(stderr, "[rt] d3d12-metal: GTA6RT_METAL_TABLE_HASH=%s is not a hash kind (fnv1a, fnv1a_fmix32)\n", v);
+    std::abort();
+}
+
 }  // namespace
 
-MetalBindless::MetalBindless(gpu::Device& device, MetalContext& context) : device_(device), context_(context) {
+MetalBindless::MetalBindless(gpu::Device& device, MetalContext& context)
+    : device_(device), context_(context), table_(16, table_hash_kind()) {
     counts_ = kCounts;
+    // GTA6RT_METAL_BINDLESS_WIDE=1 (off by default): the 1D bindings and the 2D storage bindings get the 2D sampled
+    // count. A 2D index with a storage view must lie below the storage count, so 4,096 title UAV T#s filled the 2D
+    // index space for them about 40 s into the world, and 4,096 1D T#s filled the 1D one before it.
+    if (const char* v = std::getenv("GTA6RT_METAL_BINDLESS_WIDE"); v && std::strcmp(v, "0") != 0) {
+        for (const std::uint32_t b : {4u, 5u, 8u, 9u, 10u, 17u, 18u, 19u}) counts_[b] = kCounts[0];
+        std::fprintf(stderr, "[rt] d3d12-metal: bindless 1D and 2D storage bindings widened to %u entries "
+                             "(GTA6RT_METAL_BINDLESS_WIDE)\n", kCounts[0]);
+    }
     for (std::uint32_t b = 0; b < bindless::binding_count; ++b) {
         if (b == bindless::table_binding) continue;
         gpu::DescriptorHeapDesc d;
@@ -193,14 +217,16 @@ void MetalBindless::remove_sampler(std::uint32_t index) {
     sampler_used_[index] = 0;
 }
 
-// GTA6RT_METAL_TABLE_CLUSTER_CAP_MB (default 0: off): once the table is that large, a key whose 8 probe slots are all
-// taken (no relocation possible) is refused instead of doubling the table, when the table is under 1/8 full. The
-// shaders' bare FNV-1a keeps keys that differ only in high bits on one home slot at any table size below 2^(that bit),
-// so such clusters, not load, grow it: 30,488 keys in 4,194,304 slots (160 MiB a generation) in ten-a.
+// GTA6RT_METAL_TABLE_CLUSTER_CAP_MB (default 160 since round 15 with bare FNV-1a, 0 with fnv1a_fmix32; 0: off): once
+// the table is that large, a key whose 8 probe slots are all taken (no relocation possible) is refused instead of
+// doubling the table, when the table is under 1/8 full. The shaders' bare FNV-1a keeps keys that differ only in high
+// bits on one home slot at any table size below 2^(that bit), so such clusters, not load, grow it: 30,488 keys in
+// 4,194,304 slots (160 MiB a generation) in ten-a; ten-final's doubling to 320 MiB ended it on the footprint cap.
 bool MetalBindless::cluster_refused(const DescriptorKey& key) {
-    static const std::uint64_t cap = [] {
+    static const std::uint64_t cap = [this] {
         const char* v = std::getenv("GTA6RT_METAL_TABLE_CLUSTER_CAP_MB");
-        return std::uint64_t(v && *v ? std::strtoull(v, nullptr, 10) : 0) << 20;
+        if (v && *v) return std::uint64_t(std::strtoull(v, nullptr, 10)) << 20;
+        return table_.hash_kind() == DescriptorHashKind::fnv1a ? std::uint64_t(160) << 20 : 0;
     }();
     if (!cap || table_.size_bytes() < cap) return false;
     const std::size_t capacity = table_.capacity();

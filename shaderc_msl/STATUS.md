@@ -7,6 +7,218 @@ Host: M4 Pro, macOS 27.0.1, Metal compiler 32023.922 (`metal -c`), Homebrew `spi
 also as x86_64 under Rosetta). Numbers are measured in this module unless a spike is named. The machine was shared
 with other workers (load average 10-42 during this round); all timings below are loaded timings.
 
+## Round 15, wave-rounds worker (2026-11-27 14:05-16:05): exchange census by cause; read-alone/uniform first-lane reads, gated and fall-through votes, in-half shuffles and SGPR spill lanes in the fork; 19 mesh rows bit-identical offline; in the world the 19 rows take 25-26% off their geometry (the round-14 rows and mine alike: my increment is not measurable there); the round-14 boot stalls were not the rows; pairwise rendezvous terminates but costs 2x a barrier (not used); console-heap T# table specified, shader side behind a flag
+
+Tree `port/build/wrounds-x86_64` (binary `gta6rt` = `gta6rt.play1241`, the canonical 12:41 build, the same binary in every
+world run below), fork module `shaders_vk/translator-fork/tools/wround_halves.py` (+ `wround_census.py`), tools
+`shaderc_msl/tools/wrounds*.py`, `wrounds_meet.mm`, `wrounds_lanemap.mm`. No shared source edited, nothing default.
+M = measured, I = inferred. This round was worked by two sessions of this worker (the first ended at ~15:30 with its
+batches still queued; the second collected them). Load 4-8 at every run start; other workers' world runs, builds and
+probes shared the machine all along.
+
+**Safety.** World runs wr-a..wr-d (one at a time, slot + probe lock, hidden window, no audio, private run dir and saves,
+cap 14,848 with no heavy job else 13,312, `GTA6RT_METAL_CB_ABORT_MS=2000`, fault_stop, 4 Hz wired stop 9,728 MiB, machine
+guard wired + compressor 15,360 MiB added at 15:40): 0 failed command buffers, 0 GPU page faults. **One offline GPU
+error:** gpuEvent-gta6rt_wrounds_p 15:41:34 (count 9 -> 10), `kIOGPUCommandBufferCallbackErrorHang` in a mesh probe job
+of the **shipped** row of `2MS_VS_TransformTerrainNormalTint_e74ae427_Wrapped~11` (corpus translation + mspeed passes,
+not a fork variant) on the foliage input `fol_a` (a heap built for another shader); the job was not repeated and that
+shader/input pair is excluded from my batches. No gpuEvent after it (10 before and after wr-c, wr-d and every later probe).
+
+### 1. Census: exchange points by cause, weighted by measured frame cost (M, static; `wrounds_census_sum.py`)
+
+Every exchange the fork's emulation emits (a scheduler round, or an inline barrier in structured code), counted per
+instruction and emulation path by `translator-fork/tools/wround_census.py` (wraps the translator's `main`, output
+unchanged) over the world's 404 mesh shaders (the mspeed list) and the 54 compute kernels of
+`build/cspeed-x86_64/notes/cs-b-table.md`. Cells: static points / frame ms attributed (each shader's measured ms a frame
+split by its share of points; mesh: geometry ms a frame of the single-pipeline segments in wr-a, defaults, 15 windows;
+compute: the cs-b table's ms a frame, per-dispatch timer, so inflated). Pixel shaders: no emulated rounds (round 14).
+
+| set (flags) | rfl | readlane | exec/vcc branch votes | SCC votes, masks as data | ds_swizzle | DPP | permlane(x)16 | memory-order rounds | s_barrier | all |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| mesh, corpus | 3,517 / 16.6 | 2 / 0.0 | 4,415 / 20.3 | 44 / 0.5 | 165 / 0.0 | 4 / 0.0 | 2 / 0.0 | - | 808 / 1.7 | 8,957 / 39.0 |
+| mesh, fold + tail (sstruct) | 2,883 / 8.4 | 2 | 4,237 / 27.7 | 44 / 0.9 | 165 | 4 | 2 | - | 808 / 2.0 | 8,145 / 39.0 |
+| mesh, + `--uniform-votes` (sstruct) | 1,361 / 4.9 | 2 | 3,886 / 30.6 | 44 / 1.0 | 165 | 4 | 2 | - | 808 / 2.6 | 6,272 / 39.0 |
+| mesh, + `--wave-rounds --half-shuffle` | 1,049 / 4.8 | 2 | 2,539 / 29.3 | 44 / 1.4 | - | - | - | - | 808 / 3.5 | 4,442 / 39.0 |
+| compute, corpus = fold + tail | 296 / 3.3 | 597 / 16.0 | 663 / 18.8 | 111 / 5.1 | - | 144 / 3.3 | 66 / 1.5 | 271 / 13.1 | 31 / 1.3 | 2,180 / 62.4 |
+| compute, + `--wave-rounds --half-shuffle` | 271 / 2.6 | 597 / 18.1 | 534 / 16.7 | 106 / 3.6 | - | - | - | 300 / 19.5 | 31 / 1.8 | 1,840 / 62.4 |
+| compute, + `--spill-lanes` (new) | 271 / 3.0 | **279** / 12.8 | 534 / 21.0 | 106 / 4.0 | - | - | - | 300 / 19.7 | 31 / 1.8 | **1,522** / 62.4 |
+
+- Mesh: the cost is first-lane reads and branch votes; DPP / swizzle / bpermute / permlane are rare and sit in cheap
+  shaders (165 swizzle points, 0.0 ms). The 808 s_barrier points are the epilogue's 2 per shader. What is left after
+  every flag is branch votes (2,539): the fall-through rule's refusals in the top four shaders (foliage~8, c5fd36bb~153,
+  9e3a1555~50, a14f0f80~30) are **"exec-may-widen" 10-19 each** (EXEC restored inside the region from a saved mask the
+  analysis cannot bound by the head's EXEC), side effects (`exp`, `s_sendmsg`, `s_setreg`) 3-4, SCC live at the skip 2.
+- Compute: the cascade-shadow tile kernels 00977 / 00974 (16.3 + 4.2 ms a frame) are 63% / 59% `v_readlane`, all but 4
+  of them **SGPR spills** (`v_writelane v78/v79, sN, k` ... `v_readlane sN, v78, k`): one exchange per reload.
+- Dynamic counts (rounds a group actually runs, `wrounds_dyn.py`): usable for scheduler code only; the structured code
+  of the fold+tail variants runs its exchanges as inline barriers the trace does not see (4 outer rounds), so no
+  dynamic table.
+- The world's mesh programs use a mask's bit count once (`s_bcnt1_i32_b64` as data, 1 point in 404 shaders): the
+  bit-count rule was not worth building.
+
+### 2. Rules in the fork (each off unless its flag is given; only under `--wave64-emulate`, whole-wave groups)
+
+- `--wave-rounds` (first session): (a) **read alone**: `v_readfirstlane` of a VGPR every active lane holds alike
+  (forward dataflow: written by VALU from scalars, constants and such VGPRs, EXEC only narrowed since) reads the lane's
+  own value; the scalars derived from it are tracked and the rule is refused when one reaches a branch, EXEC, M0, a
+  scalar store, a lane index or is live where EXEC may widen; scalar loads addressed through it load in active lanes
+  only. (b) **gated votes**: LLVM's uniform branches in divergent code (`s_cselect_b64 sX, exec, 0`; `vcc = exec & sX`;
+  `s_cbranch_vccz/execz`) take the SCC gate (one value per wave) instead of an EXEC/VCC vote when EXEC is proven
+  non-zero. (c) **execz fall-through**: an `s_cbranch_execz` whose skipped region (post-dominated by the target) has no
+  side effect (store, atomic, LDS append, export, sendmsg, barrier, setreg...), writes nothing live at the target,
+  never widens EXEC and has no loop that could wait for a lane runs the region with EXEC possibly 0 (every lane
+  write masked): no vote. (d) own-bit vcc branches inside folded regions. Uniform-by-proof reads (`wave_uniform.py`,
+  sstruct's `--uniform-votes`: root parameters, SALU, alike-operand VALU, whole-wave phis, constant-table loads by a
+  fixed-point analysis) are taken through the same `UNIFORM_IDS`.
+- `--half-shuffle` (first session): DPP16 rows / quad_perm / DPP8, `ds_swizzle` (bit mask and quad modes keep bit 5),
+  `ds_bpermute` (the translator's semantics: each 32-lane half permutes alone, RDNA2 ISA 10.4.4), `v_permlane16` /
+  `v_permlanex16` become `simd_shuffle` with the source lane & 31: no round. **Probe** (`wrounds_lanemap.mm`, M): in a
+  mesh function (4,096 groups x 128) and a kernel (4,096 x 256) thread i is lane i % 32 of SIMD group i / 32 (0 errors),
+  and `simd_shuffle` / `simd_ballot` read the named lane for every source pattern of those ops with random EXEC
+  patterns: 0 errors in 1.34 G (kernel) and 671 M (mesh) checks.
+- **`--spill-lanes` (new, this session; `park_spills`)**: a VGPR that only `v_writelane` / `v_readlane` with an
+  immediate lane touch (no vector operand use, below any `v_movrel*` reach) is a set of independent lane slots; a slot
+  whose writes are SGPRs or constants that are no lane mask (masks keep leonida's parked-mask path) is kept as a parked
+  SGPR in every invocation, which is exactly the value the emulation fetched from that lane's invocation (writelane
+  ignores EXEC; all invocations of a wave run the same scalar program). Reuses leonida's `w64_scalar_spills` path
+  (graphics-only until now). M: 00977 366 -> 110 exchange points, 00974 311 -> 132, 01970 86 -> 16, 01969 50 -> 13; the
+  other 50 kernels translate byte for byte as without the flag, the 404 mesh shaders keep the same exchange census;
+  spirv-val passes on the 4 changed kernels. **Not
+  verified on data:** no input exists that makes these kernels write (round 13/14: A writes 0 words on the GPU-time
+  captures and on random inputs), so **no compute rows**.
+- Not built: reduction-sequence recognition into one `simd_*` reduction + one cross-SIMD combine (the DPP steps
+  already cost no round under `--half-shuffle`; the cross-half step left is one `v_readlane 31/63` exchange; mesh has 4
+  DPP points), the bit-count-only rule (1 point).
+
+### 3. Pairwise rendezvous instead of the workgroup barrier (M, `wrounds_meet.mm`, idle-ish GPU, best of 3, 64 rounds)
+
+The two SIMD groups of one emulated wave publish their 32 words and spin on each other's epoch word (twice a round:
+data, then "read done"); every spin bounded and counted.
+- **Terminates:** 0 failed waits, 0 data errors for 64, 256, 1,024, 4,096, 16,384 and 65,536 groups at 64, 128 and 256
+  threads a group. A lane waiting on a lane of its own SIMD group (`meet_self`) never finishes: 128 of 128 SIMD groups
+  hit the cap, as the reference said.
+- **Cost:** 2.6-2.8 ns a round a group (128 threads, 1,024-65,536 groups) against 1.2-1.3 ns for two threadgroup
+  barriers (64 threads: 1.3-6.8 vs 0.6-3.2; 256 threads: 5.2-5.4 vs 2.4-2.5): **about 2x a barrier when both waves
+  arrive together.** It could only pay where the two waves of a group take paths of very different length between
+  exchanges; not measured. **Not used** (no translator change).
+
+### 4. Console-heap T# lookups by index (`--heap-tindex`, off; request to the bindless owner 14:45 in `run/requests/d3d12_metal.md`)
+
+- Table (layer side, not built): one per descriptor-table generation, after the hash slots in the binding-2 buffer:
+  header at word `H = 1 + (M + 1) * 10` = magic `0x31585448`, heap console VA lo/hi, slot count N (heap bytes / 32),
+  word offset T; entry s at `T + 9 s` = the 8 T# words bound for heap bytes `[32 s, 32 s + 32)` + bindless index
+  (0 = none). The shader compares all 8 words, so a stale or torn entry can only miss (then the FNV probe).
+- Shader side (fork, M): foliage~8 fold+tail with and without the flag on `fol_a_tix` (fol_a + a header and a slot table):
+  **0 words differ; 1.51 -> 1.59 us a group (+5%)**, i.e. the cost of the header check on the miss path. **The hit path
+  is not exercised:** fol_a's bindless table is empty and its T# slots are zero, so 0 heap slots hold a key; a hit
+  input (T# words at the traced T# addresses + the same words as table keys) is the next step, and the flag must stay
+  off until a layer publishes the table (the shader reads the header unconditionally).
+- Inferred value: lookups are ~19% of the foliage probe path (round 12); 88 of foliage~8's 132 lookups are loads from
+  the heap block.
+
+### 5. The 19 mesh rows, class by class (offline A/B, then the world)
+
+Rows: the shaders of the round-14 overlay, rebuilt from the fork with `--wave-rounds --half-shuffle` on top of the
+sstruct variant chosen per shader (f = `--fold-waterfalls`, t = `--barrier-tail`; the 9e3a1555 skin family and the
+a14f0f80 / 04fe460e / 65459485 shadows keep no tail, as in round 14), store recipe + private outputs + the mspeed passes
+with `chain_segments_all`. Libraries `build/wrounds-x86_64/ms-ftw/cas`, `ms-fw/cas`; overlays `mesh/overlay.tsv` (all 19)
+and per class `mesh-foliage/` (3), `mesh-shadows/` (4), `mesh-skin/` (6), `mesh-transformd/` (6); pipelines (135, 0
+refused) in `build/wrounds-x86_64/arch`.
+
+**Offline (M, `mspeed_probe` through `tmem_slot.sh`, 2,048 groups, best of 5, A = the shipped mspeed row as the mean of
+an early and a late copy, sstruct = the round-14 row's variant, B1 = mine).** Inputs are the mesh-speed worker's
+synthetic heaps (`zero`: the longest path; `fol_a`: structured, ~64 vertices a group): no mesh capture exists, so
+"captured inputs" means these. Every output word (positions, attributes, indices, cull flags, sizes) compared: **0
+words differ in all 38 shader x input pairs**, and each B1 library is the exact overlay library (content keys checked).
+
+| mesh shader | variant (B1) | cases A / sstruct / B1 | zero: A / sstruct / B1 (us a group) | fol_a: A / sstruct / B1 | words differ |
+|---|---|---|---|---|---|
+| `'MSR_VS_TransformSkinD_1778b45a_Wrapped~1` | f+t+w+h | 103 / 85 / 71 | 1.61 / 1.31 (-19%) / 1.24 (-23%) | 1.80 / 1.48 (-18%) / 1.40 (-22%) | 0 |
+| `(MSNC_VS_TransformSkinD_9e3a1555_Wrapped~46` | f+w+h | 193 / 154 / 129 | 2.93 / 2.61 (-11%) / 2.58 (-12%) | 1.61 / 1.56 (-3%) / 1.52 (-6%) | 0 |
+| `(MSNC_VS_TransformSkinD_9e3a1555_Wrapped~50` | f+w | 331 / 253 / 214 | 3.62 / 3.33 (-8%) / 3.26 (-10%) | 2.04 / 2.10 (+3%) / 2.01 (-1%) | 0 |
+| `(MSNC_VS_TransformSkinD_9e3a1555_Wrapped~52` | f+w+h | 331 / 253 / 214 | 3.74 / 3.32 (-11%) / 3.24 (-13%) | 2.13 / 2.17 (+2%) / 2.07 (-3%) | 0 |
+| `)MSNC_VS_LinearDepthSkin_1b4b70ba_Wrapped~2` | f+t+w+h | 224 / 140 / 121 | 4.75 / 3.06 (-36%) / 3.07 (-35%) | 1.42 / 1.03 (-27%) / 0.96 (-32%) | 0 |
+| `)MSNC_VS_LinearDepthSkin_f1f2249c_Wrapped~48` | f+t+w+h | 201 / 138 / 119 | 2.82 / 2.05 (-27%) / 2.10 (-26%) | 1.49 / 1.03 (-31%) / 0.96 (-35%) | 0 |
+| `+MS_VS_PropFoliageDeferred_7cf79608_Wrapped~8` | f+t+w | 382 / 235 / 191 | 6.02 / 3.88 (-35%) / 3.81 (-37%) | 2.01 / 1.52 (-24%) / 1.44 (-28%) | 0 |
+| `1MSNC_VS_PropFoliageSkinDeferred_4352f5e1_Wrapped~3` | f+t+w+h | 375 / 228 / 193 | 6.86 / 4.44 (-35%) / 4.37 (-36%) | 2.66 / 2.02 (-24%) / 1.97 (-26%) | 0 |
+| `1MSNC_VS_PropFoliageSkinDeferred_4352f5e1_Wrapped~8` | f+t+w+h | 375 / 228 / 193 | 6.21 / 4.16 (-33%) / 4.10 (-34%) | 2.29 / 1.80 (-21%) / 1.80 (-21%) | 0 |
+| `2MS_VS_CascadeShadows_drawTexture_04fe460e_Wrapped~31` | f+w+h | 221 / 161 / 133 | 3.08 / 2.33 (-24%) / 2.20 (-28%) | 1.14 / 1.11 (-3%) / 1.02 (-11%) | 0 |
+| `2MS_VS_CascadeShadows_drawTexture_65459485_Wrapped~48` | f+w+h | 199 / 160 / 131 | 3.60 / 3.04 (-16%) / 3.01 (-17%) | 1.10 / 1.10 (+0%) / 1.00 (-9%) | 0 |
+| `;MSNC_VS_CascadeShadows_drawskinnedTexture_a14f0f80_Wrapped~30` | f+w+h | 214 / 154 / 129 | 3.83 / 3.45 (-10%) / 3.27 (-15%) | 1.29 / 1.29 (-0%) / 1.20 (-7%) | 0 |
+| `;MSNC_VS_CascadeShadows_drawskinnedTexture_a14f0f80_Wrapped~41` | f+w+h | 192 / 153 / 128 | 3.67 / 3.19 (-13%) / 3.04 (-17%) | 1.21 / 1.23 (+2%) / 1.17 (-3%) | 0 |
+| `_MS_VS_TransformD_c5fd36bb_Wrapped` | f+t+w+h | 62 / 41 / 26 | 1.18 / 1.01 (-14%) / 0.80 (-32%) | 1.15 / 0.83 (-28%) / 0.67 (-42%) | 0 |
+| `_MS_VS_TransformD_c5fd36bb_Wrapped~149` | f+t+w+h | 195 / 133 / 107 | 2.95 / 2.19 (-26%) / 2.20 (-25%) | 1.54 / 1.24 (-19%) / 1.18 (-23%) | 0 |
+| `_MS_VS_TransformD_c5fd36bb_Wrapped~151` | f+t+w+h | 386 / 247 / 199 | 6.18 / 4.27 (-31%) / 4.24 (-31%) | 2.18 / 1.79 (-18%) / 1.71 (-22%) | 0 |
+| `_MS_VS_TransformD_c5fd36bb_Wrapped~153` | f+t+w+h | 332 / 228 / 183 | 5.27 / 3.79 (-28%) / 3.78 (-28%) | 1.93 / 1.62 (-16%) / 1.61 (-17%) | 0 |
+| `_MS_VS_TransformD_c5fd36bb_Wrapped~155` | f+t+w+h | 332 / 228 / 183 | 5.18 / 3.81 (-26%) / 3.75 (-28%) | 2.02 / 1.71 (-16%) / 1.64 (-19%) | 0 |
+| `_MS_VS_TransformD_c5fd36bb_Wrapped~23` | f+t+w+h | 41 / 31 / 28 | 1.12 / 1.22 (+9%) / 0.71 (-36%) | 1.40 / 1.08 (-23%) / 0.94 (-33%) | 0 |
+
+B1 against the sstruct row: zero -42..+2% a group (median -2%), fol_a -19..0% (median -5%).
+
+**World (M, same binary `build/wrounds-x86_64/gta6rt`, pass timer `78,2,4` + split, per-pipeline geometry; wr-a defaults
+15 windows, wr-b the 19 sstruct rows 14 windows, wr-d my 19 rows 14 windows; wr-c (my rows, 3 windows, wired stop at
+world+15 s) not used).** Class cost at wr-a's group counts (each run's us a group x wr-a's groups a frame):
+
+| class (rows; drawn in both runs) | defaults wr-a: ms a frame (us a group) | sstruct rows wr-b | wave-rounds rows wr-d | wr-d against wr-b |
+|---|---:|---:|---:|---:|
+| foliage (3; 2) | 15.8 (15.09) | 11.0 (-31%) | 11.3 (-29%) | +2% |
+| shadows (4; 4) | 3.0 (8.02) | 2.6 (-14%) | 2.5 (-18%) | -4% |
+| skin (6; 2) | 2.6 (25.46) | 2.3 (-14%) | 2.2 (-18%) | -5% |
+| transformd (6; 5) | 5.9 (5.12) | 4.2 (-29%) | 4.4 (-26%) | +8% (one small row: 1.97 -> 3.60 us at 352 -> 151 groups) |
+| **the 19 rows** | **27.3** | **20.1 (-26%)** | **20.4 (-25%)** | +1% |
+| controls (6 shaders without a row) | 15.3 (3.84) | 15.2 (-1%) | 15.3 (-0%) | |
+
+Per shader (us a group, wr-a / wr-b / wr-d): foliage~8 14.37 / 9.78 / 10.06; skin~8 16.99 / 12.30 / 12.50; c5fd36bb~153
+21.00 / 14.25 / 13.88; 9e3a1555~50 25.42 / 22.25 / 21.04; a14f0f80~30 6.01 / 5.05 / 5.01; c5fd36bb~23 1.59 / 1.46 / 1.26.
+- **The round-14 rows are verified in the world:** -26% of their geometry a frame (27.3 -> 20.1 ms at the same group
+  counts), controls within 1%, boots normal. **My increment over them is not measurable in the world** (-5..+8% by
+  class, inside the window-to-window spread; offline it is -1..-20%).
+- GPU per presented frame (pass timer on, 10 s lines in the world): wr-a 334-439 ms, wr-b 356-378, wr-d 360-398; frames
+  2.0-2.4 a second in all three. The 7 ms saved is ~2% of the frame: not separable there.
+- Presented frames: none compared this session (wr-a/wr-b dumps were deleted by the first session; wr-d's world dumps
+  need the scene probe, which my launcher did not enable). The rows are bit-identical on the probe inputs, so no
+  output change is expected; the in-world presented-frame A/B is still owed before any row is proposed as default.
+- wr-d ended on the footprint cap (14,931 MiB) at world+~60 s, wr-b on the wired stop (9,752) at world+~55 s, wr-c on the
+  wired stop (9,836) at world+15 s; wr-a on the footprint cap.
+
+### 6. Why the round-14 sst-a / sst-b runs stalled at boot (M, logs; same machine-load band)
+
+| run | rows | load at start | archive open | game state 0x2 | first `XUser AddAsync` | world |
+|---|---|---|---:|---:|---|---:|
+| sst-a (13:07) | none (defaults) | 8.4, heavy job, cap 13,312 | 12.2 s | +15.6 s | after present 2,441 (~+103 s); the save provider never started | not reached (watchdog) |
+| sst-b (13:14) | 3 sstruct rows | 6.9, no heavy job | **211.4 s** | +214.6 s | | after the watchdog |
+| wr-a (15:09) | none (defaults) | 7.2 | 11.6 s | +14.2 s | after present 41 (~+23 s) | +95.7 s |
+| wr-b (15:18) | the 19 sstruct rows | 6.3 | 12.0 s | +15.2 s | after present ~41 | +97.3 s |
+| wr-c (15:46) | the 19 wave-rounds rows | 6.0 | 11.9 s | +14.7 s | after present ~41 | +84.6 s |
+
+- **Not the rows:** sst-a had none, and the 19 rows (wr-b) and my 19 (wr-c, wr-d) boot like defaults at the same load.
+- **sst-b = the archive open** (one call before any shader is used, 132 shards / 3.6 GB, 211 s against 11.6-12.2 s in the
+  other four runs; cause inside Metal's archive load not found: no lock in our code; I: storage/compiler-service
+  contention at that moment, not reproduced).
+- **sst-a = a title-side wait:** presents ran at 30 fps throughout, but the title signed its user in ~80 s late and
+  never initialised saves or opened the launch movie (no `BinkOpenWithOptions`), with load 8.4 and a heavy job; not
+  reproduced in three later runs. Cause not found (I: a title timing dependency under CPU load).
+
+### 7. Deliverables, commands, not done
+
+- Rows (not default): `build/wrounds-x86_64/mesh/overlay.tsv` (19) and the four class overlays; with
+  `GTA6RT_METAL_SHADER_OVERLAY=$PORT/build/wrounds-x86_64/mesh/overlay.tsv:<default list>` and
+  `GTA6RT_METAL_ARCHIVE_TIERS=$PORT/build/pc7/arch-world:$PORT/build/wrounds-x86_64/arch`. For a default the lead should
+  take the round-14 rows first (verified in the world above) and mine only after a presented-frame A/B.
+- Rebuild a row: `python3 -I shaderc_msl/tools/wrounds.py overlay OUT --names-file F
+  --flags=--fold-waterfalls,--barrier-tail,--wave-rounds,--half-shuffle`; batch A/B (one slot session):
+  `wrounds_batch.py prep WORK LIST.tsv` then `wrounds_batch.py run WORK` (LIST: name TAB variants;variants).
+- Census: `translator-fork/tools/wround_census.py DISASM OUT.jsonl SPV_DIR <flags>`, then
+  `shaderc_msl/tools/wrounds_census_sum.py <passes.tsv|cost.tsv> OUT.jsonl...` (results `build/wrounds-x86_64/census/`).
+- Probes: `wrounds_meet.mm` (rendezvous), `wrounds_lanemap.mm` (lane map + shuffles); binaries in
+  `build/wrounds-x86_64/probe/`. World launcher `build/wrounds-x86_64/world_run.sh NAME OVERLAY|- TIER|-`.
+- **Not done / next (ranked):** (1) compute: verify `--spill-lanes` on 00977 / 00974 (needs a capture whose textures
+  are the title's, so the kernels write; then rows; the static count says -70% / -58% of their exchanges, 20 ms a frame
+  of kernels). (2) Mesh branch votes: bound "saved mask restored inside the region" by the head's EXEC (the
+  fall-through rule's main refusal, 10-19 votes in each top shader). (3) The heap-tindex hit path offline (an input
+  with T# words at the traced addresses), then the layer's table. (4) A presented-frame A/B of the rows (scene probe on).
+  (5) Reductions to one simd reduction + one combine: little to gain in the world set (section 1).
+
 ## Round 14, shader-structure worker (2026-11-27 11:15-14:00): translator fork; waterfall loops folded, structured prefix before the mesh epilogue; mesh probe -10..-36% a group on the long path, bit-identical
 
 Translator copy `port/shaders_vk/translator-fork/` (leonida d3b8251b + the s2-make-game computed-I/J patch; `ORIGIN.md`;

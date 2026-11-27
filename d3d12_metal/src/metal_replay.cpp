@@ -1321,10 +1321,94 @@ private:
         }
         if (MetalContext::census_on()) context_.note_census(p.name, "indirect-draw");
         trace_draw(draw, p);
+        dump_indirect_args(a, p);
         if (p.mesh && context_.gpu_debug() && p.name && std::strstr(p.name, "MS_VS_TransformD_c5fd36bb"))
             context_.gpu_debug()->note_table_slot(draw.user_data[9], 0x80);
         out_.execute_indirect(d);
         st.draws.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    // GTA6RT_METAL_INDIRECT_ARGS_DUMP=<part of a pipeline name>[,...]: the first 24 indirect draws of such pipelines
+    // (after GTA6RT_METAL_DRAW_TRACE_AFTER_S) copy their first 4 argument records and the count word at GPU time;
+    // each is printed by a later matching draw at least 3 s after it was recorded.
+    void dump_indirect_args(const IndirectDrawArgs& a, const MetalGraphicsPipeline& p) {
+        static const std::vector<std::string> wants = [] {
+            std::vector<std::string> out;
+            const char* v = std::getenv("GTA6RT_METAL_INDIRECT_ARGS_DUMP");
+            for (std::string s = v ? v : ""; !s.empty();) {
+                const auto comma = s.find(',');
+                if (comma) out.push_back(s.substr(0, comma));
+                s = comma == std::string::npos ? "" : s.substr(comma + 1);
+            }
+            return out;
+        }();
+        if (wants.empty() || !p.name) return;
+        if (std::none_of(wants.begin(), wants.end(), [&](const std::string& w) { return std::strstr(p.name, w.c_str()); }))
+            return;
+        struct Pending {
+            std::unique_ptr<gpu::Buffer> buffer;
+            std::string name;
+            std::uint32_t stride = 0, records = 0, max_count = 0;
+            bool count = false;
+            std::chrono::steady_clock::time_point at;
+        };
+        static std::mutex mutex;
+        static std::vector<Pending> pending;
+        static unsigned made = 0;
+        static const auto start = std::chrono::steady_clock::now();
+        static const double after_s = [] {
+            const char* v = std::getenv("GTA6RT_METAL_DRAW_TRACE_AFTER_S");
+            return v ? std::strtod(v, nullptr) : 0.0;
+        }();
+        const auto now = std::chrono::steady_clock::now();
+        std::lock_guard lock(mutex);
+        for (auto it = pending.begin(); it != pending.end();) {
+            if (now - it->at < std::chrono::seconds(3)) {
+                ++it;
+                continue;
+            }
+            const auto* w = static_cast<const std::uint32_t*>(it->buffer->cpu_pointer());
+            std::string text;
+            char b[64];
+            const std::uint32_t words = it->stride / 4 * it->records;
+            for (std::uint32_t i = 0; i < words && i < 64; ++i) {
+                std::snprintf(b, sizeof b, "%s%u", i ? (i % (it->stride / 4) ? " " : " | ") : "", w[i]);
+                text += b;
+            }
+            std::fprintf(stderr, "[rt] d3d12-metal: indirect args of %s: max count %u, stride %u%s%u; records: %s\n",
+                         it->name.c_str(), it->max_count, it->stride, it->count ? ", count word " : ", no count buffer ",
+                         it->count ? w[64] : 0u, text.c_str());
+            it = pending.erase(it);
+        }
+        if (made >= 24 || std::chrono::duration<double>(now - start).count() < after_s) return;
+        Resolved ra, rc;
+        const std::uint32_t records = std::min<std::uint32_t>(std::max(a.max_count, 1u), 4u);
+        const std::uint32_t stride = std::max<std::uint32_t>(a.stride, 16);
+        if (!buffer_of(a.argument_buffer, a.argument_offset, std::uint64_t(stride) * records, ra)) return;
+        const bool count = a.count_buffer && buffer_of(a.count_buffer, a.count_offset, 4, rc);
+        gpu::BufferDesc d;
+        d.size = 65 * 4;
+        d.memory = gpu::MemoryKind::shared;
+        d.usage = gpu::usage::copy;
+        d.label = "indirect args dump";
+        Pending e;
+        e.buffer = context_.gpu().create_buffer(d);
+        if (!e.buffer || !e.buffer->cpu_pointer()) return;
+        std::memset(e.buffer->cpu_pointer(), 0xff, 65 * 4);
+        gpu::Barrier fence;
+        fence.type = gpu::BarrierType::uav;
+        out_.barrier({&fence, 1});
+        out_.copy_buffer(e.buffer.get(), 0, ra.buffer, ra.offset, std::min<std::uint64_t>(std::uint64_t(stride) * records, 256));
+        if (count) out_.copy_buffer(e.buffer.get(), 256, rc.buffer, rc.offset, 4);
+        out_.barrier({&fence, 1});
+        e.name = p.name;
+        e.stride = stride;
+        e.records = records;
+        e.max_count = a.max_count;
+        e.count = count;
+        e.at = now;
+        pending.push_back(std::move(e));
+        ++made;
     }
 
     // GTA6RT_METAL_DRAW_TRACE=<part of a pipeline name>: the first 8 draws of such pipelines, with their vertex

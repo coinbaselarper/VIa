@@ -42,6 +42,8 @@ import shader_meta as _shader_meta  # noqa: E402
 import wave64_emulate_opt  # noqa: E402
 import waterfall_fold  # noqa: E402  (translator-fork)
 import wave_uniform  # noqa: E402  (translator-fork)
+import speckle_fix  # noqa: E402  (translator-fork)
+import wround_halves  # noqa: E402  (translator-fork)
 import wave64_halves  # noqa: E402
 import spirv_loop_guard  # noqa: E402
 
@@ -5891,6 +5893,9 @@ class Gen:
 
     def g_shuffle(self, r, v, src):
         """r = v of lane src of this wave (OpGroupNonUniformShuffle, or any emulated lane 0-63)."""
+        if self.emulate and wround_halves.half_shuffle(self):
+            wround_halves.shuffle_half(self, r, v, src)
+            return
         if not self.emulate:
             self.emit(f"{r} = OpGroupNonUniformShuffle %uint %c3 {v} {self.wave_source_lane(src)}")
             return
@@ -7456,7 +7461,7 @@ class Gen:
                 src_local = self.tmp()
                 self.emit(f"{src_local} = OpBitwiseOr %uint {hi} {inv}")
 
-        if self.emulate:
+        if self.emulate and not wround_halves.half_shuffle(self):
             # One workgroup exchange per DPP: every lane publishes src_val and its active bit, and the next round
             # reads the selected lane. No subgroup operation is used, so this is exact on any subgroup size.
             global_group = self.tmp()
@@ -13905,6 +13910,8 @@ class Gen:
                 uv, grads_fb = self.texel_offset_fold(img, si, uv, off, n_off, ncoord, kind, implicit, fb_lod, bias,
                                                        a[3])
                 off = None
+            if grads_fb is None and off is None:
+                grads_fb = speckle_fix.cs_quad_grads(self, kind, f, grad_width, bias, dim)
 
             def opnd(mask, args):
                 """Image operands in SPIR-V mask order: Bias / Lod, Offset (0x10), MinLod (0x80, implicit forms)."""
@@ -13934,7 +13941,7 @@ class Gen:
                           f"{res} = OpImageSampleExplicitLod %v4float {si} {uv}{opnd('Lod', bias_lod)}")
             elif kind in ("_c_lz", "_c_l", "_c", "_c_b"):
                 d = self.tmp()
-                if kind in ("_c_lz", "_c_l") or (self.stage != "ps" and kind in ("_c", "_c_b")):
+                if kind in ("_c_lz", "_c_l") or (self.stage != "ps" and kind in ("_c", "_c_b") and grads_fb is None):
                     # _c / _c_b outside the PS have no derivatives (base LOD 0, or bias / max(bias, minlod) for _c_b)
                     d_lod = f[ncoord] if kind == "_c_l" else (bias_lod if kind == "_c_b" else lod_zero)
                     self.emit(f"{d} = OpImageSampleDrefExplicitLod %float {si} {uv} {ref}{opnd('Lod', d_lod)}")
@@ -14661,6 +14668,11 @@ class Gen:
             if op in self.IMG_ATOMICS_EXTRA:
                 self.emit_image_atomic_extra(op, ptr_ty, arr_var, idx, iv, vdata, mods,
                                              volume_active=run)
+                return
+            if speckle_fix.is_atomic64(op, vdata, self.IMG_ATOMICS):
+                if is3d_atomic:
+                    raise Unsupported(op + " 64-bit 3D")
+                speckle_fix.image_atomic64(self, op, a, mods, vdata, idx, iv, run, Unsupported)
                 return
             if op == "image_atomic_cmpswap":
                 if vdata["k"] != "vgpr" or vdata.get("n", 1) != 2:
@@ -15800,11 +15812,14 @@ def assemble(gen):
     gen.uses_pc_tail = PC_TAIL_UBO and (gen.uses_heap or gen.uses_codebase or msc)
     if gen.emulate:
         # No subgroup operation is left (x_round does them through %x_buf), so none of their capabilities.
-        if any("OpGroupNonUniform" in l or "%sg_lane" in l
+        if any(("OpGroupNonUniform" in l and not speckle_fix.quad_ok(gen, l) and not wround_halves.shuffle_ok(gen, l))
+               or ("%sg_lane" in l and not wround_halves.shuffle_ok(gen, l))
                for b in gen.blocks + list(gen.x_segs.values()) if b is not None for l in b):
             raise Unsupported("wave64 emulation: a subgroup operation is left")
         gen.uses_subgroup = gen.uses_vote = gen.uses_ballot = gen.uses_wave_bits = gen.uses_quad = False
+        gen.uses_quad = bool(getattr(gen, "speckle_cs_lod", 0))
         gen.uses_bcast_first = False
+        wround_halves.keep_shuffle_caps(gen)
         x_waves, x_mask, x_sched, x_sink = gen.x_sizes()
         x_zero = x_sink - x_mask           # mask and schedule words: zeroed before the first round
         x_threads = (gen.cs or gen.ms)["size"]
@@ -16838,6 +16853,7 @@ def assemble(gen):
                       f"%m{tag}p = OpAccessChain %_ptr_Out_int_ms %ms_cull %mli {c(member)}",
                       f"OpStore %m{tag}p %m{tag}v"]
         L += ["OpBranch %ms_pend", "%ms_pend = OpLabel"]
+        L = speckle_fix.mesh_epilogue(L, c)
         end_lock = "".join(("         " + l if " = OpLabel" not in l else l) + "\n" for l in L) + end_lock
     if gen.uses_active and gen.stage == "ps":
         # A pixel is written when its lane was on in EXEC at the last `vm` export the path ran (if it ran one) and
@@ -18496,6 +18512,7 @@ def translate(path):
         wave64_emulate_opt.UNIFORM_IDS = g.wu_votes | g.wu_rfl
     else:
         wave64_emulate_opt.UNIFORM_IDS = frozenset()
+    wave64_emulate_opt.UNIFORM_IDS |= wround_halves.apply(g, blocks, succ, raw_edges)
     g.build_meta = _shader_meta.collect(path, info["name"], blocks, succ,
                                         user_sgpr_limit=user_limit, system_sgprs=sys_sgprs)
 
@@ -18590,7 +18607,9 @@ def translate(path):
                                 else:
                                     ucond = uact
                             else:
+                                g.cur_uniform_vote, g.pending_gate = bool(ins.get("fold_own_bit")), None
                                 ucond = branch_condition(g, uop)
+                                g.cur_uniform_vote = False
                             ur = g.tmp()
                             g.emit(f"{ur} = OpSelect %uint {ucond} {utgt} {ufall}")
                             g.emit(f"OpStore %pc {ur}")
@@ -18670,7 +18689,7 @@ def translate(path):
                     break
                 if op in BRANCHES:
                     term, body = ("br", op, index[target(ins)]), blocks[cur][:k]
-                    term_uniform = id(ins) in g.wu_votes
+                    term_uniform = wround_halves.gated(g, ins) or id(ins) in g.wu_votes
                     break
             g.insns(body)
             if cur in folds:
@@ -19194,6 +19213,9 @@ BRANCHES = {"s_branch", "s_cbranch_scc0", "s_cbranch_scc1", "s_cbranch_vccz", "s
 
 def branch_condition(g, op):
     """Boolean SPIR-V id: whether the branch is taken for this lane."""
+    gc = wround_halves.gate_cond(g, op)
+    if gc is not None:
+        return gc
     if op in ("s_cbranch_scc0", "s_cbranch_scc1"):
         s = g.tmp()
         g.emit(f"{s} = OpLoad %uint %scc")
@@ -19722,6 +19744,8 @@ def main():
                     help="translator-fork: under --wave64-emulate, v_readlane_b32 of a VGPR whose value was already "
                          "published in the current exchange round (no write to it, no other round since) reads that "
                          "round's copy instead of starting a round of its own")
+    speckle_fix.add_arguments(ap)
+    wround_halves.add_arguments(ap)
     ap.add_argument("--uniform-votes", action="store_true",
                     help="translator-fork: under --wave64-emulate, in workgroups of whole waves, a vote over a lane mask "
                          "whose bit is the same in all 64 lanes and a v_readfirstlane/v_readlane of a VGPR that is the "
@@ -19811,6 +19835,8 @@ def main():
     FOLD_WATERFALLS = a.fold_waterfalls
     UNIFORM_VOTES = a.uniform_votes
     READLANE_BATCH = a.readlane_batch
+    speckle_fix.configure(a)
+    wround_halves.configure(a)
     wave64_emulate_opt.BARRIER_TAIL = a.barrier_tail
     WAVE64_GRAPHICS = a.wave64_graphics
     BARY_FALLBACK = a.bary_fallback

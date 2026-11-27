@@ -92,7 +92,15 @@ fi
 set_env=()
 setenv() { export "$1=$2"; set_env+=("$1"); }
 
-args=(--exe "$root/exe/game_scarlett_master.exe" --package "$root/xbox/GTA6.Xbox.v1.0.2.1-CYBERLEEK")
+cfg="$port/build/setup/config.sh"
+game_exe="${GTA6RT_APP_EXE:-$([ -f "$cfg" ] && sed -n 's/^SETUP_EXE=//p' "$cfg" | tr -d "'")}"
+game_pkg="${GTA6RT_APP_PACKAGE:-$([ -f "$cfg" ] && sed -n 's/^SETUP_PACKAGE=//p' "$cfg" | tr -d "'")}"
+[ -n "$game_exe" ] || game_exe="$root/exe/game_scarlett_master.exe"
+if [ -z "$game_pkg" ]; then
+    for d in "$root"/xbox/*/; do [ -f "$d/shaders.rpf" ] && { game_pkg="${d%/}"; break; }; done
+fi
+[ -f "$game_exe" ] && [ -d "$game_pkg" ] || fail "no game files (GTA6RT_APP_EXE and GTA6RT_APP_PACKAGE, or tools/setup.sh)"
+args=(--exe "$game_exe" --package "$game_pkg")
 if [ "${pass[0]:-}" = "newgame" ]; then
     pass=("${pass[@]:1}")
     fresh="$port/run/fresh/play"

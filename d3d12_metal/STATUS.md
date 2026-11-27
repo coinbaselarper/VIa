@@ -1,5 +1,268 @@
 # port/d3d12_metal status (round 7)
 
+## Round 15, submission-CPU worker (2026-11-27 14:10-16:20): CPU-only ceiling 3.9 -> 4.65 fps at the new defaults (within run-to-run spread); the resolve skip made the shadow copies 7x slower and is now off; the zero-copy pool mirror cuts shadows to 0.5 ms but draws a black world; CreatePlacedView's title threads -40% CPU
+
+Tree `build/subcpu-x86_64` (attach.cmake super-build), binaries kept `gta6rt.b5` (15:31 sources) and `gta6rt.b6` (16:05:
+b5 with the two defaults below flipped). Launcher `host/tools/s4_metal_world.sh` (slot + tmem probe lock, cap 14,848 with no
+heavy job, `GTA6RT_METAL_CB_ABORT_MS=2000`, first-GPU-error stop, 4 Hz wired stop 9,728, machine guard 15,360), with
+`GTA6RT_METAL_SHADOW_CENSUS=1 GTA6RT_METAL_PRESENT_CHECK=1 GTA6RT_METAL_PCACHE_PREBUILD=all`, hidden, no audio, private run
+dir; scripts `build/subcpu-x86_64/chain*.sh`, summaries `tools/subsum.py LOG FROM_S` (ms a submission by part) and
+`tools/tcpu.py THREADS.tsv META` (per-thread CPU, r12-cpuprofile's `threadcpu`). **0 failed command buffers, 0 GPU faults
+in every run; gpuEvent-gta6rt 10 before and 10 after each of f..j** (the 10th is the wave-rounds probe's, 15:41). Runs
+end on the machine-wired stop at world+46..66 s (f: machine guard), so every window is world+15..65 s: the tips still view
+and the first gameplay seconds, not steady gameplay. Load 4.7-10.6 at the starts (other workers' runs and builds).
+M = measured, I = inferred.
+
+### 1. ms a submission by part, CPU-only ceiling (M, `subsum.py`, world+20 s to the end)
+
+| run | binary, settings | subs/s | frames/s | subs a frame | heap refresh | heap lock wait | shadows | textures | replay | serial | CPU-only ceiling |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| cp-c (r12, ref.) | live 12:51 + C | | 2.3-2.8 | 34-40 | 3.55-3.75 | 4.6-8.2 | 2.1-2.4 | 1.2-1.6 | 1.1-1.3 | 7.5-10 | 2.8-4.0 |
+| subcpu-a2 | b4, all new switches off | 100.2 | 3.97 | 25.2 | 3.33 | 5.38 | 2.19 | 1.34 | 5.17 | 12.03 | 3.29 |
+| **subcpu-g (before)** | **b5, all off** | 117.5 | 4.58 | 25.6 | 3.30 | 6.05 | 1.41 | 1.05 | 4.23 | **9.99** | **3.91** |
+| subcpu-f | b5 defaults of 15:31 (skip, memo, placed, wake on) | 75.7 | 2.05 | 36.9 | 4.42 | 9.26 | **10.02** | 2.09 | 4.84 | 21.37 | 1.27 |
+| subcpu-h | b5, skip off (memo, placed, wake on) | 98.2 | 2.72 | 36.2 | 3.51 | 7.48 | 2.07 | 1.20 | 3.98 | 10.77 | 2.57 |
+| **subcpu-i (after)** | **b6 defaults (placed, wake on)** | 132.3 | 4.87 | 27.2 | 3.12 | 3.82 | 2.03 | 1.21 | 1.55 | **7.91** | **4.65** |
+| subcpu-j | b6 + `GTA6RT_METAL_TITLE_POOL_MIRROR=1` | 189.3 | 6.73 | 28.1 | 3.02 | 3.66 | **0.50** | 0.85 | 1.03 | 5.40 | 6.58, **world black** |
+
+Serial = heap refresh x refreshes/submissions + shadows + textures + replay (lock waits out), as r12-cpuprofile. The g -> i
+change (3.91 -> 4.65 fps) is mostly replay (4.23 -> 1.55), which nothing of mine touches: scene and load spread, not a
+gain I can claim. The 6+ target is not reached with a world that draws.
+
+### 2. Shadows (item 1, M)
+
+- **What is copied** (census, `GTA6RT_METAL_SHADOW_CENSUS=1`, 5 s lines; slot-133 shadow buffers are not the bytes, title
+  windows are): i 127 MiB tracked in 198 trackers, 92 MiB copied a submission in 1.7-1.9 ms: no pool page 17 MiB (86
+  trackers), one consecutive pool run 41 MiB (18), several pool runs or mixed 73 MiB (94); 64 MiB of it the scatter
+  windows. So ~85% of the copied bytes are on pool pages (the lead's premise holds at these settings).
+- **Copy bandwidth:** offline (x86_64 under Rosetta, 4 threads, `scratchpad/bench/cmpbench.cpp`) 64 MiB copy 1.0-1.2 ms; 6
+  or 8 threads 0.96; compare-then-copy-if-dirty 1.0-1.4 ms at 0-100% pages changed. **Comparing before copying saves
+  nothing** (both are bandwidth-bound); there is no cheap dirty bit (mprotect costs ms in the title, r12-heaptrack; mach
+  dirty bits do not clear). Not built.
+- **Zero-copy pool mirror** (`GTA6RT_METAL_TITLE_POOL_MIRROR=1`, `title_pool_mirror`: a host `mach_vm_remap` of the pool
+  pages behind a window, wrapped by a bytesNoCopy buffer): j 197 mirrors / 98 MiB, copies 20 MiB in 0.45 ms, shadows 0.50
+  ms a submission, **but every world present is black (193 of 193, plane 0; HUD drawn after the hand-over, 3D black:
+  `/Users/a/Desktop/Projects/GTA-VI/port/run/present/subcpu-j/world/world_present_001917.png`)**, GPU 97 ms a frame against
+  231 in i. Cause not found (c2, b4 with the skip on, drew with 180 mirrors / 50 MiB). Stays **off**.
+- **The resolve skip (item 4) was what made f's shadows 10 ms:** with it, the V# halves over 32 MiB no longer made the
+  16 MiB windows that serve many small V#s; those V#s then made ~340 small windows over pages that fault on read: 408,787
+  guarded-read faults recovered in f (Rosetta's exception server 19% of a core) against 1,399-1,910 in g/h/i. Its verify
+  mode compared only the returned address, not the windows the attempt leaves behind.
+
+### 3. Heap refresh (item 4, M)
+
+- Cross-refresh V# memo (`GTA6RT_METAL_VSHARP_XMEMO`): exact (subcpu-b verify, b2: 782,582 reuses, 0 differ), but reuses
+  ~4% of lookups (backings are added all the time with 64 KiB chunks); refresh 3.30 (g, off) vs 3.51 (h, on) ms. **Default
+  now off.**
+- Span skip (`GTA6RT_METAL_RESOLVE_SKIP`): 186,332 skips verified with 0 differing answers (subcpu-b), but the side effect
+  above. `resolve_span_cap` (the most one resolve can back) is 32 MiB: pool spans/unions 32 MiB, copy and scatter windows
+  16 MiB each (`kTitleWindowMax`; `title_pool_scatter_window`'s 64 MiB is a total budget, not a per-window size), stream
+  extents 1 MiB; 0 (no skip) with in-place windows or geometry copies. Skips were ~14 a refresh, not r12-heaptrack's 1,213
+  (pool wake already leaves those halves alone). **Default now off.**
+- Where the refresh goes now (c2 heap line): pages 0.68-0.80, fixing 1.28-1.66, retries 0.54 ms; 600 V# halves a refresh
+  get no records (empty), almost all spans under 32 MiB.
+
+### 4. CreatePlacedView (item 2, M)
+
+`LEONIDA_PLACED_ARGS_FAST` (default on, `d3d12_xs_device.cpp`: `proxy_create_placed_view_x`, `local_write_through`): the two
+argument structs and a one-page write-through are read with a fault-safe copy before any VirtualQuery; only a copy that
+faults asks the old questions. 3.4-6.6 M fast copies a run, 0 faulted. The 5 placed-view title threads: **16.5-16.7% of a
+core each (9.6-9.7 sys) in g against 9.0-13.3% (4.0-6.7 sys) in f/h** (-0.2 to -0.37 cores of kernel time in all).
+Vulkan path tests (same tree): `d3d12vk_fault_guard_test` 36/36, `_pso_accounting_test`, `_register_test`,
+`_rts0_deserializer_test` pass; `_present_clear_test` skipped (no x86_64 Vulkan driver here); no Vulkan world run.
+
+### 5. MONITORX/MWAITX wake (item 3, M)
+
+The store the title's wait loop (exe+0x4fb0ad0) watches is the fence slot-12 mirror (`refresh_mirror`,
+`d3d12_xs_device.cpp`, `GTA6RT_MONITOR_WAKE`, default on); no store site of it is in shims_core. The pump's list-value
+writes land in `d3d12_xs_list_values.h` / `title_page_watch.h` (read-only for me): no wake there. In the title
+(`GTA6RT_MONITOR_WAKE=count`, f): 540-601 stores per 10 s, 241-284 found a waiter; the MWAITX lines read the same with and
+without (2-3 k of ~35 k waits a 10 s end by a write, the rest at the 200 us budget: the fence has not moved, the GPU is
+the wait). Wake latency (offline `isa_zen_wait_test`, load 5.7): **poll p50 21.5 / p90 28.1 us -> wake p50 4.5 / p90 8.8
+us**; ~27 wakes a second in the title, so < 1 ms a second (I). The title-side latency is not measurable from my files.
+
+### 6. Pipeline-cache manifest (item 5): not done
+
+The manifest (`cache/src/codec.cpp` `Manifest::load`) and `pcache.cpp`'s lists are read with `std::getline` (buffered).
+The `istreambuf_iterator` reads in r12's samples are `src/metal_shaders.cpp` `MetalShaders::load_locked` (line 79, each
+metallib; also 92 and 252): outside the files I may write. Fix for its owner: `stat` the size, one `read` into a sized
+vector (or map the file, as the long-run worker's library cache does).
+
+### Switches and files
+
+- `shims/d3d12_metal_device.cpp`: `resolve_skip_mode`, `vsharp_xmemo_mode` (defaults now off; `=1` / `=verify`). Earlier in
+  this round (announced 14:15/14:40): `title_pool_mirror*` (off), `shadow_census` (off), `refresh_shadows` (census line),
+  `vsharp_xmemo_*`, `resolve_skip*`, `resolve_span_cap`, `backings_added`, `ConsoleHeap` fields.
+- `d3d12_vulkan/shims/d3d12_xs_device.cpp`: `placed_args_mode` (`LEONIDA_PLACED_ARGS_FAST`, on; `=verify`),
+  `local_write_through`, `proxy_create_placed_view_x`, `mirror_wake_mode` / `wake_mirror_waiters` / `refresh_mirror`
+  (`GTA6RT_MONITOR_WAKE`, on; `=count`).
+
+### Next (ranked)
+
+1. The pool mirror's black world: one run with `GTA6RT_METAL_TITLE_POOL_MIRROR=main` (main windows only) to split main
+   vs scatter mirrors; then the scene probe on the first G-buffer pass. If fixed, shadows fall to ~0.5 ms a submission.
+2. Replay (1.5-5.2 ms a submission across runs) and the heap lock wait (3.7-9.3) vary more than any term I changed; a
+   steady-gameplay window needs runs that outlive the 9,728 MiB wired stop.
+3. The ~600 empty V# halves a refresh under 32 MiB (fixing 1.3-1.7 ms): attribute by reason before any skip.
+
+## Round 15, long-run worker (2026-11-27 14:00-15:10): libraries over file mappings (-0.8 GiB malloc), pipelines made at first use (no hand-over step), table capped at 160 MiB; the 10-minute run is stopped by machine wired (9,728 MiB) at world+102 s, footprint 1.3 GiB under the cap; fmix32 rebuild scripted (1 h 41 min measured on 50 libraries + 86 pipelines), not run
+
+Tree `build/lrun-x86_64` (attach.cmake super-build, trimmed after the round to `gta6rt.b2` (14:20, sha256 aed2df56...,
+the binary of d2/d3/r2) and `gta6rt.b5` (15:01, the shared sources as left: + the auto prebuild rule), scripts, logs,
+`keep/rundir` (pcache files); b1 14:09 and b3 14:50 deleted), launcher `build/lrun-x86_64/run_world.sh` (the ten-minute worker's: slot + tmem probe lock, cap 14,848 /
+13,312 with a heavy job, CB abort 2000, first-GPU-error stop, fault_stop, 4 Hz wired stop 9,728, machine guard 15,360,
+1 Hz machine log) behind `when_quiet.sh` (starts only with no heavy job and no gta6rt), summary `tools/minutes.py`.
+**0 failed command buffers, 0 GPU page faults; gpuEvent-gta6rt 9 before and 9 after every run.** M = measured,
+I = inferred. Other workers' runs, builds and prepare_shaders ran all along (load 3.6-9.6 at my run starts).
+
+| run | binary, settings | world | ended | what it answered |
+|---|---|---:|---|---|
+| lrun-d1 | b1, everything new off, `MallocStackLogging=lite`, heap census at world+5/+70 | +23 s | CB abort (rc 5) | `heap` stops the process ~18 s; on resume the 2 s CB abort fires: **no in-process census (heap / malloc_history) is possible under the 2 s rule**; the world+5 s size census is kept (`census-d1/w5.heap.txt`) |
+| lrun-d2 | b2, everything new off | +16 s | footprint cap 13,312 (another worker's ninja at start) | per-build Metal allocated (opt-in log), cold set seeded |
+| **lrun-d3** | b2, everything new **off** (`GTA6RT_METAL_LIBRARY_FILE_BACKED=0 GTA6RT_METAL_PCACHE_PREBUILD=all GTA6RT_METAL_TABLE_CLUSTER_CAP_MB=0`) | **+52 s** | **wired stop 9,799** | the same-binary "off" half |
+| **lrun-r2** | b2, **defaults** (all three on), walk 4 s + turn 2 s every 15 s from 150 s | **+102 s** | **wired stop 9,734** (footprint 13,524, cap 14,848) | the "on" half; HUD and Donnie's text from world+57 s |
+| lrun-f5 | b5, defaults, a fresh run dir, 5 s of world | +5 s | watchdog | the auto rule picks "all" there (`prebuild auto: all (no pcache-cold.txt in this directory yet)`) and writes the cold list at world entry |
+| lrun-r3 | b3 = b2 + each phase's opening 10 s prebuilt in window mode (archive hits too), defaults otherwise | +48 s | wired stop 9,761 | that variant: world+0 present lit, but 2,341 prebuilt, footprint 13,546 at world+51 (r2: 12,923), so **reverted** (the shared source is b2's rule) |
+
+### 1. Same binary, off (d3) against on (r2), at world+30 / +52 s (M, footprint trace 1 Hz, layer report 30 s)
+
+| | footprint | malloc in use | Metal allocated | graphics ledger | layer "other" (pipelines, libraries) | pipelines created | world presents (non-black / dumped) |
+|---|---:|---:|---:|---:|---:|---:|---|
+| off, world+30 | 13,393 | - | 7,874 | - | 1,150 | 2,563 | 4 of 5 (the 5th = the title's fade, world+50) |
+| on, world+30 | 12,342 | - | 7,104 | - | 890 | 1,822 | 8 of 11 (world+5: black, entry; +50/+55: the fade) |
+| off, world+52 | 14,072 | 2,597 | 8,174 | 4,490 | - | - | |
+| on, world+52 | 12,923 (-1,149) | 1,766 (-831) | 7,322 (-852) | 4,223 | - | - | |
+| on, world+93..104 | 13,433-13,650 | 1,796-1,803 (flat from world+60) | 8,187-8,423 | 4,437-4,469 | 1,018 | 2,025 | |
+
+- Presented frames: the same scene, HUD, text and known faults in both (speckle, black minimap, dark block behind the
+  head, the pale rectangle); r2's last present (world+95 s): `port/run/present/lrun-r2/world/world_present_001871.png`
+  (still wrong: everything the round-14 list names). **One new cost: r2's world+5 s present is black** (d3's world+3 s
+  is lit): at world entry 1,452 pipelines are made at their first use from the archive through 3 compile threads,
+  180-229 of them not ready at world+7..10 s, longest wait 4.6 s; lit again by world+15 s. 0 draws skipped. Prebuilding
+  each phase's opening 10 s during the phase before (r3) removed it but made 2,341 pipelines ahead and cost +0.6 GiB
+  footprint and the wired stop at world+48 s: reverted.
+- Frames/s (HUD median) 3.0 in d3 and r2 (2.0 in r3, load 7.8-9.6 at its start), GPU 300-350 ms a frame; ten-final's
+  2.0 was an older build (patch C since).
+
+### 2. Pipelines: what the hand-over makes, and the prebuild (M)
+
+- **Libraries are not "other" and pipelines are small:** per-build Metal allocated (opt-in
+  `GTA6RT_METAL_PIPELINE_MEM_LOG=1`, port/metal `PipelineCore::run_build`): archive hits at boot 0.12-0.19 MiB mean
+  (median 0, a 16 MiB slab now and then; d1, 722 builds). In r2 "other" is 1,009 MiB at 1,980 pipelines (0.5 MiB each
+  with their libraries' GPU part).
+- **The hand-over (r2, world+57 s): 121 first uses in 10 s**, all archive hits made at first use in 15-70 ms each:
+  player skinning (`PedTransformPreSkinD_PositionOnly`, `TransformSkinD_NoDeform`), cascade-shadow variants
+  (`CascadeShadows_draw*`, `_PedTransformPreSkinD`, `SmhCascadeShadow` hair), 13 compute kernels (`lib_cs_0213x`,
+  `0220x`, `00936`, `00948/9`, `03406`), foliage-skin and `TransformD_c5fd36bb` variants. "other" +123 MiB from
+  world+32 to +63 (155 pipelines). **No +742 MiB step**: in ten-g that step came with `PREBUILD=all` (2,597 prebuilt,
+  635 released unused, which returns nothing); its exact split was not measured again (d3 died before its hand-over).
+- **Key churn (M, prepare_shaders on 86 tier pipelines of the fmix32 sample):** 36 of 86 distinct pcache specs were
+  archive hits of an earlier one in the same fresh archive: they differ only in state that is not in the Metal
+  pipeline (depth-stencil, raster) and Metal keeps one pipeline for them. So backend duplicates already cost nothing.
+- **The title's 109,114 `PipelineState` (213 MiB, ten-c census):** 56,088 `CreateDerivedPipelineState` + 25,450
+  `DeserializeGraphicsPipelineStateX` + compute: all made before world entry (calls from 14.7 s to 82.9 s, ten-g), not
+  re-created in the world. Each is a 2,048-byte public view over one shared compiled object (`shared_native_graphics`
+  keeps a weak map by description already). Not my file (device shim): **proposal** for its owner: hand out the live
+  view for an identical (key + record) description with an AddRef when the title set no private data / name on it,
+  or make the view a slim class (COM identity + record pointer + owner): -200 MiB malloc at boot. Not measured.
+- **Prebuild, new default (`d3d12_metal/cache/src/pcache.cpp`):** a pipeline an archive or tier lists is made at its
+  first use; only pipelines compiled (not found in an archive) in earlier runs of the directory (new
+  `pcache-cold.txt`, written beside the manifest) are prebuilt, and only once their recorded first use is in the
+  current phase and at most `AHEAD_S` away. r2: 22 prebuilt (was 2,597), 1,969 made at first use from the archive, 6
+  compiled. **Its premise is that recorded pipelines are archive hits.** The submission-CPU worker's runs on my 14:10
+  version (fresh run dir: everything made at first use, ~1,200 of them compiling, 102 s waits, every world present
+  black, subcpu-b/-c1) showed where it fails, so the default is now **auto** (15:10): the window only when the
+  directory already has a `pcache-cold.txt` (a run with this code reached the world there) and neither
+  `GTA6RT_METAL_SHADER_OVERLAY` nor `GTA6RT_METAL_ARCHIVE_TIERS` is set; otherwise everything recorded is prebuilt as in
+  round 14 (and the run writes the cold list). One `[rt] pcache: prebuild auto: window|all (why)` line says which.
+  `GTA6RT_METAL_PCACHE_PREBUILD=window|cold|all` forces one.
+
+### 3. Hash table (M)
+
+- Cap exercised in the title (r2, `GTA6RT_METAL_TABLE_CLUSTER_CAP_MB` now defaults to 160 with bare FNV-1a, 0 off):
+  38,902 keys in 4,194,304 slots (160 MiB), **5 keys refused** (their T#s read the fallback; which surfaces was not
+  seen in the dumps), no doubling to 320 MiB in 104 s of world (ten-final doubled at world+106 s).
+- **fmix32 for the Metal path: a rebuild, scripted, not run.** `src/metal_bindless.cpp`: `GTA6RT_METAL_TABLE_HASH=
+  fnv1a_fmix32` builds the table with fmix32 (default fnv1a; a bad value aborts). `shaderc_msl/tools/shaderc_msl.py`:
+  pass `hash_fmix32` (`--hash-kind`, default `SHADERC_HASH_KIND` else fnv1a) wraps every 8-word FNV expression of the
+  lookups in `spvDescriptorFmix32()` and raises on an FNV basis it does not recognise. One command:
+  `d3d12_metal/tools/rehash_world.sh [WORK]` (default `build/rehash-fmix32`; resumable, nice 15, 3 jobs, no new
+  library job while a gta6rt runs, prepare_shaders with 1 compile while one runs; `rehash_world.py`, `rehash_check.sh`).
+  It resolves the tier's 2,674 shader names through the default overlay order (all resolved), 2,321 libraries: 1,764
+  with lookups (620 from the overlays' kept MSL, 1,142 rebuilt from the corpus SPIR-V with their recorded options,
+  each row's original key recomputed first, 2 `.msl` rows); the rest keep their metallib. Then the 2,595 tier pipelines
+  that use a changed library go to `WORK/arch`.
+- **Exactness (M):** the overlays' kept `.metal.gz` compile to their shipped metallibs byte for byte (6 of 6 checked),
+  so a rehashed library differs only by the wrap; the wrap + helper equal `descriptor_table.h`'s
+  `hash_descriptor_key(fnv1a_fmix32)` on 4 M random keys (0 differ, `rehash_check.sh`); 33 of 33 SPIR-V rows
+  reproduced their recorded key before the pass was added.
+- **Time (M, 50 libraries with lookups, serial, nice 19, one other world run going, load 5-7):** 17 MSL rows 34.9 s
+  (2.06 s each), 33 SPIR-V rows 216.4 s (6.56 s each), 0 failed; tier: 86 pipelines of those rows 310.9 s with one
+  compile at a time (50 compiled, 6.2 s each; 36 archive hits), 0 failed. **Estimate: libraries 620 x 2.06 + 1,142 x
+  6.56 = 8,770 s serial = 49 min with 3 jobs; pipelines 2,595 x 50/86 x 6.2 s = 9,350 s serial = 52 min with 3 jobs;
+  about 1 h 41 min on a machine with no world run** (I: linear in jobs; while world runs go on, library jobs pause and
+  the tier compiles one at a time: ~3.5 h). Not started: it could not finish and be verified in a world run within
+  this task. Run after it: `GTA6RT_METAL_TABLE_HASH=fnv1a_fmix32 SHADERC_HASH_KIND=fnv1a_fmix32
+  GTA6RT_METAL_TABLE_CLUSTER_CAP_MB=0 GTA6RT_METAL_SHADER_OVERLAY=WORK/overlay.tsv:<default list>
+  GTA6RT_METAL_ARCHIVE_TIERS=<port>/build/pc7/arch-world:WORK/arch` (I: 38.9 k keys in 2^16 slots, 2.5 MiB:
+  -157 MiB wired, -315 MiB footprint against the capped table).
+
+### 4. Malloc (M)
+
+- Census: in-process tools stop the title (d1: `heap -s` 18 s), which the 2 s CB abort ends; MallocStackLogging lite
+  starts under Rosetta ("pages will be included in process footprint") but `malloc_history` needs the same pause, so no
+  call-site census. Size classes instead, d1 world+5 s (`heap -s`) against ten-c world+93 s: blocks 48 KiB-1 MiB 1,910
+  (306 MiB) -> 2,982 (691 MiB), > 1 MiB +107 MiB (the table's CPU copy 160), <= 48 KiB +92 MiB.
+- **Top layer-side term: every Metal library keeps a malloc copy of its metallib.** port/metal
+  `create_library_metallib` gave Metal a `dispatch_data` with the DEFAULT destructor (a copy), and Metal keeps it
+  (`d3d12_metal/tools/lib_data_probe.mm`, 800 world metallibs, 129 MiB on disk: footprint +145.5 MiB as a copy, +1.2
+  MiB over a read-only file mapping, +5.4 via `newLibraryWithURL`). **Fixed (default on):** the bytes go to a
+  content-addressed file (`GTA6RT_METAL_LIBRARY_CACHE`, default `$TMPDIR/gta6rt-metallib-<uid>`, 684 MiB / 1,984 files
+  after these runs; written once, temporary name + rename, never modified, compared after mapping) and Metal gets a
+  read-only `MAP_PRIVATE` mapping (`GTA6RT_METAL_LIBRARY_FILE_BACKED=0`: the copy). r2: malloc flat at 1.80 GiB from
+  world+60 s (d3: 2.60 GiB at world+52; ten-a 2.61 at +71). A cleaner variant for the store owner: `newLibraryWithURL`
+  on the store's own path (needs a path in `gpu::Device`'s API and `metal_shaders.cpp`), no second copy on disk.
+
+### 5. The 10-minute run (r2, M)
+
+| world minute | footprint (MiB) | malloc | Metal allocated | graphics ledger | layer "other" | machine wired peak | compressor peak | wired + compressor peak | frames/s (HUD median) | frame ms |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 0-1 | 9,240-13,894 | 1,243-1,776 | 5,555-8,034 | 2,418-4,777 | 108-890 | 9,428 | 5,027 | 14,116 | 3.0 | 384 |
+| 1-1.7 | 13,398-13,650 | 1,769-1,803 | 7,796-8,423 | 4,363-4,469 | 1,013-1,018 | 9,644 | 5,233 | 14,783 | 3.0 | 322 |
+
+**Ended at world+102 s on the 4 Hz machine-wired stop (9,734 >= 9,728), not on the footprint cap** (13,524 of 14,848).
+Machine wired was 2,900 MiB before the game; 9,4xx-9,6xx through the second minute (ten-final 9,039 / 9,612; d3
+9,799 at world+52). So with footprint off the critical path, **machine wired is what ends runs now**, and none of my
+changes moves it much (the table's GPU copy is 160 MiB, pipelines' code ~1 GiB in "other"; the rest is title pool
+pages resident, title copies 1.2 GiB, render targets 1.05 GiB, driver scratch in the graphics ledger: not my files).
+Walk/turn inputs started at world+77 s (process 150 s); the run ended 25 s later, so no walking minutes measured.
+verify-s4: not updated (no run lasted).
+
+### Switches and files (this round)
+
+- Default on, same-binary off/on above: libraries over file mappings (`GTA6RT_METAL_LIBRARY_FILE_BACKED=0`), the
+  prebuild window under the auto rule (`GTA6RT_METAL_PCACHE_PREBUILD=all|cold|window`; auto = r2's window in a
+  directory with history and default shaders, d3's "all" otherwise), the table cap 160 MiB with bare FNV-1a
+  (`GTA6RT_METAL_TABLE_CLUSTER_CAP_MB=0`). Off: `GTA6RT_METAL_PIPELINE_MEM_LOG`, `GTA6RT_METAL_TABLE_HASH` (fnv1a).
+- port/metal `src/mtl_device.mm` (`create_library_metallib` + static helpers `library_file_backed`,
+  `library_cache_dir`, `library_hash`, `map_library_file`, `file_backed_library_data`), `src/mtl_pipeline.mm`
+  (`PipelineCore::run_build`); `cache/src/pcache.cpp` (`State`, `startable_locked`, `note_cold_locked`,
+  `write_locked`, `poll_locked`, `start`), `cache/include/pcache.h` (comment); `src/metal_bindless.cpp`
+  (`table_hash_kind`, constructor, `cluster_refused`); `shaderc_msl/tools/shaderc_msl.py` (`hash_fmix32`,
+  `msl_fixups`, `prepare`, `main`); new `d3d12_metal/tools/lib_data_probe.mm`, `rehash_world.py`,
+  `rehash_world.sh`, `rehash_check.sh`.
+
+### Next (ranked)
+
+1. Machine wired (the stop at 9,728 MiB): an attribution of the game's ~6.7 GiB wired (title pool pages resident,
+   title copies, RTs, driver scratch, pipelines) with `footprint` snapshots outside the 2 s CB rule's reach, then the
+   texture-copy use stamp (round 14, 4) and the tmem worker's scratch.
+2. Run `rehash_world.sh` on a quiet machine, then a world run with fmix32 (-157 MiB wired, -315 MiB footprint).
+3. World entry with the prebuild window: one black present at world+5 s while 1,452 pipelines are made from the
+   archive. Prebuilding the phase's whole opening (r3) costs too much; next try: more compile threads for demand
+   (archive hits are 15-70 ms each) during the world's first 15 s, or a recorded "used in >= 2 of the last runs" set.
+4. The device-shim proposal for the 109 k public PSO views (-200 MiB malloc).
+
 ## Round 13, compute-speed worker, continued (2026-11-27 11:20-13:10): the "~100 ms of encoder overhead" is the per-dispatch timer's own serialization; real encoder boundaries cost <1 ms a frame; the lossless passes make the hot compute kernels slower or no faster in the world, so nothing ships default
 
 Tree `build/cspeed-x86_64`, binary `gta6rt.b2` (live sources of 11:45 + my changes; the same binary in every A/B).

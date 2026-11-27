@@ -544,6 +544,8 @@ def _scalar_rw_with_meta(ins, meta):
         src_start = 0
 
     rd = meta[5]
+    if E64_MASK_EXACT and ins["op"].endswith("_e64") and meta[0] in _IMPLICIT_VCC_READS:
+        rd &= ~(1 << _BIT_VCC)   # translator-fork wround_halves: the VOP3 form names its mask (read in the loop below)
     may_w = meta[6] | vcc_imp_w
     flags = meta[8]
     no_kill_dest = flags & _FLAG_NO_KILL_DEST
@@ -896,7 +898,7 @@ def _classify_block_body(insns, lane_masks, scc_live, mask_writes):
             return False, _EMPTY_MEM_STATS, 0, (), ()
         flags = m[8]
         # 1. Strictly forbidden opcodes inside a lane-local folded region (cross-lane, barrier, unmasked writes).
-        if flags & _FLAG_FORBIDDEN_FOLD or _vcc_pair_collects_mask(ins, lane_masks):
+        if (flags & _FLAG_FORBIDDEN_FOLD and not ins.get("lane_local_ok")) or _vcc_pair_collects_mask(ins, lane_masks):
             return False, _EMPTY_MEM_STATS, 0, (), ()
 
         acc = m[9]
@@ -1173,6 +1175,7 @@ def find_local_exec_folds(blocks, raw_edges, succ, lane_masks, scc_live, mask_wr
     has_mask_writes = bool(mask_writes)
     has_scc_live = bool(scc_live)
 
+    own_bit = set()             # translator-fork wround_halves: vcc branches decided by the lane's own bit in a fold
     for b, insns in enumerate(active_blocks):
         u_mask = 0
         k_mask = 0
@@ -1195,6 +1198,8 @@ def find_local_exec_folds(blocks, raw_edges, succ, lane_masks, scc_live, mask_wr
             if m[1]:
                 op = m[0]
                 term = ("end", None) if op == "s_endpgm" else ("br", op)
+                if ins.get("fold_own_bit"):
+                    own_bit.add(b)
                 break
             if not clean:
                 continue
@@ -1202,7 +1207,7 @@ def find_local_exec_folds(blocks, raw_edges, succ, lane_masks, scc_live, mask_wr
                 clean = False
                 continue
             flags = m[8]
-            if flags & _FLAG_FORBIDDEN_FOLD or _vcc_pair_collects_mask(ins, lane_masks):
+            if (flags & _FLAG_FORBIDDEN_FOLD and not ins.get("lane_local_ok")) or _vcc_pair_collects_mask(ins, lane_masks):
                 clean = False
                 continue
             acc = m[9]
@@ -1351,7 +1356,8 @@ def find_local_exec_folds(blocks, raw_edges, succ, lane_masks, scc_live, mask_wr
                 ok = False
                 break
             if tkind == "br":
-                if top in ("s_cbranch_vccz", "s_cbranch_vccnz"):
+                if top in ("s_cbranch_vccz", "s_cbranch_vccnz") and (
+                        u not in own_bit or _region_has_cycle(region, succ)):
                     ok = False
                     break
                 if top in ("s_cbranch_execz", "s_cbranch_execnz"):
@@ -1467,6 +1473,7 @@ def _is_uniform_scc_safe(active_blocks, lane_masks, scc_live):
 
 
 UNIFORM_IDS = frozenset()   # translator-fork (wave_uniform.py): instructions whose exchanges are lane-local
+E64_MASK_EXACT = False      # translator-fork (wround_halves.py, --wave-rounds): see _scalar_rw_with_meta
 BARRIER_TAIL = False        # translator-fork --barrier-tail: an s_barrier in a wave-divergent region starts the tail
 
 

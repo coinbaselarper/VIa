@@ -26,6 +26,10 @@
 #include "../src/title_va_alias.h"
 #include "d3d12_xs_device.h"
 #include "xmem.h"
+#include <gta6rt/isa.h>
+#ifdef __APPLE__
+#include <os/os_sync_wait_on_address.h>
+#endif
 #ifdef LEONIDA_VULKAN_DEVICE
 #include "d3d12_com.h"  // rt::d3d12::create_console_descriptor_heap for slot 14
 #include "../src/vulkan_gpu_labels.h"
@@ -312,6 +316,23 @@ bool local_accessible(std::uint64_t address, std::uint64_t bytes, bool write) {
     return true;
 }
 
+// LEONIDA_PLACED_ARGS_FAST (1 by default, 0: off): the placed-view argument structs and a write-through inside one
+// 4 KiB page are copied with a fault-safe copy before any VirtualQuery; only when that copy faults are the ranges asked
+// about as before, so an uncommitted, unreadable, read-only or guard page gets the same answer (the fault guard runs
+// ahead of the os handler, so a guard page stays armed). 54-64 k CreatePlacedView calls a second in the world, each
+// with 2-4 VirtualQuery (mach_vm_region for xmem memory): ~6 x 6% of a core of kernel time (spike/r12-cpuprofile).
+// =verify: the fast path is used and the ranges are asked about as well; a range the copy read or wrote that the
+// queries would have refused is counted (placed_args_differ), with the copies that faulted (placed_args_slow).
+int placed_args_mode() {
+    static const int mode = [] {
+        const char* v = std::getenv("LEONIDA_PLACED_ARGS_FAST");
+        return v && *v == '0' ? 0 : v && std::strcmp(v, "verify") == 0 ? 2 : 1;
+    }();
+    return mode;
+}
+bool placed_args_fast() { return placed_args_mode() != 0; }
+std::atomic<std::uint64_t> g_placed_args_fast{0}, g_placed_args_slow{0}, g_placed_args_differ{0};
+
 void local_write_through(const DeviceProxy* device, D3D12_CPU_DESCRIPTOR_HANDLE custom, SIZE_T count) {
     if (!local_desc_mirror() || !custom.ptr || !count) return;
     if (!g_custom_range_count.load(std::memory_order_acquire)) return;
@@ -324,10 +345,21 @@ void local_write_through(const DeviceProxy* device, D3D12_CPU_DESCRIPTOR_HANDLE 
         const SIZE_T bytes = count * it->stride;
         if (offset > (std::numeric_limits<SIZE_T>::max)() - it->real_start) return;
         const SIZE_T real = it->real_start + offset;
-        // On Wine, VirtualQuery can report a live vkMapMemory span as MEM_FREE.
-        if (real == custom.ptr || (!it->mapped && !local_accessible(real, bytes, false)) ||
-            !local_accessible(custom.ptr, bytes, true)) return;
-        std::memcpy(reinterpret_cast<void*>(custom.ptr), reinterpret_cast<const void*>(real), bytes);
+        if (real == custom.ptr) return;
+        const bool one_page = (custom.ptr & 4095) + bytes <= 4096;
+        if (one_page && placed_args_fast() &&
+            rthost::guarded_copy(reinterpret_cast<void*>(custom.ptr), reinterpret_cast<const void*>(real), bytes)) {
+            g_placed_args_fast.fetch_add(1, std::memory_order_relaxed);
+            if (placed_args_mode() == 2 &&
+                ((!it->mapped && !local_accessible(real, bytes, false)) || !local_accessible(custom.ptr, bytes, true)))
+                g_placed_args_differ.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            if (one_page && placed_args_fast()) g_placed_args_slow.fetch_add(1, std::memory_order_relaxed);
+            // On Wine, VirtualQuery can report a live vkMapMemory span as MEM_FREE.
+            if ((!it->mapped && !local_accessible(real, bytes, false)) || !local_accessible(custom.ptr, bytes, true))
+                return;
+            std::memcpy(reinterpret_cast<void*>(custom.ptr), reinterpret_cast<const void*>(real), bytes);
+        }
         static std::atomic<bool> said{false};
         if (!said.exchange(true))
             std::fprintf(stderr, "[rt] d3d12_xs: local: descriptors written for a title-backed heap are also stored at the "
@@ -1231,11 +1263,54 @@ struct FenceMirror {
     std::atomic<bool> arm_failed{false};
 };
 
+// The title waits for a mirror's value with MONITORX/MWAITX (exe+0x4fb0ad0, port/isa zen_wait): a store is followed by
+// gta6rt_isa_monitor_wake so the wait returns at once instead of at its next 20 us poll step.
+// GTA6RT_MONITOR_WAKE=0: no wake; =count: the wake is made here and counted (how many stores found a waiter), logged
+// every 10 s.
+int mirror_wake_mode() {
+    static const int mode = [] {
+        const char* v = std::getenv("GTA6RT_MONITOR_WAKE");
+        return v && *v == '0' ? 0 : v && std::strcmp(v, "count") == 0 ? 2 : 1;
+    }();
+    return mode;
+}
+std::atomic<std::uint64_t> g_mirror_stores{0}, g_mirror_woke{0};
+std::atomic<ULONGLONG> g_mirror_wake_report{0};
+
+void wake_mirror_waiters(FenceMirror* m) {
+    const int mode = mirror_wake_mode();
+    if (!mode) return;
+    const void* at = const_cast<const std::uint64_t*>(&m->completed);
+    g_mirror_stores.fetch_add(1, std::memory_order_relaxed);
+    if (mode == 1) {
+        gta6rt_isa_monitor_wake(at);
+        return;
+    }
+#ifdef __APPLE__
+    if (__builtin_available(macOS 14.4, *))
+        if (os_sync_wake_by_address_all(const_cast<void*>(at), 8, OS_SYNC_WAKE_BY_ADDRESS_NONE) == 0)
+            g_mirror_woke.fetch_add(1, std::memory_order_relaxed);
+#endif
+    const ULONGLONG now = GetTickCount64();
+    ULONGLONG last = g_mirror_wake_report.load(std::memory_order_relaxed);
+    if (!last) {
+        g_mirror_wake_report.compare_exchange_strong(last, now, std::memory_order_relaxed);
+        return;
+    }
+    if (now - last < 10000 || !g_mirror_wake_report.compare_exchange_strong(last, now, std::memory_order_relaxed)) return;
+    std::fprintf(stderr, "[rt] d3d12_xs: fence slot 12 mirror wakes in %.0f s: %llu stores, %llu found a MWAITX waiter\n",
+                 double(now - last) / 1000.0,
+                 static_cast<unsigned long long>(g_mirror_stores.exchange(0, std::memory_order_relaxed)),
+                 static_cast<unsigned long long>(g_mirror_woke.exchange(0, std::memory_order_relaxed)));
+}
+
 std::uint64_t refresh_mirror(FenceMirror* m) {
     AcquireSRWLockExclusive(&m->lock);
     const std::uint64_t value = m->fence->GetCompletedValue();
-    if (m->completed != value) m->completed = value;
+    const bool changed = m->completed != value;
+    if (changed) m->completed = value;
     ReleaseSRWLockExclusive(&m->lock);
+    if (changed) wake_mirror_waiters(m);
     return value;
 }
 
@@ -3965,12 +4040,28 @@ void proxy_create_placed_view_x(DeviceProxy* self, bool unordered, std::uint64_t
     const std::uint64_t n = counts.calls.fetch_add(1, std::memory_order_relaxed) + 1;
     std::uint32_t resource[14] = {}, view[16] = {};
     bool read = false;
+    bool copied = false;
 #ifdef LEONIDA_VULKAN_DEVICE
-    read = resource_words && view_words &&
-           accessible_range(reinterpret_cast<const void*>(resource_words), sizeof(resource), false) &&
-           accessible_range(reinterpret_cast<const void*>(view_words), sizeof(view), false);
+    if (resource_words && view_words && placed_args_fast()) {
+        copied = rthost::guarded_copy(resource, reinterpret_cast<const void*>(resource_words), sizeof(resource)) &&
+                 rthost::guarded_copy(view, reinterpret_cast<const void*>(view_words), sizeof(view));
+        if (!copied) {
+            std::memset(resource, 0, sizeof(resource));
+            std::memset(view, 0, sizeof(view));
+            g_placed_args_slow.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            g_placed_args_fast.fetch_add(1, std::memory_order_relaxed);
+            if (placed_args_mode() == 2 &&
+                !(accessible_range(reinterpret_cast<const void*>(resource_words), sizeof(resource), false) &&
+                  accessible_range(reinterpret_cast<const void*>(view_words), sizeof(view), false)))
+                g_placed_args_differ.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    read = copied || (resource_words && view_words &&
+                      accessible_range(reinterpret_cast<const void*>(resource_words), sizeof(resource), false) &&
+                      accessible_range(reinterpret_cast<const void*>(view_words), sizeof(view), false));
 #endif
-    if (read) {
+    if (read && !copied) {
         std::memcpy(resource, reinterpret_cast<const void*>(resource_words), sizeof(resource));
         std::memcpy(view, reinterpret_cast<const void*>(view_words), sizeof(view));
     }
@@ -3987,6 +4078,12 @@ void proxy_create_placed_view_x(DeviceProxy* self, bool unordered, std::uint64_t
 #endif
     (written ? counts.buffers : buffer ? counts.refused : texture_written ? counts.texture_views : counts.textures)
         .fetch_add(1, std::memory_order_relaxed);
+    if (!(n % 262144))
+        std::fprintf(stderr, "[rt] d3d12_xs: placed views and descriptor write-throughs so far: %llu fault-safe copies with no "
+                             "VirtualQuery, %llu faulted and were asked about, %llu the queries would have refused\n",
+                     static_cast<unsigned long long>(g_placed_args_fast.load(std::memory_order_relaxed)),
+                     static_cast<unsigned long long>(g_placed_args_slow.load(std::memory_order_relaxed)),
+                     static_cast<unsigned long long>(g_placed_args_differ.load(std::memory_order_relaxed)));
     if (n <= 8 || !(n % 4096))
         std::fprintf(stderr,
                      "[rt] d3d12_xs: slot %u call %llu: %s of placed memory 0x%llx (%llu bytes), dimension %u, view "

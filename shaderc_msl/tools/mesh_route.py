@@ -21,7 +21,7 @@ import shaderc_msl as S  # noqa: E402
 import batch  # noqa: E402
 
 ROOT = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
-CORPUS = os.path.join(ROOT, "spike/s2-make-game/work/shaders/spirv")
+CORPUS = os.environ.get("GTA6RT_METAL_SPIRV") or os.path.join(ROOT, "spike/s2-make-game/work/shaders/spirv")
 
 
 def jsonl(path):
@@ -44,7 +44,7 @@ def sweep_rows(build):
     return best
 
 
-PROBE = os.path.join(ROOT, "port/build/shaderc_msl/bin2/msl_probe")
+PROBE = os.path.join(HERE, "..", "..", "build", "shaderc_msl", "bin2", "msl_probe")
 
 
 class Probe:

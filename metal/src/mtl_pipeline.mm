@@ -431,10 +431,32 @@ PipelineState PipelineCore::core_state() const {
     return queued.load() ? PipelineState::queued : s;
 }
 
+// GTA6RT_METAL_PIPELINE_MEM_LOG=1: one line a build with Metal's allocated size before and after it (other threads'
+// allocations land in the difference too; the world runs one background compile at a time).
 void PipelineCore::run_build() {
+    static const bool mem_log = [] {
+        const char* v = std::getenv("GTA6RT_METAL_PIPELINE_MEM_LOG");
+        return v && v[0] == '1';
+    }();
+    if (!mem_log) {
+        @autoreleasepool {
+            build();
+        }
+        return;
+    }
+    static std::atomic<std::int64_t> total{0};
+    static std::atomic<std::uint64_t> builds{0};
+    const std::int64_t a0 = std::int64_t(device_->mtl().currentAllocatedSize);
+    const double t0 = now_seconds();
     @autoreleasepool {
         build();
     }
+    const std::int64_t d = std::int64_t(device_->mtl().currentAllocatedSize) - a0;
+    const std::int64_t sum = total += d;
+    std::fprintf(stderr, "[metal] pipeline mem t=%.3f #%llu %s %s %.1f ms: Metal allocated %+.2f MiB (builds %+.1f MiB in all): %s\n",
+                 t0, (unsigned long long)++builds, state_.load() == PipelineState::ready ? "ok" : "failed",
+                 from_archive_ ? "archive" : "compiled", (now_seconds() - t0) * 1e3, d / 1048576.0, sum / 1048576.0,
+                 label_text.c_str());
 }
 
 Status PipelineCore::core_wait() {

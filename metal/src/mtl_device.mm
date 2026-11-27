@@ -13,6 +13,14 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cerrno>
+#include <atomic>
+#include <fcntl.h>
+#include <functional>
+#include <string>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <thread>
 #include <unistd.h>
 
 namespace gta6rt::gpu {
@@ -789,9 +797,110 @@ std::unique_ptr<gpu::ShaderLibrary> MetalDevice::create_library_msl(std::string_
     return std::make_unique<MetalLibrary>(this, lib, std::move(text), secs, options);
 }
 
+// A library made from a copied dispatch_data keeps the copy for its lifetime (+145 MiB footprint for 129 MiB of world
+// metallibs, d3d12_metal/tools/lib_data_probe.mm); over a read-only file mapping it costs ~1 MiB, since clean file pages
+// are not footprint. The bytes are written once to a content-addressed file (name = size + 64-bit hash, written to a
+// temporary name and renamed, never modified), compared with the bytes after mapping, and Metal gets the mapping.
+// GTA6RT_METAL_LIBRARY_FILE_BACKED=0: the copy; GTA6RT_METAL_LIBRARY_CACHE: the directory.
+static bool library_file_backed() {
+    static const bool on = [] {
+        const char* v = std::getenv("GTA6RT_METAL_LIBRARY_FILE_BACKED");
+        return !v || v[0] != '0';
+    }();
+    return on;
+}
+
+static const std::string& library_cache_dir() {
+    static const std::string dir = [] {
+        if (const char* v = std::getenv("GTA6RT_METAL_LIBRARY_CACHE"); v && *v) return std::string(v);
+        const char* t = std::getenv("TMPDIR");
+        std::string base = t && *t ? t : "/tmp";
+        if (base.back() == '/') base.pop_back();
+        return base + "/gta6rt-metallib-" + std::to_string(::getuid());
+    }();
+    return dir;
+}
+
+static std::uint64_t library_hash(std::span<const std::uint8_t> b) {
+    std::uint64_t h = 0x9E3779B97F4A7C15ull ^ b.size();
+    std::size_t i = 0;
+    for (; i + 8 <= b.size(); i += 8) {
+        std::uint64_t w;
+        std::memcpy(&w, b.data() + i, 8);
+        h = (h ^ w) * 0x100000001B3ull;
+        h ^= h >> 29;
+    }
+    for (; i < b.size(); ++i) h = (h ^ b[i]) * 0x100000001B3ull;
+    return h;
+}
+
+static void* map_library_file(const std::string& path, std::size_t size) {
+    const int fd = ::open(path.c_str(), O_RDONLY);
+    if (fd < 0) return nullptr;
+    struct stat sb {};
+    void* p = MAP_FAILED;
+    if (::fstat(fd, &sb) == 0 && std::size_t(sb.st_size) == size) p = ::mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
+    ::close(fd);
+    return p == MAP_FAILED ? nullptr : p;
+}
+
+static dispatch_data_t file_backed_library_data(std::span<const std::uint8_t> bytes) {
+    struct Counts {
+        std::atomic<std::uint64_t> mapped{0}, written{0}, failed{0}, bytes{0};
+    };
+    static Counts counts;
+    if (bytes.empty()) return nil;
+    const std::string& dir = library_cache_dir();
+    char name[64];
+    std::snprintf(name, sizeof name, "/%zu-%016llx.metallib", bytes.size(), (unsigned long long)library_hash(bytes));
+    const std::string path = dir + name;
+    void* p = map_library_file(path, bytes.size());
+    if (p && std::memcmp(p, bytes.data(), bytes.size()) != 0) {
+        ::munmap(p, bytes.size());
+        p = nullptr;
+    }
+    if (!p) {
+        ::mkdir(dir.c_str(), 0700);
+        char tmp[96];
+        std::snprintf(tmp, sizeof tmp, ".%d.%llx.tmp", int(::getpid()),
+                      (unsigned long long)std::hash<std::thread::id>{}(std::this_thread::get_id()));
+        const std::string part = path + tmp;
+        const int fd = ::open(part.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        bool ok = fd >= 0;
+        for (std::size_t at = 0; ok && at < bytes.size();) {
+            const ssize_t n = ::write(fd, bytes.data() + at, bytes.size() - at);
+            if (n <= 0) ok = false;
+            else at += std::size_t(n);
+        }
+        if (fd >= 0 && ::close(fd) != 0) ok = false;
+        if (ok) ok = ::rename(part.c_str(), path.c_str()) == 0;
+        if (!ok) ::unlink(part.c_str());
+        if (ok) p = map_library_file(path, bytes.size());
+        if (p && std::memcmp(p, bytes.data(), bytes.size()) != 0) {
+            ::munmap(p, bytes.size());
+            p = nullptr;
+        }
+        if (p) counts.written++;
+    }
+    if (!p) {
+        if (counts.failed++ < 4)
+            std::fprintf(stderr, "[metal] library file mapping failed for %s (%s): the library keeps a copy\n",
+                         path.c_str(), std::strerror(errno));
+        return nil;
+    }
+    const std::uint64_t n = ++counts.mapped;
+    counts.bytes += bytes.size();
+    if (n == 1 || !(n & (n - 1)))
+        std::fprintf(stderr, "[metal] libraries over read-only file mappings: %llu (%.1f MiB, %llu files written now) in %s\n",
+                     (unsigned long long)n, counts.bytes.load() / 1048576.0, (unsigned long long)counts.written.load(),
+                     dir.c_str());
+    return dispatch_data_create(p, bytes.size(), nullptr, DISPATCH_DATA_DESTRUCTOR_MUNMAP);
+}
+
 std::unique_ptr<gpu::ShaderLibrary> MetalDevice::create_library_metallib(std::span<const std::uint8_t> bytes,
                                                                          std::string* error) {
-    dispatch_data_t data = dispatch_data_create(bytes.data(), bytes.size(), nullptr, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
+    dispatch_data_t data = library_file_backed() ? file_backed_library_data(bytes) : nil;
+    if (!data) data = dispatch_data_create(bytes.data(), bytes.size(), nullptr, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
     NSError* err = nil;
     const double t0 = now_seconds();
     id<MTLLibrary> lib = [device_ newLibraryWithData:data error:&err];

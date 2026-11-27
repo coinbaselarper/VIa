@@ -11,7 +11,8 @@ import argparse, json, os, re, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import spv  # noqa: E402
 
-CORPUS = "/Users/a/Desktop/Projects/GTA-VI/spike/s2-make-game/work/shaders/spirv"
+CORPUS = os.environ.get("GTA6RT_METAL_SPIRV") or os.path.abspath(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "spike", "s2-make-game", "work", "shaders", "spirv"))
 OP_TYPE_MATRIX, OP_TYPE_RUNTIME_ARRAY, OP_FUNCTION_END, OP_FUNCTION_CALL = 24, 29, 56, 57
 OP_PTR_ACCESS_CHAIN, OP_COPY_MEMORY, OP_CONSTANT_NULL, OP_CONSTANT_COMPOSITE = 67, 63, 46, 44
 CHAINS = (spv.OP_ACCESS_CHAIN, spv.OP_IN_BOUNDS_ACCESS_CHAIN, OP_PTR_ACCESS_CHAIN, 70)

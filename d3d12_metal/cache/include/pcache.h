@@ -89,6 +89,11 @@ std::string archive_version(const std::string& port_root, const std::string& cat
 // GTA6RT_METAL_PCACHE_RELEASE_S (30): a prebuilt pipeline unused that long after its recorded first use is released.
 // GTA6RT_METAL_PCACHE_AHEAD_S (10, 0 = no limit): a recorded pipeline is prebuilt at most that long before its
 // recorded first use (a later phase's from that phase's start).
+// GTA6RT_METAL_PCACHE_PREBUILD: window: a pipeline an archive or tier lists is made at its first use (an archive hit);
+// pipelines compiled in earlier runs (pcache-cold.txt) are prebuilt within the current phase's window; cold: no window;
+// all: every recorded pipeline is prebuilt (the round-14 behaviour; ~660 never used). Unset/auto (default since round
+// 15): window when this directory has a pcache-cold.txt from an earlier run and neither GTA6RT_METAL_SHADER_OVERLAY nor
+// GTA6RT_METAL_ARCHIVE_TIERS is set, else all.
 gpu::Status open_archive(gpu::Device& device, const std::string& directory, const std::string& version, bool load,
                          std::string* log);
 

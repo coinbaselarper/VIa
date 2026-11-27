@@ -32,7 +32,8 @@ import spv  # noqa: E402
 PORT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 STORE = os.path.join(PORT, "build", "shaderc_msl", "runs", "main")
 STORE_ROOT = os.path.join(PORT, "build", "shaderc_msl")
-SPIRV = os.path.abspath(os.path.join(PORT, "..", "spike", "s2-make-game", "work", "shaders", "spirv"))
+SPIRV = os.path.abspath(os.environ.get("GTA6RT_METAL_SPIRV") or
+                        os.path.join(PORT, "..", "spike", "s2-make-game", "work", "shaders", "spirv"))
 LIMIT = 32768
 VERSION = "mesh_tg_pack 2"
 

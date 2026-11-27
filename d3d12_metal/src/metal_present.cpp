@@ -23,13 +23,14 @@ constexpr std::int32_t kInvalidArg = std::int32_t(0x80070057u);     // E_INVALID
 constexpr std::int32_t kDeviceRemoved = std::int32_t(0x887A0005u);  // DXGI_ERROR_DEVICE_REMOVED
 }  // namespace
 
-// GTA6RT_METAL_WORLD_PRESENT_DUMP=dir[,every[,count]]: once the scene probe has seen an upscaled frame (the world),
-// every `every`-th presented frame (default 10) is written as dir/world_present_<frame>.png, `count` times (default 6).
+// GTA6RT_METAL_WORLD_PRESENT_DUMP=dir[,every[,count[,first]]]: once the scene probe has seen an upscaled frame (the
+// world; with `first`, that many upscaled frames), every `every`-th presented frame (default 10) is written as
+// dir/world_present_<frame>.png, `count` times (default 6).
 struct MetalPresenter::Dump {
     present_dump::PresentDump writer;
     std::vector<std::uint8_t> pixels;
     std::string world_dir;
-    std::uint64_t world_every = 10, world_count = 6, world_done = 0, world_seen = 0;
+    std::uint64_t world_every = 10, world_count = 6, world_done = 0, world_seen = 0, world_first = 1;
     Dump() {
         const char* v = std::getenv("GTA6RT_METAL_WORLD_PRESENT_DUMP");
         if (!v || !*v) return;
@@ -37,15 +38,17 @@ struct MetalPresenter::Dump {
         const std::size_t c = s.find(',');
         world_dir = s.substr(0, c);
         if (c != std::string::npos) {
-            unsigned long long e = 0, n = 0;
-            const int got = std::sscanf(s.c_str() + c + 1, "%llu,%llu", &e, &n);
+            unsigned long long e = 0, n = 0, f = 0;
+            const int got = std::sscanf(s.c_str() + c + 1, "%llu,%llu,%llu", &e, &n, &f);
             if (got >= 1 && e) world_every = e;
             if (got >= 2) world_count = n;
+            if (got >= 3 && f) world_first = f;
         }
         ::mkdir(world_dir.c_str(), 0755);
     }
     bool world_due(SceneProbe* scene) {
-        if (world_dir.empty() || world_done >= world_count || !scene || !scene->upscaled_frames()) return false;
+        if (world_dir.empty() || world_done >= world_count || !scene || scene->upscaled_frames() < world_first)
+            return false;
         return world_seen++ % world_every == 0;
     }
 };

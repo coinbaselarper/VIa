@@ -38,3 +38,7 @@
 *.gz
 *.rlib
 *.rmeta
+
+!metal/tests/shaders/*.metal
+!shaderc_msl/tools/soft_f64.metal
+io_bench/results/

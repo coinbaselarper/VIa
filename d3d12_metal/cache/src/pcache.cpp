@@ -23,6 +23,7 @@
 #include <tuple>
 #include <unistd.h>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace gta6rt::pcache {
 
@@ -82,7 +83,12 @@ struct State {
     StartConfig cfg;
     bool started = false, stopping = false, paused = false;
     std::atomic<bool> ready{false};
-    std::string manifest_path, run_path;
+    std::string manifest_path, run_path, cold_path;
+    // Keys whose pipeline was compiled, not found in an archive (pcache-cold.txt beside the manifest): the window mode
+    // prebuilds these (a library built from MSL at run time, for example, never comes from an archive).
+    std::unordered_set<std::string> cold_keys;
+    std::string cold_lines;
+    bool cold_known = false, cold_written = false;
     Manifest prior, run;
     bool dirty = false;
     std::unordered_map<std::string, Phase> boot_keys, boot_labels;
@@ -96,7 +102,8 @@ struct State {
     Phase phase = Phase::boot;
     double phase_t0[8] = {};
     double release_s = 30, ahead_s = 10;
-    bool cold_only = false;  // GTA6RT_METAL_PCACHE_PREBUILD=cold
+    bool cold_only = true;      // GTA6RT_METAL_PCACHE_PREBUILD unset, =window or =cold
+    bool phase_window = true;   // GTA6RT_METAL_PCACHE_PREBUILD unset or =window
     std::uint32_t min_runs = 1;  // GTA6RT_METAL_PCACHE_MIN_RUNS
     bool movie = false;
     double quiet_until = 0, quiet_s = 10;
@@ -144,6 +151,10 @@ void log_line(const char* fmt, ...) {
     std::fprintf(stderr, "[rt] pcache: %s\n", buf);
 }
 
+void note_cold_locked(State& s, const std::string& key) {
+    if (s.cold_keys.insert(key).second) s.cold_lines += key + "\n";
+}
+
 // Called with the lock held.
 std::tuple<int, int, std::uint64_t, std::string> queue_key(const Held& h) {
     return {h.bootstrap ? 1 : 0, int(h.phase), h.seq, h.key};
@@ -158,8 +169,17 @@ void enqueue_locked(State& s, Held& h) {
 // The first seconds of the world (its opening cutscene) and of a movie: only pipelines recorded for the phase so
 // far are prebuilt, no guesses and nothing of a later phase. Otherwise a recorded pipeline is prebuilt at most
 // ahead_s before its recorded first use (a later phase counts from that phase's start), which bounds what is held.
+// Window mode (the default): only what an archive does not hold is prebuilt (pcache-cold.txt), and only once its
+// recorded first use is in the current phase and at most ahead_s away; nothing of an earlier or later phase, no
+// bootstrap guesses. Prebuilding each phase's opening seconds as well (archive hits included) was measured in lrun-r3:
+// 2,341 prebuilt, +0.6 GiB footprint at world+50 s and the wired stop at world+48 s, against world+102 s without.
 bool startable_locked(const State& s, const Held& h) {
     const double now = process_age_s();
+    if (s.phase_window) {
+        if (h.bootstrap || int(h.phase) != int(s.phase)) return false;
+        const double rel = now - s.phase_t0[int(s.phase)];
+        return s.ahead_s <= 0 || h.expect_rel <= rel + s.ahead_s;
+    }
     if (now < s.quiet_until && (h.bootstrap || int(h.phase) > int(s.phase))) return false;
     if (s.ahead_s <= 0 || h.bootstrap || int(h.phase) < int(s.phase)) return true;
     const double rel = int(h.phase) == int(s.phase) ? now - s.phase_t0[int(s.phase)] : 0;
@@ -205,6 +225,14 @@ void note_use_locked(State& s, const std::string& key, const std::string& text, 
 
 void write_locked(State& s, const char* why) {
     if (s.manifest_path.empty()) return;
+    if (!s.cold_path.empty() && (!s.cold_lines.empty() || (!s.cold_written && s.phase == Phase::world))) {
+        s.cold_written = true;
+        if (FILE* f = std::fopen(s.cold_path.c_str(), "a")) {
+            std::fwrite(s.cold_lines.data(), 1, s.cold_lines.size(), f);
+            std::fclose(f);
+            s.cold_lines.clear();
+        }
+    }
     if (s.dirty) {
         Manifest merged = s.prior;
         merged.merge(s.run, true);
@@ -423,6 +451,7 @@ void poll_locked(State& s) {
         }
         ++s.stats.prebuilt;
         if (p->from_archive()) ++s.stats.prebuilt_from_archive;
+        else note_cold_locked(s, h.key);
         s.stats.prebuild_seconds += now - h.t_start;
         h.state = HeldState::ready;
         h.t_ready = now;
@@ -444,6 +473,7 @@ void poll_locked(State& s) {
             ++s.stats.waits;
             s.stats.wait_sum += waited;
             if (!w.adopted) ++(w.pipeline->from_archive() ? s.stats.demand_ready_from_archive : s.stats.demand_compiled);
+            if (!w.pipeline->from_archive()) note_cold_locked(s, w.key);
             if (s.world_t0 > 0 && waited > s.world_wait_longest) {
                 s.world_wait_longest = waited;
                 s.world_wait_label = w.key;
@@ -772,10 +802,35 @@ void start(const StartConfig& config) {
     if (const char* v = std::getenv("GTA6RT_METAL_PCACHE_QUIET_S")) s.quiet_s = std::atof(v);
     if (const char* v = std::getenv("GTA6RT_METAL_PCACHE_RELEASE_S")) s.release_s = std::atof(v);
     if (const char* v = std::getenv("GTA6RT_METAL_PCACHE_AHEAD_S")) s.ahead_s = std::atof(v);
-    if (const char* v = std::getenv("GTA6RT_METAL_PCACHE_PREBUILD")) s.cold_only = std::string(v) == "cold";
+    const char* prebuild_mode = std::getenv("GTA6RT_METAL_PCACHE_PREBUILD");
+    if (prebuild_mode && *prebuild_mode && std::string(prebuild_mode) != "auto") {
+        const std::string m = prebuild_mode;
+        s.cold_only = m != "all";
+        s.phase_window = m != "all" && m != "cold";
+    }
     if (const char* v = std::getenv("GTA6RT_METAL_PCACHE_MIN_RUNS")) s.min_runs = std::uint32_t(std::max(1, std::atoi(v)));
     ::mkdir(config.directory.c_str(), 0755);
     s.manifest_path = config.directory + "/pcache-manifest.txt";
+    s.cold_path = config.directory + "/pcache-cold.txt";
+    {
+        std::ifstream cold(s.cold_path);
+        s.cold_known = bool(cold);
+        for (std::string line; std::getline(cold, line);)
+            if (line.size() == 16) s.cold_keys.insert(line);
+    }
+    // Auto (the default): the window only where its premise holds, i.e. the recorded pipelines are archive hits: an
+    // earlier run in this directory listed what it compiled (pcache-cold.txt, written once a run reaches the world),
+    // and the shaders are the default overlays and tier the tier was folded for. A fresh run directory, or one with
+    // GTA6RT_METAL_SHADER_OVERLAY / GTA6RT_METAL_ARCHIVE_TIERS set, prebuilds everything recorded (round 14): with the
+    // window, a fresh directory made ~1,200 pipelines at first use and showed black for 100 s (subcpu-b/-c1).
+    if (!prebuild_mode || !*prebuild_mode || std::string(prebuild_mode) == "auto") {
+        const auto set = [](const char* n) { const char* v = std::getenv(n); return v && *v; };
+        const bool window = s.cold_known && !set("GTA6RT_METAL_SHADER_OVERLAY") && !set("GTA6RT_METAL_ARCHIVE_TIERS");
+        s.cold_only = s.phase_window = window;
+        log_line("prebuild auto: %s (%s)", window ? "window" : "all",
+                 window ? "pcache-cold.txt from an earlier run, default overlays and tier"
+                 : !s.cold_known ? "no pcache-cold.txt in this directory yet" : "overlays or tiers set");
+    }
     {
         const std::string runs = config.directory + "/pcache-runs";
         ::mkdir(runs.c_str(), 0755);
@@ -823,7 +878,9 @@ void start(const StartConfig& config) {
             }
             const bool fresh = !s.table.count(e.key);
             Held& h = add_locked(s, e.key, e.text, spec, e.phase, false);
-            if (!changed) h.archived = true;
+            // Re-keyed entries are archive hits too when the tier was rebuilt over the current catalog (ten-g: 2,597
+            // of 2,597 prebuilt from the archive, 2,357 of them re-keyed), so the window mode makes them at first use.
+            if ((!changed || s.phase_window) && !s.cold_keys.count(e.key)) h.archived = true;
             h.runs = std::max(h.runs, e.runs);
             if (!fresh) {
                 h.expect_rel = std::min(h.expect_rel, rel[i].t);
@@ -863,14 +920,18 @@ void start(const StartConfig& config) {
     }
     load_bootstrap(s, config.directory + "/pcache-bootstrap.txt");
     if (rekeyed) log_line("%zu recorded pipelines re-keyed to the shaders' current content keys", rekeyed);
+    if (!s.cold_keys.empty()) log_line("%zu pipelines compiled, not found in an archive, in earlier runs (%s)", s.cold_keys.size(), s.cold_path.c_str());
     log_line("manifest %s: %zu pipelines%s; prebuilding in phase order, %u at a time, holding up to %zu, %.0f s ahead of "
              "recorded first use, released %.0f s after it unused", s.manifest_path.c_str(),
              s.prior.size(), bad ? (" (" + std::to_string(bad) + " unreadable)").c_str() : "", s.cfg.max_in_flight,
              s.max_hold, s.ahead_s, s.release_s);
     if (s.cold_only || s.min_runs > 1)
-        log_line("%s: %llu pipelines an archive lists are made at their first use, %zu prebuilt",
-                 s.cold_only ? "GTA6RT_METAL_PCACHE_PREBUILD=cold" : "GTA6RT_METAL_PCACHE_MIN_RUNS (fewer runs at first use)",
-                 (unsigned long long)s.stats.on_demand, s.queue.size());
+        log_line("%s: %llu pipelines an archive lists are made at their first use, %zu prebuilt%s",
+                 s.phase_window ? "prebuild window (GTA6RT_METAL_PCACHE_PREBUILD unset; =all: everything recorded)"
+                 : s.cold_only  ? "GTA6RT_METAL_PCACHE_PREBUILD=cold"
+                                : "GTA6RT_METAL_PCACHE_MIN_RUNS (fewer runs at first use)",
+                 (unsigned long long)s.stats.on_demand, s.queue.size(),
+                 s.phase_window ? " when their recorded first use is in the current phase window" : "");
     if (gta6rt_governor_register) gta6rt_governor_register(GTA6RT_GOV_COMPILE_SHRINK, "pcache prebuild", governor_reclaim, nullptr);
     s.worker = std::thread(worker_main);
     s.monitor = std::thread(monitor_main);

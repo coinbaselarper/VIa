@@ -17,7 +17,7 @@ sys.path.insert(0, HERE)
 import shaderc_msl as S  # noqa: E402
 import mesh_split_check as C  # noqa: E402
 
-MCVS = os.path.join(C.ROOT, "spike/s2-make-game/tree/tools/mesh_compute_vs.py")
+MCVS = os.path.join(os.path.dirname(C.TRANSLATOR), "mesh_compute_vs.py")
 
 
 def main():

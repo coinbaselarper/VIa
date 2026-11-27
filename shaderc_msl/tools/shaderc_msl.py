@@ -167,6 +167,10 @@ def prepare(words, stage, opts):
         w, r = spv.trim_outputs(w, {int(k): v for k, v in trim.items()})
         passes.append({"pass": "trim_outputs", "widths": {str(k): v for k, v in sorted(r["trimmed"].items())}})
         passes.append({"pass": "pack_mesh_struct", "level": "msl"})
+    if opts.get("hash_kind", "fnv1a") == "fnv1a_fmix32":
+        passes.append({"pass": "hash_fmix32", "level": "msl", "version": 1})
+    elif opts.get("hash_kind", "fnv1a") != "fnv1a":
+        raise ValueError("hash_kind %r: fnv1a or fnv1a_fmix32" % opts["hash_kind"])
     return w, passes, extra
 
 
@@ -388,6 +392,67 @@ def soft_f64(msl):
     return t, True
 
 
+FNV_BASIS, FNV_PRIME = "2166136261u", "16777619u"
+FMIX32_HELPER = """
+static inline __attribute__((always_inline)) uint spvDescriptorFmix32(uint h)
+{
+    h ^= h >> 16u;
+    h *= 0x85EBCA6Bu;
+    h ^= h >> 13u;
+    h *= 0xC2B2AE35u;
+    h ^= h >> 16u;
+    return h;
+}
+"""
+
+
+def hash_fmix32(text):
+    """The descriptor-table lookups' bare FNV-1a over the 8 key words -> fnv1a_fmix32 (portable/src/descriptor_table.h
+    finalize_descriptor_hash): every `(((...(2166136261u ^ w0) * 16777619u) ^ w1) ... ^ w7) * 16777619u` expression is
+    wrapped in spvDescriptorFmix32(). Returns (text, sites); raises when an FNV basis is left that is not such an
+    expression (a lookup this pass does not recognise must not silently keep the old hash)."""
+    out, at, sites = [], 0, 0
+    while True:
+        i = text.find(FNV_BASIS, at)
+        if i < 0:
+            break
+        j = i
+        while j > 0 and text[j - 1] == "(":
+            j -= 1
+        if i - j != 15:
+            raise RuntimeError("hash_fmix32: FNV basis at %d is preceded by %d '(' (want 15)" % (i, i - j))
+        depth, k = 0, j
+        while k < len(text):
+            c = text[k]
+            if c == "(":
+                depth += 1
+            elif c == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+            elif c in ";{}":
+                raise RuntimeError("hash_fmix32: FNV expression at %d not closed before %r" % (i, c))
+            k += 1
+        tail = " * " + FNV_PRIME
+        if not text.startswith(tail, k + 1):
+            raise RuntimeError("hash_fmix32: FNV expression at %d does not end in '%s'" % (i, tail))
+        end = k + 1 + len(tail)
+        expr = text[j:end]
+        if expr.count(FNV_PRIME) != 8:
+            raise RuntimeError("hash_fmix32: FNV expression at %d has %d multiplies (want 8)" % (i, expr.count(FNV_PRIME)))
+        out.append(text[at:j])
+        out.append("spvDescriptorFmix32(" + expr + ")")
+        at = end
+        sites += 1
+    out.append(text[at:])
+    t = "".join(out)
+    if sites:
+        if "using namespace metal;\n" not in t:
+            raise RuntimeError("hash_fmix32: no 'using namespace metal;' line to put the helper after")
+        t = t.replace("using namespace metal;\n", "using namespace metal;\n" + FMIX32_HELPER, 1)
+    return t, sites
+
+
 def msl_fixups(text, passes):
     """MSL-level steps of the recipe, in order; returns (new text or None when unchanged, report)."""
     names = {p["pass"] for p in passes}
@@ -423,6 +488,10 @@ def msl_fixups(text, passes):
         text, c = pack_mesh_struct(text)
         info["mesh_struct_sorted"] = c
         changed |= c
+    if "hash_fmix32" in names:
+        text, c = hash_fmix32(text)
+        info["hash_fmix32_sites"] = c
+        changed |= bool(c)
     return (text if changed else None), info
 
 
@@ -642,9 +711,13 @@ def main():
     ap.add_argument("--merge-typed-reads", action="store_true",
                     help="typed-view read diamonds -> one noinline helper call (thread-private memory, tools/tmem.py)")
     ap.add_argument("--loop-cap", type=int, default=0, help="a lane leaves any loop after this many iterations (0 = off)")
+    ap.add_argument("--hash-kind", default=os.environ.get("SHADERC_HASH_KIND", "fnv1a"),
+                    choices=["fnv1a", "fnv1a_fmix32"],
+                    help="descriptor-table lookup hash (default SHADERC_HASH_KIND, else fnv1a); every library one "
+                         "device loads must use the same kind as its table (GTA6RT_METAL_TABLE_HASH)")
     a = ap.parse_args()
     opts = {"vs_route": a.vs_route, "force": a.force, "dual_source": a.dual_source,
-            "merge_typed_reads": a.merge_typed_reads, "loop_cap": a.loop_cap}
+            "merge_typed_reads": a.merge_typed_reads, "loop_cap": a.loop_cap, "hash_kind": a.hash_kind}
     if a.output_variants:
         import out_types
         opts["output_variants"] = [c for c in a.output_variants.split(",") if c]

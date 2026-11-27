@@ -1817,6 +1817,55 @@ struct DeviceState {
                 return;
             }
     }
+    // GTA6RT_METAL_SHADOW_CENSUS=1 (off by default): with the 5 s shadow line, the copied trackers' bytes by what backs
+    // their title pages now (no pool page, one run of consecutive pool bytes, several runs) and the zero-copy mirrors
+    // made instead of scatter windows. shadow_mutex held.
+    static bool shadow_census_on() {
+        static const bool on = [] {
+            const char* v = std::getenv("GTA6RT_METAL_SHADOW_CENSUS");
+            return v && *v == '1';
+        }();
+        return on;
+    }
+    void shadow_census() {
+        std::uint64_t bytes[3] = {}, trackers[3] = {};
+        for (const ShadowPagesPtr& s : shadows) {
+            std::uint64_t pool = 0, plain = 0, runs = 0;
+            for (std::uint64_t at = s->first(); at < s->last();) {
+                void* host = nullptr;
+                std::uint64_t run = 0;
+                if (rt::xmem::title_pool_view(at, &host, &run) && run) {
+                    const std::uint64_t n = std::min<std::uint64_t>(run, s->last() - at);
+                    pool += n;
+                    ++runs;
+                    at += n;
+                } else {
+                    plain += ShadowPages::kPage;
+                    at += ShadowPages::kPage;
+                }
+            }
+            const unsigned kind = !runs ? 0 : runs == 1 && !plain ? 1 : 2;
+            bytes[kind] += pool + plain;
+            ++trackers[kind];
+            if (pool + plain >= (1u << 20))
+                std::fprintf(stderr, "[rt] d3d12: title window tracker [0x%llx, 0x%llx): %s, %llu pool runs\n",
+                             static_cast<unsigned long long>(s->first()), static_cast<unsigned long long>(s->last()),
+                             kind == 0 ? "no pool page" : kind == 1 ? "one pool run" : "several pool runs or mixed",
+                             static_cast<unsigned long long>(runs));
+        }
+        std::fprintf(stderr, "[rt] d3d12: title windows by backing now: no pool page %llu KiB (%llu trackers), one pool run %llu "
+                             "KiB (%llu), several pool runs or mixed %llu KiB (%llu); scatter copy windows %llu KiB; zero-copy "
+                             "pool mirrors %zu, %llu KiB (%llu pieces, %llu dropped by remaps, %llu refused)\n",
+                     static_cast<unsigned long long>(bytes[0] >> 10), static_cast<unsigned long long>(trackers[0]),
+                     static_cast<unsigned long long>(bytes[1] >> 10), static_cast<unsigned long long>(trackers[1]),
+                     static_cast<unsigned long long>(bytes[2] >> 10), static_cast<unsigned long long>(trackers[2]),
+                     static_cast<unsigned long long>(title_pool_scatter_bytes_seen.load(std::memory_order_relaxed) >> 10),
+                     pool_mirror_count.load(std::memory_order_relaxed),
+                     static_cast<unsigned long long>(pool_mirror_bytes.load(std::memory_order_relaxed) >> 10),
+                     static_cast<unsigned long long>(pool_mirror_pieces.load(std::memory_order_relaxed)),
+                     static_cast<unsigned long long>(pool_mirror_dropped.load(std::memory_order_relaxed)),
+                     static_cast<unsigned long long>(pool_mirror_refused.load(std::memory_order_relaxed)));
+    }
     // heaps / pages: whether this submission refreshes the console heaps and the slot-133 shadows and title windows
     // (LEONIDA_REFRESH_PER_FRAME leaves some submissions without them).
     void refresh_shadows(bool heaps = true, bool pages = true) {
@@ -1893,6 +1942,7 @@ struct DeviceState {
                      kib(ShadowPages::Copy::guarded), kib(ShadowPages::Copy::unguarded), kib(ShadowPages::Copy::aliased),
                      kib(ShadowPages::Copy::pinned), kib(ShadowPages::Copy::read_only),
                      kib(ShadowPages::Copy::copy_on_write), kib(ShadowPages::Copy::write_watched));
+        if (shadow_census_on()) shadow_census();
         shadow_copy_bytes = {};
         shadow_logged = shadow_submissions;
         shadow_log_time = now;
@@ -2751,6 +2801,7 @@ struct DeviceState {
     // its own budget, GTA6RT_METAL_TITLE_POOL_SCATTER_MB (64 by default), outside LEONIDA_TITLE_WINDOWS_MB: the window
     // mirrors the title's pages before every submission, so it follows a remap as the title sees it.
     std::uint64_t title_pool_scatter_bytes = 0, title_pool_scatter_windows = 0, title_pool_scatter_refused = 0;
+    std::atomic<std::uint64_t> title_pool_scatter_bytes_seen{0};  // title_pool_scatter_bytes, for shadow_census
     bool title_pool_scatter_window(std::uint64_t va, std::uint64_t want, std::uint64_t title_hi, std::uint64_t& out) {
         static const std::uint64_t cap = [] {
             const char* v = std::getenv("GTA6RT_METAL_TITLE_POOL_SCATTER_MB");
@@ -2770,6 +2821,12 @@ struct DeviceState {
                              static_cast<unsigned long long>(cap >> 20));
             return false;
         }
+        if (std::uint64_t shader = 0; title_pool_mirror(start, size, shader, true)) {
+            title_pool_scatter_bytes += size;
+            title_pool_scatter_bytes_seen.store(title_pool_scatter_bytes, std::memory_order_relaxed);
+            out = shader + (va - start);
+            return true;
+        }
         const std::uint64_t main_cap = title_window_cap, main_bytes = title_window_bytes;
         title_window_cap = main_bytes + size;
         const std::uint64_t offset = make_title_window(start, size);
@@ -2777,6 +2834,7 @@ struct DeviceState {
         title_window_bytes = main_bytes;
         if (!offset || !leonida::title_va_aliases().add(start, size, offset)) return false;
         title_pool_scatter_bytes += size;
+        title_pool_scatter_bytes_seen.store(title_pool_scatter_bytes, std::memory_order_relaxed);
         const std::uint64_t n = ++title_pool_scatter_windows;
         if (n <= 4 || !(n & (n - 1)))
             std::fprintf(stderr, "[rt] d3d12-metal: title pool: title 0x%llx (%llu bytes) is on scattered pool pages: a "
@@ -2785,6 +2843,134 @@ struct DeviceState {
                          static_cast<unsigned long long>(size >> 10), static_cast<unsigned long long>(n),
                          static_cast<unsigned long long>(title_pool_scatter_bytes >> 10));
         out = offset + (va - start);
+        return true;
+    }
+    // GTA6RT_METAL_TITLE_POOL_MIRROR (off by default; main: main windows; 1: scatter windows too): a window's range on
+    // pool pages is read in place instead of copied, through a host mapping of its own that puts the pool pages behind
+    // it side by side (mach_vm_remap of the pool's mapping, which xmem never moves, protects or unmaps), wrapped by a
+    // bytesNoCopy buffer: nothing is copied before each submission, and GPU writes land in the title's pages. Not
+    // default: in subcpu-c2 the bytes copied fell 83 -> 62 MiB a submission but the copy time rose 1.6 -> 2.7 ms (the
+    // mirrors split the remaining windows into 251 small trackers), and mirrors wire pool pages. Its alias goes when
+    // xmem reports the range remapped (title_pool_sync), like a chunk's, and that range takes the copy windows from then
+    // on; the mapping and buffer stay until the device goes, as windows do.
+    // A mirror is charged to the budget its copy window would have used (LEONIDA_TITLE_WINDOWS_MB or the scatter budget),
+    // so which ranges get a backing does not change, only how. Up to GTA6RT_METAL_TITLE_POOL_MIRROR_MB (128) in all; past
+    // it, or when a piece is not host-page aligned, the copy window. title_window_mutex held.
+    struct PoolMirror {
+        std::uint64_t start, size, shader;
+        std::uintptr_t host;
+        std::unique_ptr<leonida::gpu::Buffer> buffer;
+    };
+    std::vector<PoolMirror> pool_mirrors;
+    std::atomic<std::size_t> pool_mirror_count{0};
+    std::map<std::uint64_t, std::pair<std::uint64_t, std::uint64_t>> pool_mirror_aliases;  // title VA -> (end, shader VA)
+    // Ranges whose mirror a remap dropped: the title remaps them, so they take the copy windows, which follow a remap
+    // without a new mapping each time (title VA -> end).
+    std::map<std::uint64_t, std::uint64_t> pool_mirror_unstable;
+    std::atomic<std::uint64_t> pool_mirror_bytes{0}, pool_mirror_refused{0}, pool_mirror_dropped{0}, pool_mirror_pieces{0};
+    // 1 (all): scatter and main windows; main: main windows only; 0 (default): none.
+    static int title_pool_mirror_mode() {
+        static const int mode = [] {
+            const char* v = std::getenv("GTA6RT_METAL_TITLE_POOL_MIRROR");
+            return !v || !*v || *v == '0' ? 0 : std::strcmp(v, "main") == 0 ? 2 : 1;
+        }();
+        return mode;
+    }
+    bool title_pool_mirror(std::uint64_t start, std::uint64_t size, std::uint64_t& out, bool scattered = false) {
+        if (!title_pool_mirror_mode() || (scattered && title_pool_mirror_mode() != 1)) return false;
+        static const std::uint64_t cap = [] {
+            const char* v = std::getenv("GTA6RT_METAL_TITLE_POOL_MIRROR_MB");
+            return (v && *v ? std::strtoull(v, nullptr, 10) : 128ull) << 20;
+        }();
+        if (!gpu || !context || pool_mirror_bytes + size > cap) return false;
+        for (auto it = pool_mirror_unstable.lower_bound(start + size); it != pool_mirror_unstable.begin();) {
+            --it;
+            if (it->second > start) return false;
+            if (it->first + kTitleWindowMax <= start) break;
+        }
+        const std::uint64_t page = std::max<std::uint64_t>(gpu->caps().host_page_size, 16384);
+        if ((start | size) & (page - 1)) return false;
+        std::vector<std::pair<std::uintptr_t, std::uint64_t>> pieces;  // host, bytes
+        for (std::uint64_t at = start; at < start + size;) {
+            void* host = nullptr;
+            std::uint64_t run = 0;
+            if (!rt::xmem::title_pool_view(at, &host, &run) || !run) return false;
+            const std::uint64_t n = std::min(run, start + size - at);
+            const auto h = reinterpret_cast<std::uintptr_t>(host);
+            if ((h | n) & (page - 1)) return false;
+            if (!pieces.empty() && pieces.back().first + pieces.back().second == h) pieces.back().second += n;
+            else pieces.emplace_back(h, n);
+            at += n;
+        }
+        const auto fail = [&](const char* why, mach_vm_address_t base, kern_return_t kr) {
+            if (base) mach_vm_deallocate(mach_task_self(), base, size);
+            if (pool_mirror_refused++ < 8)
+                std::fprintf(stderr, "[rt] d3d12-metal: title pool mirror of 0x%llx (%llu KiB, %zu pieces) refused: %s (%d); "
+                                     "a copy window instead\n",
+                             static_cast<unsigned long long>(start), static_cast<unsigned long long>(size >> 10),
+                             pieces.size(), why, int(kr));
+            return false;
+        };
+        mach_vm_address_t base = 0;
+        kern_return_t kr = mach_vm_allocate(mach_task_self(), &base, size, VM_FLAGS_ANYWHERE);
+        if (kr != KERN_SUCCESS) return fail("no host range", 0, kr);
+        std::uint64_t off = 0;
+        for (const auto& [host, bytes] : pieces) {
+            mach_vm_address_t target = base + off;
+            vm_prot_t cur = 0, max = 0;
+            kr = mach_vm_remap(mach_task_self(), &target, bytes, 0, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, mach_task_self(),
+                               host, FALSE, &cur, &max, VM_INHERIT_SHARE);
+            if (kr != KERN_SUCCESS || target != base + off) return fail("remap", base, kr);
+            if ((cur & (VM_PROT_READ | VM_PROT_WRITE)) != (VM_PROT_READ | VM_PROT_WRITE)) return fail("protection", base, cur);
+            off += bytes;
+        }
+        if (rthost::guarded_compare(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(start)),
+                                    reinterpret_cast<const void*>(static_cast<std::uintptr_t>(base)), size) != 0)
+            return fail("bytes differ from the title's", base, 0);
+        leonida::gpu::HostBufferDesc d;
+        d.cpu = reinterpret_cast<void*>(static_cast<std::uintptr_t>(base));
+        d.size = size;
+        d.label = "title pool mirror";
+        d.resident = false;
+        std::unique_ptr<leonida::gpu::Buffer> buffer;
+        std::uint64_t shader = 0;
+        for (int attempt = 0; attempt < 64 && !buffer; ++attempt) {
+            std::string error;
+            auto made = gpu->create_host_buffer(d, &error);
+            if (!made || !made->host_gpu_address()) return fail(error.empty() ? "Metal refused the buffer" : error.c_str(), 0, 0);
+            shader = made->host_gpu_address() - arena.address;
+            const bool upward = made->host_gpu_address() > arena.address;
+            if (upward && claim_shader_range(shader, size)) {
+                buffer = std::move(made);
+                break;
+            }
+            title_pool_set_aside.push_back(std::move(made));
+            if (upward && claim_refused_hi > shader) title_pool_fill_hole(shader, claim_refused_hi);
+        }
+        if (!buffer) return fail("no free shader-VA range", 0, 0);
+        if (title_pool_per_encoder()) gta6rt::metal::set_encoder_resource(gpu.get(), buffer.get(), true);
+        else gta6rt::metal::make_resident(gpu.get(), buffer.get());
+        context->add_va_range(shader, size, buffer.get(), 0);
+        backing(buffer->host_gpu_address(), size, shader, true);
+        if (!leonida::title_va_aliases().add(start, size, shader)) {
+            pool_mirrors.push_back({start, size, shader, static_cast<std::uintptr_t>(base), std::move(buffer)});
+            return false;
+        }
+        pool_mirror_aliases[start] = {start + size, shader};
+        leonida::metal_ledger::add_imported(size);
+        pool_mirror_bytes += size;
+        pool_mirror_pieces += pieces.size();
+        pool_mirrors.push_back({start, size, shader, static_cast<std::uintptr_t>(base), std::move(buffer)});
+        const std::size_t n = pool_mirrors.size();
+        pool_mirror_count.store(n, std::memory_order_relaxed);
+        if (n <= 4 || !(n & (n - 1)))
+            std::fprintf(stderr, "[rt] d3d12-metal: title pool mirror: title 0x%llx (%llu KiB, %zu pool pieces) read in place "
+                                 "at shader VA 0x%llx, no copy (%zu mirrors, %llu KiB, %llu pieces; %llu dropped by remaps)\n",
+                         static_cast<unsigned long long>(start), static_cast<unsigned long long>(size >> 10), pieces.size(),
+                         static_cast<unsigned long long>(shader), n, static_cast<unsigned long long>(pool_mirror_bytes >> 10),
+                         static_cast<unsigned long long>(pool_mirror_pieces),
+                         static_cast<unsigned long long>(pool_mirror_dropped));
+        out = shader;
         return true;
     }
     // Chunks under 1 MiB (GTA6RT_METAL_TITLE_POOL_CHUNK_KB): a range is mapped together with every title-pool alias it
@@ -3014,6 +3200,14 @@ struct DeviceState {
                 aliases.remove(it->first, it->second.second);
                 ++title_pool_invalidated;
                 it = title_pool_aliases.erase(it);
+            }
+            auto mirror = pool_mirror_aliases.upper_bound(lo);
+            if (mirror != pool_mirror_aliases.begin() && std::prev(mirror)->second.first > lo) --mirror;
+            while (mirror != pool_mirror_aliases.end() && mirror->first < hi) {
+                aliases.remove(mirror->first, mirror->second.second);
+                ++pool_mirror_dropped;
+                pool_mirror_unstable[mirror->first] = mirror->second.first;
+                mirror = pool_mirror_aliases.erase(mirror);
             }
         }
         title_pool_seen.store(at, std::memory_order_relaxed);
@@ -3566,6 +3760,11 @@ struct DeviceState {
             leonida::TitleWindowRange range{};
             if (leonida::title_window_range(va, want, lo, hi, kTitleWindowAlign, kTitleWindowMax, title_window_cap,
                                             title_window_bytes, range)) {
+                if (std::uint64_t shader = 0; title_pool_on() && title_pool_mirror(range.start, range.size, shader)) {
+                    title_window_bytes += range.size;
+                    out = shader + (va - range.start);
+                    return true;
+                }
                 if (const std::uint64_t offset = make_title_window(range.start, range.size)) {
                     aliases.add(range.start, range.size, offset);
                     out = offset + (va - range.start);
@@ -3965,10 +4164,13 @@ struct DeviceState {
     std::atomic<uint64_t> released_backings{};
     std::mutex backing_mutex;
     leonida::BufferVaIndex<uint64_t> gpu_backings;
+    std::atomic<std::uint64_t> backings_added{};  // vsharp_xmemo_env
     void backing(VkDeviceAddress address, uint64_t bytes, uint64_t id, bool add) {
         std::lock_guard lock(backing_mutex);
-        if (add) gpu_backings.insert(address, bytes, id);
-        else {
+        if (add) {
+            gpu_backings.insert(address, bytes, id);
+            backings_added.fetch_add(1, std::memory_order_release);
+        } else {
             gpu_backings.erase(address, id);
             const std::uint64_t shader = address - arena.address;
             released_log.push_back({released_backings.load(std::memory_order_relaxed) + 1, {shader, shader + bytes}});
@@ -4161,8 +4363,17 @@ struct DeviceState {
                              (unsigned long long)base, (unsigned long long)bytes, (unsigned long long)to,
                              (unsigned long long)room, int(to && backed(to)));
             if (to && room < bytes && make_window && title_pool_on() && title_pool_chunk_bytes < (1ull << 20)) {
-                std::uint64_t remade = 0;
-                if (!resolve_title_memory(base, bytes, remade) || !aliases.range_of(base, to, room)) return 0;
+                const int skip = resolve_skip(bytes);
+                const std::uint64_t skipped = skip ? aliases.range_of(base, to, room) && room >= bytes && backed(to) ? to : 0 : 0;
+                if (skip == 1) {
+                    ++resolve_skips;
+                    if (!skipped) return 0;
+                } else {
+                    std::uint64_t remade = 0;
+                    const bool made = resolve_title_memory(base, bytes, remade) && aliases.range_of(base, to, room);
+                    if (skip == 2) resolve_skip_check(base, bytes, skipped, made && to && room >= bytes && backed(to) ? to : 0);
+                    if (!made) return 0;
+                }
             }
             if (!to || room < bytes || !backed(to)) return 0;
             aliases.note_translation(kind);
@@ -4237,11 +4448,81 @@ struct DeviceState {
             if (to && encodable(to)) return to;
         }
         if (make_window && title()) {
-            to = aliases.resolve(base, bytes, kind);
+            const int skip = resolve_skip(bytes);
             uint64_t mapped{};
-            if (to && aliases.range_of(base, mapped, room) && mapped == to && room >= bytes && backed(to)) return to;
+            const std::uint64_t skipped =
+                skip ? aliases.range_of(base, mapped, room) && room >= bytes && backed(mapped) ? mapped : 0 : 0;
+            if (skip == 1) {
+                ++resolve_skips;
+                if (skipped) aliases.note_translation(kind);
+                return skipped;
+            }
+            to = aliases.resolve(base, bytes, kind);
+            const std::uint64_t got =
+                to && aliases.range_of(base, mapped, room) && mapped == to && room >= bytes && backed(to) ? to : 0;
+            if (skip == 2) resolve_skip_check(base, bytes, skipped, got);
+            return got;
         }
         return 0;
+    }
+
+    // GTA6RT_METAL_RESOLVE_SKIP (off by default; 1: on; verify: both are computed, the resolver's answer is used and a
+    // difference counted): a V# half whose span is past resolve_span_cap gets no resolve attempt, only the alias-table
+    // and backing checks, since no path of resolve_title_memory can back that many bytes from one address. The heaps'
+    // title data read as V#s with spans over 32 MiB were ~1,200 such attempts a refresh, never once rebased
+    // (spike/r12-heaptrack). Off because the skipped attempts have a side effect verify cannot see: they made the
+    // 16 MiB title windows that then serve many small V#s. Without them the same V#s made ~340 small windows, and the
+    // shadow refresh took 5.6-10.5 ms a submission with ~400k guarded-read faults (subcpu-f) against 1.1-1.4 ms
+    // (subcpu-g/-h, same binary). Returns 0 (resolve), 1 (skip) or 2 (verify).
+    static int resolve_skip_mode() {
+        static const int mode = [] {
+            const char* v = std::getenv("GTA6RT_METAL_RESOLVE_SKIP");
+            return !v || *v != '1' ? (v && std::strcmp(v, "verify") == 0 ? 2 : 0) : 1;
+        }();
+        return mode;
+    }
+    int resolve_skip(std::uint64_t bytes) {
+        const int mode = resolve_skip_mode();
+        if (!mode) return 0;
+        const std::uint64_t cap = resolve_span_cap();
+        return cap && bytes > cap ? mode : 0;
+    }
+    std::atomic<std::uint64_t> resolve_skips{0}, resolve_skip_checked{0}, resolve_skip_differ{0};
+    void resolve_skip_check(std::uint64_t base, std::uint64_t bytes, std::uint64_t skipped, std::uint64_t got) {
+        ++resolve_skip_checked;
+        if (skipped == got) return;
+        if (resolve_skip_differ.fetch_add(1, std::memory_order_relaxed) < 8)
+            std::fprintf(stderr, "[rt] d3d12-metal: resolve skip (verify): V# base 0x%llx (%llu bytes): the resolver gave "
+                                 "0x%llx, the skip would give 0x%llx\n",
+                         static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes),
+                         static_cast<unsigned long long>(got), static_cast<unsigned long long>(skipped));
+    }
+    // The most bytes from one address that any path of resolve_title_memory can back: pool chunk and span buffers
+    // (title_pool_chunk: at most max(8, kTitlePoolSpanBytes / chunk) chunks; title_pool_union: kTitlePoolSpanBytes),
+    // copy and scatter windows (kTitleWindowMax), stream-pool extents (kPoolExtentMax). 0 (no bound) with in-place
+    // windows (they reach the end of the title range) or geometry copies (exactly the range asked).
+    std::uint64_t resolve_span_cap() {
+        static const bool in_place = [] {
+            const char* v = std::getenv("GTA6RT_METAL_TITLE_WINDOWS_IN_PLACE");
+            return v && *v && std::strcmp(v, "0") != 0 && std::strcmp(v, "alias") != 0;
+        }();
+        static const std::uint64_t chunk = [] {
+            std::uint64_t bytes = 64ull << 10;
+            if (const char* v = std::getenv("GTA6RT_METAL_TITLE_POOL_CHUNK_MB"); v && *v) {
+                const std::uint64_t mib = std::strtoull(v, nullptr, 10);
+                if (mib && !(mib & (mib - 1)) && mib <= 1024) bytes = mib << 20;
+            }
+            if (const char* v = std::getenv("GTA6RT_METAL_TITLE_POOL_CHUNK_KB"); v && *v) {
+                const std::uint64_t kib = std::strtoull(v, nullptr, 10);
+                if (kib >= 64 && !(kib & (kib - 1)) && kib <= (1u << 20)) bytes = kib << 10;
+            }
+            return bytes;
+        }();
+        if (in_place || (watch_shadow_writes() && geometry.cap())) return 0;
+        std::uint64_t cap = std::max(kTitleWindowMax, kPoolExtentMax);
+        if (title_pool_on())
+            cap = std::max({cap, kTitlePoolSpanBytes, std::max<std::uint64_t>(8, kTitlePoolSpanBytes / chunk) * chunk});
+        return cap;
     }
 
     VsharpResult fix_vsharp(uint32_t* w, VsharpPath path) {
@@ -4674,6 +4955,15 @@ struct DeviceState {
         std::uint64_t wake_fallbacks = 0, wake_rebuilds = 0, wake_old_queued = 0;
         std::chrono::steady_clock::time_point wake_log{};
         double max_live_ms = 0, max_pages_ms = 0, max_fix_ms = 0, max_retry_ms = 0;  // longest parts since wake_report
+        // vsharp_xmemo_*: fresh V# fixes kept across refreshes, with the state (vsharp_xmemo_env) they were made in
+        struct VsharpXMemo {
+            std::uint32_t in[8], out[8];
+            std::uint64_t env[5];
+            std::uint8_t used, result, counter;
+        };
+        std::vector<VsharpXMemo> xmemo;
+        std::uint64_t xmemo_lookups = 0, xmemo_hits = 0, xmemo_kept = 0, xmemo_checked = 0, xmemo_differ = 0;
+        std::chrono::steady_clock::time_point xmemo_log{};
     };
     std::mutex console_heap_mutex;  // taken before title_window_mutex, shadow_mutex and descriptor_mutex
     std::vector<std::unique_ptr<ConsoleHeap>> console_heaps;
@@ -4716,11 +5006,30 @@ struct DeviceState {
             if (!vsharp_memo_find(heap, w, result, counter)) {
                 std::uint32_t in[kDescriptorSize / 4];
                 std::memcpy(in, w, kDescriptorSize);
-                pool_slot_kind = heap.resource_heap ? heap_vsharp_kind(w) : 0;
-                result = fix_vsharp(w, path);
-                pool_slot_kind = heap.resource_heap ? heap_vsharp_kind(w + 4) : 0;
-                counter = fix_vsharp(w + 4, path);
-                pool_slot_kind = 0;
+                const int xmemo = vsharp_xmemo_mode();
+                std::uint64_t env[5];
+                const bool reused = xmemo && heap.resource_heap && !heap.vsharp_memo_bypass &&
+                                    vsharp_xmemo_find(heap, in, w, result, counter, env);
+                if (!reused || xmemo == 2) {
+                    std::uint32_t memo[kDescriptorSize / 4];
+                    const VsharpResult memo_result = result, memo_counter = counter;
+                    if (reused) {
+                        std::memcpy(memo, w, kDescriptorSize);
+                        std::memcpy(w, in, kDescriptorSize);
+                    }
+                    pool_slot_kind = heap.resource_heap ? heap_vsharp_kind(w) : 0;
+                    result = fix_vsharp(w, path);
+                    pool_slot_kind = heap.resource_heap ? heap_vsharp_kind(w + 4) : 0;
+                    counter = fix_vsharp(w + 4, path);
+                    pool_slot_kind = 0;
+                    if (reused) {
+                        ++heap.xmemo_checked;
+                        if (std::memcmp(memo, w, kDescriptorSize) || memo_result != result || memo_counter != counter)
+                            vsharp_xmemo_differ(heap, in, memo, w);
+                    } else if (xmemo && heap.resource_heap && !heap.vsharp_memo_bypass) {
+                        vsharp_xmemo_keep(heap, in, w, result, counter, env);
+                    }
+                }
                 vsharp_memo_keep(heap, in, w, result, counter);
             }
             if (result == VsharpResult::rebased) ++heap.vsharps;
@@ -4826,6 +5135,104 @@ struct DeviceState {
             for (auto& e : heap.vsharp_memo) e.serial = 0;
             heap.vsharp_memo_serial = 1;
         }
+    }
+
+    // GTA6RT_METAL_VSHARP_XMEMO (off by default; 1: on; verify: every reuse is fixed again, the fix is used and a
+    // difference counted): a resource heap's fresh V# fix is kept across refreshes and reused for the same 32 bytes while
+    // nothing it depends on changed: no backing added or released, the alias table unchanged (size and invalidations),
+    // the same resolve_span_cap. Kept only when that state did not change during the fix, and only when each half is
+    // not empty or empty because its span is past resolve_span_cap (an empty half under the cap waits on title memory,
+    // the pool and the window budgets, so it is fixed again as before). Exact in 818,946 shadow-checked reuses under
+    // the same rule without the empty-half condition (spike/r12-heaptrack), 782,582 verified in subcpu-b. Off: it reused
+    // ~4% of lookups and the refresh was no faster (subcpu-g/-h); a reused empty half past the cap also skips the resolve
+    // attempt whose windows GTA6RT_METAL_RESOLVE_SKIP's note describes.
+    int vsharp_xmemo_mode() const {
+        static const int mode = [] {
+            const char* v = std::getenv("GTA6RT_METAL_VSHARP_XMEMO");
+            return !v || *v != '1' ? (v && std::strcmp(v, "verify") == 0 ? 2 : 0) : 1;
+        }();
+        return vsharp_title_first() || vsharp_title_soft() || watch_shadow_writes() ? 0 : mode;
+    }
+    static constexpr std::size_t kVsharpXMemoSize = 32768, kVsharpXMemoProbe = 8;
+    void vsharp_xmemo_env(std::uint64_t* env) {
+        const auto& a = leonida::title_va_aliases();
+        env[0] = released_backings.load(std::memory_order_acquire);
+        env[1] = backings_added.load(std::memory_order_acquire);
+        env[2] = a.size();
+        env[3] = a.invalidations();
+        env[4] = resolve_span_cap();
+    }
+    bool vsharp_xmemo_find(ConsoleHeap& heap, const std::uint32_t* in, std::uint32_t* w, VsharpResult& result,
+                           VsharpResult& counter, std::uint64_t* env) {
+        vsharp_xmemo_env(env);
+        if (!(++heap.xmemo_lookups & 4095)) vsharp_xmemo_report(heap);
+        if (heap.xmemo.empty()) return false;
+        const std::size_t h = vsharp_memo_hash(in);
+        for (std::size_t k = 0; k < kVsharpXMemoProbe; ++k) {
+            const auto& e = heap.xmemo[(h + k) & (kVsharpXMemoSize - 1)];
+            if (!e.used) return false;
+            if (std::memcmp(e.in, in, sizeof e.in)) continue;
+            if (std::memcmp(e.env, env, sizeof e.env)) return false;
+            std::memcpy(w, e.out, sizeof e.out);
+            result = VsharpResult(e.result);
+            counter = VsharpResult(e.counter);
+            ++heap.xmemo_hits;
+            return true;
+        }
+        return false;
+    }
+    void vsharp_xmemo_keep(ConsoleHeap& heap, const std::uint32_t* in, const std::uint32_t* out, VsharpResult result,
+                           VsharpResult counter, const std::uint64_t* before) {
+        std::uint64_t after[5];
+        vsharp_xmemo_env(after);
+        if (std::memcmp(before, after, sizeof after)) return;
+        const auto settled_empty = [&](const std::uint32_t* half, VsharpResult r) {
+            if (r != VsharpResult::empty) return true;
+            const std::uint32_t stride = (half[1] >> 16) & 0x3fffu;
+            const std::uint64_t span = std::uint64_t(half[2]) * (stride ? stride : 1);
+            return after[4] && span > after[4];
+        };
+        if (!settled_empty(in, result) || !settled_empty(in + 4, counter)) return;
+        if (heap.xmemo.empty()) heap.xmemo.resize(kVsharpXMemoSize);
+        const std::size_t h = vsharp_memo_hash(in);
+        ConsoleHeap::VsharpXMemo* slot = nullptr;
+        for (std::size_t k = 0; k < kVsharpXMemoProbe && !slot; ++k) {
+            auto& e = heap.xmemo[(h + k) & (kVsharpXMemoSize - 1)];
+            if (!e.used || !std::memcmp(e.in, in, sizeof e.in)) slot = &e;
+        }
+        if (!slot) slot = &heap.xmemo[h & (kVsharpXMemoSize - 1)];
+        std::memcpy(slot->in, in, sizeof slot->in);
+        std::memcpy(slot->out, out, sizeof slot->out);
+        std::memcpy(slot->env, after, sizeof slot->env);
+        slot->used = 1;
+        slot->result = std::uint8_t(result);
+        slot->counter = std::uint8_t(counter);
+        ++heap.xmemo_kept;
+    }
+    void vsharp_xmemo_differ(ConsoleHeap& heap, const std::uint32_t* in, const std::uint32_t* memo, const std::uint32_t* fixed) {
+        if (heap.xmemo_differ++ < 8)
+            std::fprintf(stderr, "[rt] d3d12-metal: V# cross-refresh memo (verify): %08x %08x %08x %08x %08x %08x %08x %08x "
+                                 "fixed to %08x %08x %08x %08x %08x %08x %08x %08x, the memo had %08x %08x %08x %08x %08x "
+                                 "%08x %08x %08x\n",
+                         in[0], in[1], in[2], in[3], in[4], in[5], in[6], in[7], fixed[0], fixed[1], fixed[2], fixed[3],
+                         fixed[4], fixed[5], fixed[6], fixed[7], memo[0], memo[1], memo[2], memo[3], memo[4], memo[5],
+                         memo[6], memo[7]);
+    }
+    // Every 10 s at most, from a lookup: the memo's and the resolve skip's counts since the last line.
+    void vsharp_xmemo_report(ConsoleHeap& heap) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now - heap.xmemo_log < std::chrono::seconds(10)) return;
+        heap.xmemo_log = now;
+        std::fprintf(stderr, "[rt] d3d12-metal: heap 0x%llx V# fixes kept across refreshes: %llu lookups, %llu reused, %llu "
+                             "kept, %llu reuses verified, %llu differ; resolve attempts skipped past %llu MiB: %llu "
+                             "(%llu verified, %llu differ)\n",
+                     static_cast<unsigned long long>(heap.console_va), static_cast<unsigned long long>(heap.xmemo_lookups),
+                     static_cast<unsigned long long>(heap.xmemo_hits), static_cast<unsigned long long>(heap.xmemo_kept),
+                     static_cast<unsigned long long>(heap.xmemo_checked), static_cast<unsigned long long>(heap.xmemo_differ),
+                     static_cast<unsigned long long>(resolve_span_cap() >> 20),
+                     static_cast<unsigned long long>(resolve_skips.load()),
+                     static_cast<unsigned long long>(resolve_skip_checked.load()),
+                     static_cast<unsigned long long>(resolve_skip_differ.load()));
     }
 
     // The slots on [offset, offset + bytes) of a heap copy's mirror, just brought up to date: each that differs from
@@ -6034,7 +6441,81 @@ struct DeviceState {
         VkFormat view_format{}, channels_format{}, storage_format{};
         VkImageAspectFlags aspects = 0;
         unsigned sampled_class = 0;
+        std::string share;  // GTA6RT_METAL_VIEW_SHARE: the view identity whose index this entry shares
     };
+    // GTA6RT_METAL_VIEW_SHARE=1 (off by default): T#s whose views would be identical (same texture, format, channels,
+    // levels, layers, swizzle, MIN_LOD) share one bindless index and view, counted per index. Measured (vfx-d3, txt-p1,
+    // spk-a): the 2D array (65,536) fills about 40 s into the world and the 1D array (4,096) before it; every later
+    // T# of that dimension reads the fallback. Title T#s that differ only in words the view ignores (data in words 4-7)
+    // each took an index.
+    static bool view_share_on() {
+        static const bool on = [] {
+            const char* v = std::getenv("GTA6RT_METAL_VIEW_SHARE");
+            return v && std::strcmp(v, "0") != 0;
+        }();
+        return on;
+    }
+    struct SharedView {
+        std::uint32_t index = 0;
+        std::shared_ptr<leonida::gpu::Texture> sampled, storage;
+    };
+    std::unordered_map<std::string, SharedView> shared_views;     // descriptor_mutex
+    std::unordered_map<std::uint64_t, std::uint32_t> shared_refs;  // (dimension << 32 | index) -> entries
+    std::uint64_t shared_hits = 0;
+    std::string view_share_key(const leonida::gpu::Texture* texture, const leonida::gfx10::Image& image,
+                               leonida::ImageDimension dimension, VkFormat view_format, VkFormat channels_format,
+                               VkFormat storage_format, VkImageAspectFlags aspects, bool sampled, bool storage,
+                               unsigned sampled_class, const leonida::gfx10::ImageWords& words) {
+        if (!view_share_on()) return {};
+        struct Key {
+            const void* texture;
+            std::uint32_t dimension, type, first_mip, mip_count, first_layer, layer_count, swizzle[4];
+            std::int32_t view_format, channels_format, storage_format;
+            std::uint32_t aspects, sampled, storage, sampled_class, mip_base;
+            float min_lod;
+        } k;
+        std::memset(&k, 0, sizeof k);
+        k.texture = texture;
+        k.dimension = std::uint32_t(dimension);
+        k.type = std::uint32_t(image.type);
+        k.first_mip = image.first_mip;
+        k.mip_count = image.mip_count;
+        k.first_layer = image.first_layer;
+        k.layer_count = image.layer_count;
+        for (int i = 0; i < 4; ++i) k.swizzle[i] = std::uint32_t(image.swizzle[i]);
+        k.view_format = view_format;
+        k.channels_format = channels_format;
+        k.storage_format = storage_format;
+        k.aspects = aspects;
+        k.sampled = sampled;
+        k.storage = storage;
+        k.sampled_class = sampled_class;
+        k.mip_base = mip_base(texture);
+        k.min_lod = leonida::gfx10::image_min_lod(words);
+        return std::string(reinterpret_cast<const char*>(&k), sizeof k);
+    }
+    static std::uint64_t share_ref(leonida::ImageDimension d, std::uint32_t index) {
+        return (std::uint64_t(d) << 32) | index;
+    }
+    // A shared view for `entry`'s identity, if one is live: the entry takes its index and views.
+    bool take_shared_view(ImageEntry& entry, const std::string& share) {
+        if (share.empty()) return false;
+        const auto it = shared_views.find(share);
+        if (it == shared_views.end()) return false;
+        entry.index = it->second.index;
+        entry.sampled = it->second.sampled;
+        entry.storage = it->second.storage;
+        entry.share = share;
+        ++shared_refs[share_ref(entry.dimension, entry.index)];
+        ++shared_hits;
+        return true;
+    }
+    void keep_shared_view(ImageEntry& entry, const std::string& share) {
+        if (share.empty()) return;
+        shared_views[share] = {entry.index, entry.sampled, entry.storage};
+        shared_refs[share_ref(entry.dimension, entry.index)] = 1;
+        entry.share = share;
+    }
     // Textures that hold only a title texture's levels from this one on (Resource::mip_base): views are shifted.
     std::mutex mip_base_mutex;  // a leaf: nothing else is taken under it
     std::unordered_map<const leonida::gpu::Texture*, std::uint32_t> mip_bases;
@@ -6098,6 +6579,15 @@ struct DeviceState {
     }
 
     void release(const ImageEntry& entry) {  // descriptor_mutex held
+        if (!entry.share.empty()) {
+            const auto r = shared_refs.find(share_ref(entry.dimension, entry.index));
+            if (r != shared_refs.end()) {
+                if (--r->second) return;
+                shared_refs.erase(r);
+            }
+            const auto s = shared_views.find(entry.share);
+            if (s != shared_views.end() && s->second.index == entry.index) shared_views.erase(s);
+        }
         if (bindless) bindless->remove_image(entry.dimension, entry.index);
     }
 
@@ -6278,6 +6768,19 @@ struct DeviceState {
         entry.storage_format = storage_format;
         entry.aspects = aspects;
         entry.sampled_class = sampled_class;
+        const std::string share = view_share_key(texture, image, dimension, view_format, channels_format, storage_format,
+                                                 aspects, sampled, storage, sampled_class, words);
+        if (take_shared_view(entry, share)) {
+            if (existing != image_entries.end()) {
+                replaced_images.push_back(existing->second);
+                existing->second = entry;
+            } else {
+                image_entries.emplace(words, entry);
+                image_keys.emplace(image.address, words);
+            }
+            bindless->insert_key(words, entry.index);
+            return true;
+        }
         if (sampled) {
             entry.sampled = make_view(texture, image, view_format, channels_format, false, aspects, words);
             if (!entry.sampled) return false;
@@ -6298,6 +6801,7 @@ struct DeviceState {
                              int(dimension), bindless->image_capacity(dimension));
             return false;
         }
+        keep_shared_view(entry, share);
         if (existing != image_entries.end()) {
             replaced_images.push_back(existing->second);
             existing->second = entry;
@@ -6311,6 +6815,9 @@ struct DeviceState {
 
     TitleGpuPlacements<Resource> gpu_placements;  // descriptor_mutex
     std::map<std::uint64_t, const void*> images_by_address;  // a Resource
+    // GTA6RT_METAL_TSHARP_TWINS: textures over a registered title texture's bytes in another format of the same block
+    // size (the title reuses same-size slots), by title address; the registered one keeps images_by_address.
+    std::multimap<std::uint64_t, Resource*> twin_images;  // descriptor_mutex
     void note_image_address(std::uint64_t address, const void* resource) {
         std::lock_guard lock(descriptor_mutex);
         images_by_address[address] = resource;
@@ -6358,6 +6865,19 @@ struct DeviceState {
             leonida::gfx10::ImageWords words{};
             std::memcpy(words.data(), it->second.data(), sizeof(words));
             entry.sampled = entry.storage = nullptr;
+            entry.share.clear();
+            const std::string share =
+                old.share.empty() ? std::string()
+                                  : view_share_key(texture, old.image, old.dimension, old.view_format, old.channels_format,
+                                                   old.storage_format, old.aspects, old.sampled != nullptr,
+                                                   old.storage != nullptr, old.sampled_class, words);
+            if (take_shared_view(entry, share)) {
+                replaced_images.push_back(old);
+                old = entry;
+                bindless->insert_key(it->second, entry.index);
+                ++made;
+                continue;
+            }
             if (old.sampled) {
                 entry.sampled = make_view(texture, old.image, old.view_format, old.channels_format, false, old.aspects, words);
                 if (!entry.sampled) continue;
@@ -6372,6 +6892,7 @@ struct DeviceState {
             }
             entry.index = bindless->add_image(entry.dimension, entry.sampled.get(), views, entry.sampled_class);
             if (!entry.index) continue;
+            keep_shared_view(entry, share);
             replaced_images.push_back(old);
             old = entry;
             bindless->insert_key(it->second, entry.index);
@@ -9896,6 +10417,8 @@ struct TitleTexture {
     std::uint32_t resident_mip = 0;  // the first level whose bytes are mapped (a texture streamed in part)
     std::uint32_t base_floor = 0;    // a T#-made texture: the T#'s BASE_LEVEL (the levels above are not the title's)
     bool base_floor_made = false;    // made from a title-built T# (make_orphan_textures)
+    std::uint64_t twin_of = 0;       // a format twin (GTA6RT_METAL_TSHARP_TWINS): the registered texture's address
+    std::uint64_t twin_base_fills = 0;  // the registered texture's fills when the twin was last filled
     std::uint64_t readable_span() const { return layout.layout.size - std::min(short_tail, layout.layout.size); }
 };
 
@@ -10133,6 +10656,56 @@ bool decode_title_tsharp(const leonida::gfx10::ImageWords& words, leonida::gfx10
     return leonida::gfx10::decode(w, image);
 }
 
+// The first distinct (T# format, texture format) pairs whose view bind_title_image could not make, logged.
+void note_tsharp_view_refused(const leonida::gfx10::ImageWords& words, const leonida::gfx10::Image& image,
+                              const Resource& r) {
+    static std::mutex mutex;
+    static std::set<std::pair<std::uint32_t, int>> seen;
+    static std::uint64_t total = 0;
+    const D3D12_RESOURCE_DESC& d = r.desc();
+    std::lock_guard lock(mutex);
+    ++total;
+    if (seen.size() >= 32 || !seen.insert({image.format, int(d.Format)}).second) return;
+    std::fprintf(stderr,
+                 "[rt] d3d12-metal: T# view refused (%llu so far): T# %08x %08x %08x %08x %08x at 0x%llx type %u format %u "
+                 "%ux%u mips %u-%u layers %u-%u; texture DXGI %d %llux%u mips %u layers %u, image 0x%llx, title %s\n",
+                 static_cast<unsigned long long>(total), words[0], words[1], words[2], words[3], words[4],
+                 static_cast<unsigned long long>(image.address), unsigned(image.type), image.format, image.width,
+                 image.height, image.first_mip, image.first_mip + image.mip_count - 1, image.first_layer,
+                 image.first_layer + image.layer_count - 1, int(d.Format), static_cast<unsigned long long>(d.Width),
+                 d.Height, unsigned(d.MipLevels), unsigned(d.DepthOrArraySize),
+                 static_cast<unsigned long long>(r.image_address()), r.title_address() ? "texture" : "none");
+}
+
+// GTA6RT_METAL_TSHARP_TWINS=1 (off by default): a title T# naming a registered title texture's address and shape in
+// another block-compressed format of the same block size gets a texture of its own over the same bytes (a format
+// twin, Device::make_orphan_textures). Measured: the title reuses same-size texture slots for textures of other BC
+// formats (BC7 sRGB T#s on a BC5 texture, BC1 on BC4, ...), and Metal cannot view one BC format as another.
+bool tsharp_twins_on() {
+    static const bool on = [] {
+        const char* v = std::getenv("GTA6RT_METAL_TSHARP_TWINS");
+        return v && std::strcmp(v, "0") != 0;
+    }();
+    return on;
+}
+std::uint32_t bc_block_bytes(VkFormat f) {
+    if (f >= VK_FORMAT_BC1_RGB_UNORM_BLOCK && f <= VK_FORMAT_BC1_RGBA_SRGB_BLOCK) return 8;
+    if (f == VK_FORMAT_BC4_UNORM_BLOCK || f == VK_FORMAT_BC4_SNORM_BLOCK) return 8;
+    if (f >= VK_FORMAT_BC2_UNORM_BLOCK && f <= VK_FORMAT_BC7_SRGB_BLOCK) return 16;
+    return 0;
+}
+// The T#'s format is another BC format of the texture's block size, of a title texture the title fills.
+bool twin_wanted(const Resource& r, const leonida::gfx10::Image& image) {
+    if (!tsharp_twins_on() || !r.title_address() || r.desc().Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+        (r.desc().Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS |
+                           D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)))
+        return false;
+    const VkFormat named = leonida::gfx10::vulkan_format(image.format);
+    const std::uint32_t bytes = bc_block_bytes(named);
+    return bytes && bytes == bc_block_bytes(r.format()) && named != r.format();
+}
+std::atomic<std::uint64_t> g_twin_binds{0}, g_twin_wanted{0};
+
 TitleImage bind_title_image(DeviceState& device, const leonida::gfx10::ImageWords& words, const char** why) {
     namespace g = leonida::gfx10;
     const auto refuse = [why](const char* reason) {
@@ -10209,8 +10782,35 @@ TitleImage bind_title_image(DeviceState& device, const leonida::gfx10::ImageWord
             }
         }
         if (!device.bind_image_locked(words, image, r.descriptor_image(), r.format(), r.aspects(), storage,
-                                      r.has_view_format_list(), r.uint_backed()))
-            return refuse("no view for the T#'s format or range");
+                                      r.has_view_format_list(), r.uint_backed())) {
+            note_tsharp_view_refused(words, image, r);
+            if (!twin_wanted(r, image)) return refuse("no view for the T#'s format or range");
+            const auto key = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(r.title_address()));
+            const auto [first, last] = device.twin_images.equal_range(key);
+            for (auto it = first; it != last; ++it) {
+                Resource& t = *it->second;
+                if (!matches(t) || bc_block_bytes(t.format()) != bc_block_bytes(r.format())) continue;
+                g::Image twin = image;
+                twin.address = t.image_address();
+                if (!t.descriptor_image()) {
+                    Resource::PendingView v;
+                    v.words = words;
+                    v.image = twin;
+                    v.simple = true;
+                    v.view_format = t.format();
+                    v.aspects = t.aspects();
+                    if (!t.defer_view(v)) continue;
+                } else if (!device.bind_image_locked(words, twin, t.descriptor_image(), t.format(), t.aspects(), false)) {
+                    continue;
+                }
+                t.note_shader_view();
+                g_twin_binds.fetch_add(1, std::memory_order_relaxed);
+                return TitleImage::bound;
+            }
+            g_twin_wanted.fetch_add(1, std::memory_order_relaxed);
+            note_tsharp_miss(key, words);
+            return refuse("another BC format of the texture's block size (a format twin is wanted)");
+        }
         r.note_shader_view();  // Include descriptors written directly into title heaps.
         if (image.first_mip < r.mip_base()) note_tsharp_wanted(r.title_address());  // it may have more levels now
         if (r.sparse_image()) sparse = r.id();
@@ -11724,7 +12324,7 @@ public:
         const auto visit = [&](TitleTexture& t) {
             if (t.bink && !bink_visit) return;
             if (t.over_budget) return;
-            if (t.base_floor_made && t.unbound_bytes && tsharp_worker_on()) return;  // the T# texture worker's
+            if (t.base_floor_made && t.unbound_bytes && tsharp_worker_on() && !t.twin_of) return;  // the T# worker's
             if (t.resource && t.resource->in_place()) return;
             // A slot-133 texture's guessed layout (no slot-70 view yet) is only used once the title maps it.
             if (t.gpu_written || !t.layout_known || !t.resource ||
@@ -11862,6 +12462,7 @@ public:
                 ++stats.every_pass_visits;
                 visit(*entry.second);
             }
+        if (!twin_textures_.empty()) refresh_twins(visit);
         stats.every_pass_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - every_start).count();
         // The budget is the round robin's: mapped and stale textures above are checked every pass whatever it is.
         const auto first_bytes = checked, first_hash_ns = stats.hash_ns;
@@ -11893,6 +12494,25 @@ public:
         if (now - stats.last_log >= std::chrono::seconds(10)) {
             stats.last_log = now;
             log_title_census("refresh");
+            if (DeviceState::view_share_on()) {
+                std::lock_guard descriptors(state_.descriptor_mutex);
+                std::fprintf(stderr, "[rt] d3d12-metal: shared views: %zu identities, %zu shared indices, %llu T#s took a "
+                                     "shared view, %zu image entries\n",
+                             state_.shared_views.size(), state_.shared_refs.size(),
+                             static_cast<unsigned long long>(state_.shared_hits), state_.image_entries.size());
+            }
+            if (tsharp_twins_on())
+                std::fprintf(stderr, "[rt] d3d12-metal: format twins: %zu live, %llu made, %llu retired; T# binds to a twin %llu, "
+                                     "twins wanted %llu\n",
+                             twin_textures_.size(), static_cast<unsigned long long>(twins_made_),
+                             static_cast<unsigned long long>(twins_retired_),
+                             static_cast<unsigned long long>(g_twin_binds.load(std::memory_order_relaxed)),
+                             static_cast<unsigned long long>(g_twin_wanted.load(std::memory_order_relaxed)));
+            if (state_.bindless) {
+                const auto bs = state_.bindless->stats();
+                std::fprintf(stderr, "[rt] d3d12-metal: bindless: %llu images live, %llu refused (an index array was full)\n",
+                             static_cast<unsigned long long>(bs.images), static_cast<unsigned long long>(bs.full));
+            }
         }
         inside.reset();
         lock.unlock();
@@ -12588,7 +13208,7 @@ private:
     TitleTexture* make_title_texture(const rt::xg_xs::ResourceDesc& d, const std::array<std::uint32_t, 14>& words,
                                      const D3D12_SHADER_RESOURCE_VIEW_DESC& srv, std::uint64_t address,
                                      std::vector<DXGI_FORMAT> formats, std::uint32_t base_floor = 0,
-                                     std::uint64_t resident_span = 0) {
+                                     std::uint64_t resident_span = 0, std::shared_ptr<TitleTexture>* twin = nullptr) {
         namespace xg = rt::xg_xs;
         if (d.flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
                        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))
@@ -12656,14 +13276,16 @@ private:
             r->Release();
             return refuse_title_view(why, d, address), nullptr;
         }
-        r->place_at_title_address(reinterpret_cast<void*>(static_cast<std::uintptr_t>(address)));
+        r->place_at_title_address(reinterpret_cast<void*>(static_cast<std::uintptr_t>(address)), twin != nullptr);
         entry->address = address;
         entry->desc = words;
         entry->layout_known = true;
         entry->set_resource(r);
         entry->owned = true;
         entry->formats = std::move(formats);
-        if (title_fill_async()) {
+        if (twin) {
+            entry->stale = true;  // filled by the refresh pass (twin_textures_)
+        } else if (title_fill_async()) {
             entry->stale = true;  // filled by the fill worker (queued below, once it is in the registry)
         } else if (resident_span) {
             entry->stale = true;  // filled by the pass once a T# names it (fill_title_texture)
@@ -12674,6 +13296,10 @@ private:
         ++title_stats_.made;
         TitleTexture* t = entry.get();
         t->span = span;
+        if (twin) {
+            *twin = std::move(entry);
+            return t;
+        }
         retire_overlapped_title_textures(address, span, "an image made for a slot-70 view");
         max_title_span_ = std::max(max_title_span_, span);
         state_.title_textures[address] = std::move(entry);
@@ -13237,6 +13863,7 @@ private:
         return xg::k4kbS;
     }
     std::array<std::uint64_t, 4> layout_scored_{};  // 4KB_S kept, 64KB_D, linear, no answer (under title_texture_mutex)
+    std::set<std::uint32_t> format_codes_logged_;  // under title_texture_mutex
 
     static DXGI_FORMAT dxgi_of_gfx10(std::uint32_t code) {
         static const std::array<DXGI_FORMAT, 512> table = [] {
@@ -13292,7 +13919,15 @@ private:
             if (!decode_title_tsharp(words, image)) { skip("not a T#"); continue; }
             if (g::multisampled(image.type)) { skip("multisampled"); continue; }
             const DXGI_FORMAT format = dxgi_of_gfx10(image.format);
-            if (format == DXGI_FORMAT_UNKNOWN) { skip("format"); continue; }
+            if (format == DXGI_FORMAT_UNKNOWN) {
+                skip("format");
+                if (format_codes_logged_.size() < 16 && format_codes_logged_.insert(image.format).second)
+                    std::fprintf(stderr, "[rt] d3d12-metal: no DXGI format for GFX10 format %u (T# %08x %08x %08x %08x, "
+                                         "type %u %ux%u)\n",
+                                 image.format, words[0], words[1], words[2], words[3], unsigned(image.type), image.width,
+                                 image.height);
+                continue;
+            }
             xg::ResourceDesc d{};
             const bool volume = image.type == g::ImageType::image_3d;
             const bool line = image.type == g::ImageType::image_1d || image.type == g::ImageType::image_1d_array;
@@ -13313,6 +13948,11 @@ private:
                                                                                                     : chain);
             d.format = std::uint32_t(format);
             d.samples = 1;
+            if (auto it = state_.title_textures.find(image.address); it != state_.title_textures.end() &&
+                                                                      twin_base(*it->second, image)) {
+                make_twin(*it->second, image, words, d, format, budget);
+                continue;
+            }
             if (auto it = state_.title_textures.find(image.address); it != state_.title_textures.end()) {
                 // Checked before the layout is scored: a T# queued again while its texture was being made.
                 const TitleTexture& old = *it->second;
@@ -13452,6 +14092,123 @@ private:
         }
         return false;
     }
+
+    // A registered title texture whose bytes a T# names in another BC format of the same block size and shape
+    // (bind_title_image's twin_wanted): a format twin is made beside it (GTA6RT_METAL_TSHARP_TWINS).
+    bool twin_base(const TitleTexture& old, const leonida::gfx10::Image& image) {
+        if (!tsharp_twins_on() || !old.resource || old.twin_of || old.gpu_written || !old.layout_known) return false;
+        return twin_wanted(*old.resource, image) &&
+               TitleGpuPlacements<Resource>::matches(image, old.resource->desc());
+    }
+    // Caller holds title_texture_mutex. The twin takes the registered texture's layout (same bytes) in the T#'s format.
+    void make_twin(const TitleTexture& old, const leonida::gfx10::Image& image, const leonida::gfx10::ImageWords& words,
+                   rt::xg_xs::ResourceDesc d, DXGI_FORMAT format, std::uint64_t budget) {
+        namespace xg = rt::xg_xs;
+        const auto skip = [&](const char* why) { ++orphan_skipped_[why]; };
+        const auto key = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(old.resource->title_address()));
+        const auto [first, last] = twin_textures_.equal_range(key);
+        for (auto it = first; it != last; ++it)
+            if (it->second->resource && it->second->resource->desc().Format == format) {
+                skip("format twin: one of this format exists");
+                return;
+            }
+        xg::ResourceDesc od{};
+        std::memcpy(&od, old.desc.data(), sizeof(od));
+        d.width = od.width;
+        d.height = od.height;
+        d.depth_or_array = od.depth_or_array;
+        d.mips = od.mips;
+        d.layout = od.layout;
+        xg::Texture layout;
+        const char* why = nullptr;
+        if (!title_layout(d, layout, why)) {
+            skip(why ? why : "format twin: layout");
+            return;
+        }
+        if (layout.layout.size != old.layout.layout.size) {
+            skip("format twin: another layout size");
+            return;
+        }
+        const std::uint32_t floor = image.first_mip < layout.layout.mips ? image.first_mip : 0;
+        const bool partial = layout.array == 1 && layout.layout.dimension != xg::kTexture3D;
+        const auto& floor_mip = layout.layout.plane[0].mips[floor];
+        const std::uint64_t span = partial ? floor_mip.offset + floor_mip.size : layout.layout.size;
+        const std::uint32_t base_floor = partial ? floor : 0;
+        if (orphan_bytes_ + span > budget) {
+            skip("format twin: over the budget");
+            return;
+        }
+        if (base_floor_bytes_zero(layout, base_floor, old.address)) {
+            skip("format twin: its largest level is all zero bytes");
+            return;
+        }
+        std::array<std::uint32_t, 14> desc{};
+        std::memcpy(desc.data(), &d, sizeof(d));
+        desc[2] = desc[3] = 0;
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+        srv.Format = format;
+        srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        std::shared_ptr<TitleTexture> twin;
+        TitleTexture* t = make_title_texture(d, desc, srv, old.address, {}, base_floor, span, &twin);
+        if (!t || !twin) {
+            skip("format twin: not made");
+            return;
+        }
+        t->base_floor_made = true;
+        t->twin_of = old.address;
+        orphan_bytes_ += span;
+        {
+            std::lock_guard descriptors(state_.descriptor_mutex);
+            state_.twin_images.emplace(key, t->resource);
+        }
+        twin_textures_.emplace(key, std::move(twin));
+        if (++twins_made_ <= 16)
+            std::fprintf(stderr,
+                         "[rt] d3d12-metal: format twin at 0x%llx: %llux%u mips %u DXGI %d beside DXGI %d, %llu bytes\n",
+                         static_cast<unsigned long long>(old.address), static_cast<unsigned long long>(d.width),
+                         unsigned(d.height), unsigned(d.mips), int(format), int(old.resource->desc().Format),
+                         static_cast<unsigned long long>(span));
+    }
+    // Twins whose registered texture is gone or another now go; a twin the registered texture's refill made stale,
+    // or one bound before its first fill, is visited. Caller holds title_texture_mutex.
+    template <class Visit>
+    void refresh_twins(Visit&& visit) {
+        for (auto it = twin_textures_.begin(); it != twin_textures_.end();) {
+            TitleTexture& t = *it->second;
+            const auto base = state_.title_textures.find(t.twin_of);
+            const bool alive = t.resource && base != state_.title_textures.end() && base->second->resource &&
+                               static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(
+                                   base->second->resource->title_address())) == it->first;
+            if (!alive) {
+                if (t.resource) {
+                    {
+                        std::lock_guard descriptors(state_.descriptor_mutex);
+                        const auto [first, last] = state_.twin_images.equal_range(it->first);
+                        for (auto k = first; k != last; ++k)
+                            if (k->second == t.resource) {
+                                state_.twin_images.erase(k);
+                                break;
+                            }
+                    }
+                    orphan_bytes_ -= std::min(orphan_bytes_, t.span);
+                    retire_title_texture(t);
+                    ++twins_retired_;
+                }
+                it = twin_textures_.erase(it);
+                continue;
+            }
+            const TitleTexture& b = *base->second;
+            if (b.fills != t.twin_base_fills || (!t.fills && t.resource->shader_views())) t.stale = true;
+            if (t.stale) {
+                t.twin_base_fills = b.fills;
+                visit(t);
+            }
+            ++it;
+        }
+    }
+    std::multimap<std::uint64_t, std::shared_ptr<TitleTexture>> twin_textures_;  // under title_texture_mutex
+    std::uint64_t twins_made_ = 0, twins_retired_ = 0;
 
     // GTA6RT_METAL_TSHARP_ZERO_CHECK (on; =0 off): the first 64 KiB of the largest level a T# names, read from the
     // title's memory, are all zero.

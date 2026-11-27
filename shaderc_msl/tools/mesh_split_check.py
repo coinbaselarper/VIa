@@ -20,10 +20,11 @@ import spv  # noqa: E402
 import mesh_split as M  # noqa: E402
 
 ROOT = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
-CORPUS = os.path.join(ROOT, "spike/s2-make-game/work/shaders")
-TRANSLATOR = os.path.join(ROOT, "spike/s2-make-game/tree/tools/rdna2spirv.py")
-RUN = os.path.join(ROOT, "port/build/shaderc_msl/bin2/mesh_run")
-PY314 = "/opt/homebrew/bin/python3.14"
+CORPUS = os.environ.get("GTA6RT_SHADER_WORK") or os.path.join(ROOT, "spike/s2-make-game/work/shaders")
+TRANSLATOR = os.path.join(os.environ.get("GTA6RT_TRANSLATOR_TOOLS") or os.path.join(ROOT, "spike/s2-make-game/tree/tools"),
+                          "rdna2spirv.py")
+RUN = os.path.join(HERE, "..", "..", "build", "shaderc_msl", "bin2", "mesh_run")
+PY314 = os.environ.get("GTA6RT_MAKE_GAME_PYTHON") or "/opt/homebrew/bin/python3.14"
 
 
 def gta6rt_running():

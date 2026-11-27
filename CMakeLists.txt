@@ -1,4 +1,9 @@
 cmake_minimum_required(VERSION 3.24)
+# The oldest macOS whose SDK declares every Metal and os_sync call the sources make without an availability check
+# (a 14.0 build warns about macOS 14.4, 15.0 and 26.4 APIs, a 26.4 build about none). Only macOS 27.0 is tested.
+if(NOT DEFINED CMAKE_OSX_DEPLOYMENT_TARGET AND NOT DEFINED ENV{MACOSX_DEPLOYMENT_TARGET})
+  set(CMAKE_OSX_DEPLOYMENT_TARGET "26.4" CACHE STRING "Minimum macOS version")
+endif()
 project(gta6rt_port LANGUAGES C CXX ASM)
 
 # One architecture per build tree: -DCMAKE_OSX_ARCHITECTURES=x86_64 (Rosetta host, shipped) or arm64 (escape route).

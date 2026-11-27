@@ -16,7 +16,9 @@ import argparse, json, os, re, struct, sys
 FNV0, FNVP = 2166136261, 16777619
 VA0 = 0x10000000
 PAD = 64 << 10
-CORPUS_INDEX = "/Users/a/Desktop/Projects/GTA-VI/spike/s2-make-game/work/shaders/spirv/library/index.json"
+CORPUS_INDEX = os.path.join(os.environ.get("GTA6RT_METAL_SPIRV") or os.path.abspath(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "spike", "s2-make-game", "work", "shaders", "spirv")),
+    "library", "index.json")
 
 
 def fnv(words):
