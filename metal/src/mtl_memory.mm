@@ -1,6 +1,10 @@
 #include "mtl_internal.h"
 
 #include <mach/mach.h>
+#include <malloc/malloc.h>
+
+#include <cstdio>
+#include <cstdlib>
 #include <unistd.h>
 
 namespace gta6rt::metal {
@@ -45,6 +49,73 @@ void MetalDevice::start_pressure_source() {
       self->dispatch_pressure(level);
     });
     dispatch_resume(src);
+    start_machine_guard();
+}
+
+namespace {
+// GTA6RT_METAL_MALLOC_TRACE=1: once a second, every malloc zone's bytes in use and allocated, and the machine's wired and
+// compressor pages (diagnostics for the footprint's growth).
+void malloc_zone_trace(std::uint64_t wired_mb, std::uint64_t compressor_mb, std::uint64_t compressions) {
+    vm_address_t* zones = nullptr;
+    unsigned count = 0;
+    if (malloc_get_all_zones(mach_task_self(), nullptr, &zones, &count) != KERN_SUCCESS) return;
+    std::string text;
+    std::uint64_t in_use = 0;
+    for (unsigned i = 0; i < count; ++i) {
+        auto* zone = reinterpret_cast<malloc_zone_t*>(zones[i]);
+        malloc_statistics_t st{};
+        malloc_zone_statistics(zone, &st);
+        in_use += st.size_in_use;
+        if (st.size_allocated < (1u << 20)) continue;
+        const char* name = malloc_get_zone_name(zone);
+        char t[160];
+        std::snprintf(t, sizeof t, "%s%s %.0f in use / %.0f allocated (%u blocks)", text.empty() ? "" : ", ",
+                      name ? name : "?", double(st.size_in_use) / 1048576.0, double(st.size_allocated) / 1048576.0,
+                      st.blocks_in_use);
+        text += t;
+    }
+    std::fprintf(stderr, "[metal] malloc trace t=%.0fs: in use %.0f MiB: %s; machine wired %llu MiB, compressor %llu MiB "
+                         "(%llu compressions)\n",
+                 now_seconds(), double(in_use) / 1048576.0, text.c_str(), (unsigned long long)wired_mb,
+                 (unsigned long long)compressor_mb, (unsigned long long)compressions);
+}
+}  // namespace
+
+// GTA6RT_METAL_MACHINE_GUARD_MB (default 15360, 0: off): 4 times a second, the machine's wired pages plus the pages the
+// compressor occupies; over the limit the process ends (exit 6). Wired GPU memory cannot be compressed or paged, and the
+// 03:33 kernel panic came at 10.7 GiB wired + 5.3 GiB compressed (16.0 GiB) with 96 MiB free; the worst world run
+// before this guard reached 9.37 + 4.73 = 14.1 GiB.
+void MetalDevice::start_machine_guard() {
+    const char* v = std::getenv("GTA6RT_METAL_MACHINE_GUARD_MB");
+    const std::uint64_t limit_mb = v && *v ? std::strtoull(v, nullptr, 10) : 15360;
+    if (!limit_mb || !pressure_queue_) return;
+    machine_guard_ = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, pressure_queue_);
+    if (!machine_guard_) {
+        log("machine guard unavailable");
+        return;
+    }
+    dispatch_source_set_timer(machine_guard_, dispatch_time(DISPATCH_TIME_NOW, 250 * NSEC_PER_MSEC), 250 * NSEC_PER_MSEC,
+                              20 * NSEC_PER_MSEC);
+    const host_t host = mach_host_self();
+    const std::uint64_t page = vm_kernel_page_size;
+    const bool malloc_trace = env_flag("GTA6RT_METAL_MALLOC_TRACE");
+    __block unsigned ticks = 0;
+    dispatch_source_set_event_handler(machine_guard_, ^{
+      vm_statistics64_data_t vs{};
+      mach_msg_type_number_t n = HOST_VM_INFO64_COUNT;
+      if (host_statistics64(host, HOST_VM_INFO64, reinterpret_cast<host_info64_t>(&vs), &n) != KERN_SUCCESS) return;
+      const std::uint64_t wired = std::uint64_t(vs.wire_count) * page >> 20;
+      const std::uint64_t compressor = std::uint64_t(vs.compressor_page_count) * page >> 20;
+      if (malloc_trace && ++ticks % 4 == 0) malloc_zone_trace(wired, compressor, std::uint64_t(vs.compressions));
+      if (wired + compressor <= limit_mb) return;
+      std::fprintf(stderr, "[metal] machine guard: wired %llu MiB + compressor %llu MiB = %llu MiB over "
+                           "GTA6RT_METAL_MACHINE_GUARD_MB %llu: ending the run (exit 6)\n",
+                   (unsigned long long)wired, (unsigned long long)compressor, (unsigned long long)(wired + compressor),
+                   (unsigned long long)limit_mb);
+      std::fflush(stderr);
+      std::_Exit(6);
+    });
+    dispatch_resume(machine_guard_);
 }
 
 void MetalDevice::dispatch_pressure(MemoryPressure level) {
@@ -96,7 +167,9 @@ std::unique_ptr<gpu::Buffer> MetalDevice::create_host_buffer(const HostBufferDes
     if (!b) return fail("newBufferWithBytesNoCopy refused the range");
     if (desc.label) b.label = @(desc.label);
     const std::uint64_t va = desc.va ? desc.va : va_.allocate(desc.size, 1ull << 16);
-    return std::make_unique<MetalBuffer>(this, b, va, desc.size, false, false, MemoryCategory::host_window, desc.resident);
+    auto out = std::make_unique<MetalBuffer>(this, b, va, desc.size, false, false, MemoryCategory::host_window, desc.resident);
+    if (!desc.va) out->own_va();
+    return out;
 }
 
 std::unique_ptr<gpu::Texture> MetalDevice::create_buffer_texture(gpu::Buffer* buffer, std::uint64_t offset,

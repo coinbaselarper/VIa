@@ -25,6 +25,7 @@
 #include <set>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -812,8 +813,10 @@ private:
     // counts (an indirect dispatch's first record), every user-data word read as a table (up to 64 KiB) and the ranges
     // of the buffer V#s in those tables (up to 16 MiB each, 256 MiB a capture). Input of
     // port/shaderc_msl/tools/cspeed_ab.mm (offline A/B and timing on real inputs).
+    // GTA6RT_METAL_CS_CAPTURE_GPU=1: the layer buffers among those ranges (and an indirect dispatch's record) are
+    // copied on the GPU right before the dispatch and written ~3 s later, so GPU-produced inputs are what it read.
     void cs_capture(const char* name, const std::array<std::uint32_t, 32>& user_data, std::uint32_t x, std::uint32_t y,
-                    std::uint32_t z, bool indirect) {
+                    std::uint32_t z, bool indirect, gpu::Buffer* args = nullptr, std::uint64_t args_offset = 0) {
         struct Config {
             std::string dir;
             std::vector<std::string> names;
@@ -902,26 +905,78 @@ private:
         std::string file = label.substr(0, label.find(' '));
         std::replace(file.begin(), file.end(), '/', '_');
         file = cfg.dir + "/" + file + "_" + std::to_string(index) + ".cap";
-        std::FILE* f = std::fopen(file.c_str(), "wb");
-        if (!f) return;
-        const auto put32 = [&](std::uint32_t w) { std::fwrite(&w, 4, 1, f); };
-        std::fwrite("CSCAP001", 1, 8, f);
-        put32(std::uint32_t(label.size()));
-        std::fwrite(label.data(), 1, label.size(), f);
-        put32(x), put32(y), put32(z), put32(indirect);
-        std::fwrite(user_data.data(), 4, 32, f);
-        put32(std::uint32_t(regions.size()));
-        for (const Region& r : regions) {
-            std::fwrite(&r.va, 8, 1, f);
-            const std::uint64_t n = r.bytes.size();
-            std::fwrite(&n, 8, 1, f);
-            put32(r.kind);
-            std::fwrite(r.bytes.data(), 1, r.bytes.size(), f);
+        struct Staged {
+            std::size_t region;
+            std::unique_ptr<gpu::Buffer> buffer;
+        };
+        auto job = std::make_shared<std::pair<std::vector<Region>, std::vector<Staged>>>();
+        static const bool on_gpu = [] {
+            const char* g = std::getenv("GTA6RT_METAL_CS_CAPTURE_GPU");
+            return g && *g && *g != '0';
+        }();
+        std::unique_ptr<gpu::Buffer> args_copy;
+        if (on_gpu) {
+            const auto stage = [&](gpu::Buffer* src, std::uint64_t offset, std::uint64_t bytes) -> std::unique_ptr<gpu::Buffer> {
+                gpu::BufferDesc bd;
+                bd.size = bytes;
+                bd.memory = gpu::MemoryKind::readback;
+                bd.usage = gpu::usage::copy;
+                bd.label = "cs capture";
+                auto b = context_.gpu().create_buffer(bd);
+                if (b && b->cpu_pointer()) out_.copy_buffer(b.get(), 0, src, offset, bytes);
+                else b.reset();
+                return b;
+            };
+            barrier_all(d3d12_state::unordered_access, d3d12_state::copy_source);
+            for (std::size_t i = 0; i < regions.size(); ++i) {
+                std::uint64_t n = regions[i].bytes.size();
+                gpu::Buffer* buf = nullptr;
+                std::uint64_t off = 0;
+                if (!context_.buffer_at(regions[i].va, n, buf, off) || !buf || n < regions[i].bytes.size()) continue;
+                if (auto b = stage(buf, off, regions[i].bytes.size())) job->second.push_back({i, std::move(b)});
+            }
+            if (args) args_copy = stage(args, args_offset, 12);
+            barrier_all(d3d12_state::copy_source, d3d12_state::unordered_access);
         }
-        std::fclose(f);
-        std::fprintf(stderr, "[rt] d3d12-metal: cs capture %s: %ux%ux%u%s, %zu tables, %zu buffers, %.1f MiB\n",
-                     file.c_str(), x, y, z, indirect ? " (indirect, first record)" : "", tables, regions.size() - tables,
-                     double(total) / 1048576.0);
+        job->first = std::move(regions);
+        const std::array<std::uint32_t, 32> ud = user_data;
+        const std::uint32_t staged = std::uint32_t(job->second.size());
+        auto write = [job, file, label, ud, x, y, z, indirect, tables, total, staged,
+                      args_copy = std::shared_ptr<gpu::Buffer>(std::move(args_copy))]() mutable {
+            std::uint32_t gx = x, gy = y, gz = z;
+            if (!job->second.empty() || args_copy) {
+                std::this_thread::sleep_for(std::chrono::seconds(3));
+                for (Staged& s : job->second)
+                    std::memcpy(job->first[s.region].bytes.data(), s.buffer->cpu_pointer(), job->first[s.region].bytes.size());
+                if (args_copy) {
+                    const auto* g = static_cast<const std::uint32_t*>(args_copy->cpu_pointer());
+                    gx = g[0], gy = g[1], gz = g[2];
+                }
+            }
+            std::FILE* f = std::fopen(file.c_str(), "wb");
+            if (!f) return;
+            const auto put32 = [&](std::uint32_t w) { std::fwrite(&w, 4, 1, f); };
+            std::fwrite("CSCAP001", 1, 8, f);
+            put32(std::uint32_t(label.size()));
+            std::fwrite(label.data(), 1, label.size(), f);
+            put32(gx), put32(gy), put32(gz), put32(indirect);
+            std::fwrite(ud.data(), 4, 32, f);
+            put32(std::uint32_t(job->first.size()));
+            for (const Region& r : job->first) {
+                std::fwrite(&r.va, 8, 1, f);
+                const std::uint64_t n = r.bytes.size();
+                std::fwrite(&n, 8, 1, f);
+                put32(r.kind);
+                std::fwrite(r.bytes.data(), 1, r.bytes.size(), f);
+            }
+            std::fclose(f);
+            std::fprintf(stderr, "[rt] d3d12-metal: cs capture %s: %ux%ux%u%s, %zu tables, %zu buffers (%u read on the GPU "
+                                 "before the dispatch), %.1f MiB\n",
+                         file.c_str(), gx, gy, gz, indirect ? " (indirect, first record)" : "", tables,
+                         job->first.size() - tables, staged, double(total) / 1048576.0);
+        };
+        if (on_gpu) std::thread(std::move(write)).detach();
+        else write();
     }
 
     void record(const Dispatch& c) {
@@ -975,7 +1030,8 @@ private:
         static const bool capture_on = std::getenv("GTA6RT_METAL_CS_CAPTURE") != nullptr;
         if (const MetalBinding* ab = capture_on ? binding(c.argument_buffer, false) : nullptr; ab && ab->va) {
             std::uint32_t g[3] = {};
-            if (read_va(ab->va + c.argument_offset, g, sizeof g)) cs_capture(p.name, c.user_data, g[0], g[1], g[2], true);
+            if (read_va(ab->va + c.argument_offset, g, sizeof g))
+                cs_capture(p.name, c.user_data, g[0], g[1], g[2], true, d.arguments, d.argument_offset);
         }
         set_compute(p, c.user_data);
         out_.execute_indirect(d);
@@ -1061,6 +1117,16 @@ private:
         rt_dirty_ = false;
         return true;
     }
+    // A buffer the backend gave no console VA (its VA space ran out) cannot be named by the encoder: that draw is
+    // skipped alone instead of failing the encoder and with it the whole held submission.
+    static void no_console_va(const char* what, std::uint32_t slot, std::uint64_t title_va) {
+        static std::atomic<std::uint64_t> n{0};
+        const std::uint64_t k = n.fetch_add(1) + 1;
+        if (k <= 8 || !(k & (k - 1)))
+            std::fprintf(stderr, "[rt] d3d12-metal: draw skipped: %s buffer slot %u (title VA 0x%llx) is a backend buffer "
+                                 "with no console VA (%llu so far)\n",
+                         what, slot, static_cast<unsigned long long>(title_va), static_cast<unsigned long long>(k));
+    }
     Fate bind_draw_state(const Draw& draw, const MetalGraphicsPipeline& p, const char*& why, bool indirect = false) {
         if (!bind_targets(draw)) {
             unsupported("draw with an unknown render target or depth texture");
@@ -1128,6 +1194,11 @@ private:
                                          slot, static_cast<unsigned long long>(v.va), v.size, v.stride);
                         return Fate::vertex_unknown;
                     }
+                    if (!r.buffer->gpu_va()) {
+                        why = "vertex buffer with no backend console VA";
+                        no_console_va("vertex", slot, v.va);
+                        return Fate::vertex_unknown;
+                    }
                     vbs[slot] = {r.buffer->gpu_va() + r.offset, std::uint32_t(std::min<std::uint64_t>(v.size, r.bytes)),
                                  v.stride};
                     used = slot + 1;
@@ -1140,6 +1211,11 @@ private:
                     Resolved r;
                     if (!va(draw.index.va, draw.index.size, r, TitleVaAliases::index_view)) {
                         unsupported("index buffer at an unknown VA");
+                        return Fate::index_unknown;
+                    }
+                    if (!r.buffer->gpu_va()) {
+                        why = "index buffer with no backend console VA";
+                        no_console_va("index", 0, draw.index.va);
                         return Fate::index_unknown;
                     }
                     ib.va = r.buffer->gpu_va() + r.offset;

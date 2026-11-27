@@ -246,6 +246,7 @@ MetalDevice::MetalDevice(id<MTLDevice> device, const DeviceOptions& options) : d
 }
 
 MetalDevice::~MetalDevice() {
+    if (machine_guard_) dispatch_source_cancel(machine_guard_);
     if (pressure_source_) dispatch_source_cancel(pressure_source_);
     collect_retired(true);
 }
@@ -649,14 +650,17 @@ std::unique_ptr<gpu::Buffer> MetalDevice::create_buffer(const BufferDesc& desc) 
                      placementSparsePageSize:MTLSparsePageSize16];
         if (!b) return nullptr;
         if (desc.label) b.label = @(desc.label);
-        const std::uint64_t va = va_.allocate(desc.size, 1ull << 16);
-        return std::make_unique<MetalBuffer>(this, b, va, desc.size, false, true, MemoryCategory::buffer, false);
+        // A GPU-VA hold: its users read host_gpu_address alone, so it takes no console VA (wired-b's holds took
+        // 115 GiB of the 64 GiB space, and every buffer made after that had none).
+        return std::make_unique<MetalBuffer>(this, b, 0, desc.size, false, true, MemoryCategory::buffer, false);
     }
     id<MTLBuffer> b = [device_ newBufferWithLength:desc.size options:storage_options(desc.memory)];
     if (!b) return nullptr;
     if (desc.label) b.label = @(desc.label);
     const std::uint64_t va = va_.allocate(desc.size, 1ull << 16);
-    return std::make_unique<MetalBuffer>(this, b, va, desc.size, false, true, MemoryCategory::buffer, desc.resident);
+    auto out = std::make_unique<MetalBuffer>(this, b, va, desc.size, false, true, MemoryCategory::buffer, desc.resident);
+    out->own_va();
+    return out;
 }
 
 std::unique_ptr<gpu::Texture> MetalDevice::create_texture(const TextureDesc& desc) {
@@ -1030,6 +1034,12 @@ std::string memory_detail(gpu::Device* device, unsigned max_labels) {
                   "pipelines created %llu, compiled %llu)",
                   double(other) / 1048576.0, (unsigned long long)st.pipelines_created,
                   (unsigned long long)st.pipelines_compiled);
+    out += t;
+    const VaSpace::Stats va = d->va_space().stats();
+    std::snprintf(t, sizeof t, "; console VA %.0f of %.0f MiB handed out, %.0f MiB released, %llu ranges reused, %llu "
+                               "refused (exhausted)",
+                  double(va.bump_used) / 1048576.0, double(va.bump_size) / 1048576.0, double(va.free_bytes) / 1048576.0,
+                  (unsigned long long)va.reused, (unsigned long long)va.exhausted);
     out += t;
     return out;
 }

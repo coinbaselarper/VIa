@@ -1069,7 +1069,8 @@ std::unique_ptr<SceneProbe> SceneProbe::create(MetalContext& context) {
     const char* p = std::getenv("GTA6RT_METAL_PRESENT_SCENE");
     const char* d = std::getenv("GTA6RT_METAL_SCENE_DUMP");
     const char* l = std::getenv("GTA6RT_METAL_SCENE_LOG");
-    if (!(p && *p && *p != '0') && !(d && *d) && !(l && *l == '1')) return nullptr;
+    const char* a = std::getenv("GTA6RT_METAL_SCENE_ALBEDO");
+    if (!(p && *p && *p != '0') && !(d && *d) && !(l && *l == '1') && !(a && *a && *a != '0')) return nullptr;
     return std::make_unique<SceneProbe>(context);
 }
 
@@ -1105,6 +1106,11 @@ SceneProbe::SceneProbe(MetalContext& context) : context_(context) {
     }
     if (const char* r = std::getenv("GTA6RT_METAL_SCENE_RAW"); r && *r == '1') raw_ = true;
     if (const char* r = std::getenv("GTA6RT_METAL_SCENE_SENTINEL"); r && *r == '1') sentinel_ = true;
+    if (const char* a = std::getenv("GTA6RT_METAL_SCENE_ALBEDO"); a && *a) albedo_every_ = std::strtoull(a, nullptr, 10);
+    if (const char* a = std::getenv("GTA6RT_METAL_SCENE_ALBEDO_PNG"); a && *a) {
+        albedo_dir_ = a;
+        ::mkdir(albedo_dir_.c_str(), 0755);
+    }
     std::fprintf(stderr,
                  "[rt] d3d12-metal scene probe: render size %ux%u, present %s, %s%s (frame %llu, then every %llu, %llu "
                  "times)\n",
@@ -1182,6 +1188,11 @@ bool SceneProbe::draw(const Target* rts, std::uint32_t count, const Target& dept
         if (!same) {
             if (logging_ && (stages_max_ || !after_.empty()) && !cur_.first.empty())
                 copied = pass_boundary(rts, std::min<std::uint32_t>(count, 8), name, out, resolve);
+            if (albedo_every_ && !latched_ && cur_.count >= 3 && cur_.rts[0].id && cur_.rts[1].id &&
+                cur_.rts[0].format == 29 && render_size(cur_.rts[0]) && frame_ % albedo_every_ == 0) {
+                albedo_copy(out, resolve);
+                copied = true;
+            }
             cur_ = Pass{};
             cur_.count = std::min<std::uint32_t>(count, 8);
             for (std::uint32_t i = 0; i < cur_.count; ++i) cur_.rts[i] = rts[i];
@@ -1540,6 +1551,88 @@ void SceneProbe::write_readback(Readback& r) {
                  written ? "written to" : "NOT written to", r.path.c_str());
 }
 
+void SceneProbe::albedo_copy(gpu::CommandList& out, const Resolve& resolve) {
+    if (albedo_frame_ != frame_) {
+        if (albedo_frame_ != ~std::uint64_t(0)) return;  // the last sample is not read yet
+        albedo_frame_ = frame_;
+        albedo_upscaled_ = upscaled_frames_ + 1;
+        albedo_passes_ = 0;
+    }
+    for (int i = 0; i < 2; ++i) {
+        const Target& t = cur_.rts[i];
+        gpu::Texture* texture = resolve(t.id);
+        gpu::FormatInfo info;
+        if (!texture || !context_.gpu().describe_format(t.format, info) || info.block_bytes != 4 || info.block_dim != 1)
+            return;
+        const std::uint64_t bytes = std::uint64_t(t.width) * t.height * 4;
+        if (!albedo_buf_[i] || albedo_buf_[i]->size() < bytes) {
+            gpu::BufferDesc d;
+            d.size = bytes;
+            d.memory = gpu::MemoryKind::shared;
+            d.usage = gpu::usage::copy;
+            d.label = "scene albedo readback";
+            albedo_buf_[i] = context_.gpu().create_buffer(d);
+            if (!albedo_buf_[i] || !albedo_buf_[i]->cpu_pointer()) return;
+        }
+        gpu::BufferTextureCopy k;
+        k.buffer = albedo_buf_[i].get();
+        k.row_pitch = t.width * 4;
+        k.texture = texture;
+        k.mip = t.mip;
+        k.layer = t.layer;
+        k.width = t.width;
+        k.height = t.height;
+        gpu::Barrier fence;
+        fence.type = gpu::BarrierType::uav;
+        out.barrier({&fence, 1});
+        out.copy_texture_to_buffer(k);
+        out.barrier({&fence, 1});
+        albedo_target_[i] = t;
+    }
+    ++albedo_passes_;
+}
+
+void SceneProbe::albedo_report() {
+    const Target& a = albedo_target_[0];
+    const auto* alb = static_cast<const std::uint8_t*>(albedo_buf_[0]->cpu_pointer());
+    const auto* nrm = static_cast<const std::uint8_t*>(albedo_buf_[1]->cpu_pointer());
+    const std::size_t n = std::size_t(a.width) * a.height;
+    std::uint64_t albedo = 0, geometry = 0, black = 0;
+    const bool png = !albedo_dir_.empty() && albedo_reports_ % 6 == 0;
+    std::vector<std::uint8_t> rgba(png ? n * 4 : 0);
+    for (std::size_t i = 0; i < n; ++i) {
+        const std::uint8_t* p = alb + i * 4;
+        const std::uint8_t* q = nrm + i * 4;
+        const bool lit = p[0] | p[1] | p[2];
+        const bool geo = q[0] | q[1] | q[2] | q[3];
+        albedo += lit;
+        geometry += geo;
+        black += geo && !lit;
+        if (png) {
+            std::uint8_t* d = &rgba[i * 4];
+            const bool hole = geo && !lit;
+            d[0] = hole ? 255 : p[0], d[1] = hole ? 0 : p[1], d[2] = hole ? 255 : p[2], d[3] = 255;
+        }
+    }
+    ++albedo_reports_;
+    if (png) {
+        char file[64];
+        std::snprintf(file, sizeof file, "/albedo_%05llu.png", static_cast<unsigned long long>(albedo_upscaled_));
+        if (std::FILE* f = std::fopen((albedo_dir_ + file).c_str(), "wb")) {
+            present_dump::write_png(f, VkExtent2D{a.width, a.height}, VK_FORMAT_R8G8B8A8_UNORM, false, rgba.data());
+            std::fclose(f);
+        }
+    }
+    std::fprintf(stderr,
+                 "[rt] d3d12-metal scene albedo: upscaled frame %llu (+%.1f s, %llu G-buffer passes): albedo non-zero "
+                 "%.1f%%, geometry %.1f%%, geometry with black albedo %.1f%% of the frame (%.1f%% of geometry)\n",
+                 static_cast<unsigned long long>(albedo_upscaled_),
+                 std::chrono::duration<double>(std::chrono::steady_clock::now() - created_).count(),
+                 static_cast<unsigned long long>(albedo_passes_), 100.0 * double(albedo) / double(n),
+                 100.0 * double(geometry) / double(n), 100.0 * double(black) / double(n),
+                 geometry ? 100.0 * double(black) / double(geometry) : 0.0);
+}
+
 void SceneProbe::finish_readbacks(bool all) {
     for (auto it = readbacks_.begin(); it != readbacks_.end();) {
         if (!all && frame_ < it->frame + 2) {
@@ -1572,6 +1665,10 @@ void SceneProbe::end_frame() {
     passes_.clear();
     ++frame_;
     finish_readbacks(false);
+    if (albedo_frame_ != ~std::uint64_t(0) && frame_ >= albedo_frame_ + 3) {
+        if (albedo_passes_) albedo_report();
+        albedo_frame_ = ~std::uint64_t(0);
+    }
     const std::uint64_t due = dump_first_ + dumps_done_ * dump_every_;
     logging_ = (!dump_dir_.empty() || log_only_) && dumps_done_ < dump_count_ && upscaled_frames_ + 1 >= due;
     latched_ = false;

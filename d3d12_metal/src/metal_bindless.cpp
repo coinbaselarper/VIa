@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <thread>
 
 namespace leonida {
@@ -192,18 +193,132 @@ void MetalBindless::remove_sampler(std::uint32_t index) {
     sampler_used_[index] = 0;
 }
 
+// GTA6RT_METAL_TABLE_CLUSTER_CAP_MB (default 0: off): once the table is that large, a key whose 8 probe slots are all
+// taken (no relocation possible) is refused instead of doubling the table, when the table is under 1/8 full. The
+// shaders' bare FNV-1a keeps keys that differ only in high bits on one home slot at any table size below 2^(that bit),
+// so such clusters, not load, grow it: 30,488 keys in 4,194,304 slots (160 MiB a generation) in ten-a.
+bool MetalBindless::cluster_refused(const DescriptorKey& key) {
+    static const std::uint64_t cap = [] {
+        const char* v = std::getenv("GTA6RT_METAL_TABLE_CLUSTER_CAP_MB");
+        return std::uint64_t(v && *v ? std::strtoull(v, nullptr, 10) : 0) << 20;
+    }();
+    if (!cap || table_.size_bytes() < cap) return false;
+    const std::size_t capacity = table_.capacity();
+    if ((table_.size() + 1) * 8 > capacity) return false;
+    const DescriptorHashKind kind = table_.hash_kind();
+    const std::uint32_t mask = table_.mask();
+    const std::uint32_t h = hash_descriptor_key(key, kind);
+    std::uint32_t w[10];
+    for (std::uint32_t k = 0; k < kDescriptorProbes; ++k) {
+        if (!table_.read_slot((h + k) & mask, w)) return false;
+        if (w[9] != kSlotOccupiedMarker || std::memcmp(w, key.data(), 32) == 0) return false;
+    }
+    for (std::uint32_t offset = kDescriptorProbes; offset < 2 * kDescriptorProbes - 1; ++offset) {
+        const std::uint32_t hole = (h + offset) & mask;
+        if (!table_.read_slot(hole, w)) return false;
+        if (w[9] == kSlotOccupiedMarker) continue;
+        for (std::uint32_t k = kDescriptorProbes; k > 0; --k) {
+            if (!table_.read_slot((h + k - 1) & mask, w)) return false;
+            if (((hole - hash_descriptor_key(w, kind)) & mask) < kDescriptorProbes) return false;
+        }
+        break;
+    }
+    const std::uint64_t n = ++cluster_refused_;
+    if (n <= 16 || !(n & (n - 1)))
+        std::fprintf(stderr, "[rt] d3d12-metal: descriptor hash table: key %08x %08x %08x %08x %08x %08x %08x %08x refused "
+                             "(its 8 probe slots from %u are taken; %zu keys in %zu slots; %llu refused): it reads the "
+                             "fallback\n",
+                     key[0], key[1], key[2], key[3], key[4], key[5], key[6], key[7], h & mask, table_.size(), capacity,
+                     static_cast<unsigned long long>(n));
+    return true;
+}
+
 bool MetalBindless::insert_key(const DescriptorKey& key, std::uint32_t index) {
     std::lock_guard lock(mutex_);
+    if (cluster_refused(key)) return false;
     const auto result = table_.insert_or_update(key.data(), index);
     table_dirty_ |= result != DescriptorTable::InsertResult::unchanged;
     return true;
 }
 
+namespace {
+// GTA6RT_METAL_TABLE_TOMBSTONES (default on, 0: off): an erased key's slot holds a tombstone until the GPU passed the
+// flush that emptied it, so no other key is written into it in place meanwhile (bindless::tombstone_key).
+bool tombstones_on() {
+    static const bool on = [] {
+        const char* v = std::getenv("GTA6RT_METAL_TABLE_TOMBSTONES");
+        return !v || std::strcmp(v, "0") != 0;
+    }();
+    return on;
+}
+}  // namespace
+
 bool MetalBindless::erase_key(const DescriptorKey& key) {
     std::lock_guard lock(mutex_);
+    std::uint32_t slot = UINT32_MAX;
+    if (tombstones_on()) {
+        const std::uint32_t mask = table_.mask();
+        const std::uint32_t h = hash_descriptor_key(key, table_.hash_kind());
+        std::uint32_t words[10];
+        for (std::uint32_t k = 0; k < kDescriptorProbes && slot == UINT32_MAX; ++k)
+            if (table_.read_slot((h + k) & mask, words) && words[9] == kSlotOccupiedMarker &&
+                std::memcmp(words, key.data(), 32) == 0)
+                slot = (h + k) & mask;
+    }
     if (!table_.erase(key)) return false;
     table_dirty_ = true;
+    if (slot != UINT32_MAX) {
+        const std::uint64_t serial = ++tombstone_serial_;
+        const DescriptorKey t = bindless::tombstone_key(slot, serial, table_.hash_kind());
+        table_.insert_or_update(t.data(), 0);
+        std::uint32_t words[10];
+        if (table_.read_slot(slot, words) && std::memcmp(words, t.data(), 32) == 0) {
+            tombstones_.emplace(serial, Tombstone{t, 0});
+            ++tombstones_made_;
+        } else {
+            table_.erase(t);
+            ++tombstones_refused_;
+        }
+    }
     return true;
+}
+
+void MetalBindless::release_tombstones(std::uint64_t first_unreleased, bool all) {
+    for (auto it = tombstones_.begin(); it != tombstones_.end();) {
+        if (!all && (!it->second.record || it->second.record >= first_unreleased)) {
+            ++it;
+            continue;
+        }
+        table_.erase(it->second.key);
+        ++tombstones_released_;
+        it = tombstones_.erase(it);
+    }
+}
+
+void MetalBindless::date_tombstones(std::uint64_t record) {
+    for (auto& [serial, t] : tombstones_)
+        if (!t.record) t.record = record;
+}
+
+// A retired generation the queues have passed is freed at once (the generation path reused or freed one only when it
+// next ran, so 2-3 retired 80 MiB generations stayed live between its runs). Every 100 ms at most.
+void MetalBindless::free_settled_generations(std::chrono::steady_clock::time_point now) {
+    if (now - last_free_scan_ < std::chrono::milliseconds(100)) return;
+    last_free_scan_ = now;
+    for (std::size_t i = 0; i < generations_.size();) {
+        Generation& g = generations_[i];
+        if (i == current_ || !generation_free(g, now)) {
+            ++i;
+            continue;
+        }
+        if (g.buffer) {
+            generation_bytes_ -= g.buffer->size();
+            metal_ledger::remove(metal_ledger::descriptor, g.buffer->size());
+        }
+        generations_.erase(generations_.begin() + std::ptrdiff_t(i));
+        ++generations_freed_;
+        if (current_ != SIZE_MAX && current_ > i) --current_;
+    }
 }
 
 bool MetalBindless::generation_free(Generation& g, std::chrono::steady_clock::time_point now) {
@@ -248,16 +363,34 @@ std::uint64_t MetalBindless::release_empty_records(std::chrono::steady_clock::ti
 void MetalBindless::report_in_place(std::chrono::steady_clock::time_point now) {
     if (now - last_report_ < std::chrono::seconds(10)) return;
     last_report_ = now;
+    // GTA6RT_METAL_TABLE_DUMP=path (diagnostics, off by default): every 10 s the table's keys and indices (9 words each,
+    // tombstones left out) to that file, for offline sizing.
+    static const char* dump = std::getenv("GTA6RT_METAL_TABLE_DUMP");
+    if (dump && *dump) {
+        const std::vector<std::uint32_t> keys = table_.export_keys();
+        const std::string tmp = std::string(dump) + ".tmp";
+        if (std::FILE* f = std::fopen(tmp.c_str(), "wb")) {
+            for (std::size_t i = 0; i + 9 <= keys.size(); i += 9)
+                if (!bindless::is_tombstone(&keys[i])) std::fwrite(&keys[i], 4, 9, f);
+            std::fclose(f);
+            std::rename(tmp.c_str(), dump);
+        }
+    }
     std::fprintf(stderr, "[rt] d3d12-metal: descriptor hash table: %llu flushes in place, %llu to a generation (%llu "
-                         "rekeyed, %llu refills too soon), %zu live generations, %zu slots emptied in flight\n",
+                         "rekeyed, %llu refills too soon), %zu live generations (%llu MiB), %zu slots emptied in flight; "
+                         "tombstones %zu live, %llu made, %llu released, %llu misplaced; %zu keys in %zu slots\n",
                  static_cast<unsigned long long>(in_place_flushes_),
                  static_cast<unsigned long long>(serial_),
                  static_cast<unsigned long long>(in_place_refused_rekey_),
-                 static_cast<unsigned long long>(in_place_refused_refill_), generations_.size(), refills_.size());
+                 static_cast<unsigned long long>(in_place_refused_refill_), generations_.size(),
+                 static_cast<unsigned long long>(generation_bytes_ >> 20), refills_.size(), tombstones_.size(),
+                 static_cast<unsigned long long>(tombstones_made_), static_cast<unsigned long long>(tombstones_released_),
+                 static_cast<unsigned long long>(tombstones_refused_), table_.size(), table_.capacity());
 }
 
 bool MetalBindless::flush() {
     std::unique_lock lock(mutex_);
+    free_settled_generations(std::chrono::steady_clock::now());
     if (!table_dirty_ && current_ != SIZE_MAX) return true;
     // GTA6RT_METAL_TABLE_IN_PLACE (default on, 0: off): while the table keeps its size, changed slots are written into
     // the generation the GPU reads when bindless::write_in_place finds every change safe for a racing reader; else
@@ -271,17 +404,28 @@ bool MetalBindless::flush() {
         auto* gpu_words = static_cast<std::uint32_t*>(g.buffer->cpu_pointer());
         if (gpu_words && g.written && g.epoch == table_epoch_ && g.synced == journal_seq_ &&
             g.buffer->size() >= table_.size_bytes()) {
+            const auto now = std::chrono::steady_clock::now();
+            const std::uint64_t first = release_empty_records(now);
+            release_tombstones(first, false);
             DescriptorTable::Changes changes = take_all_changes();
             if (!changes.all) {
-                const auto now = std::chrono::steady_clock::now();
-                const std::uint64_t first = release_empty_records(now);
                 const bindless::InPlaceResult r =
                     bindless::write_in_place(gpu_words, table_, changes.slots, refills_, next_record_, first);
                 if (r.written) {
-                    if (r.emptied) empty_records_.push_back({next_record_++, now, context_.submitted()});
+                    const bool undated = std::any_of(tombstones_.begin(), tombstones_.end(),
+                                                     [](const auto& t) { return !t.second.record; });
+                    if (r.emptied || undated) {
+                        date_tombstones(next_record_);
+                        empty_records_.push_back({next_record_++, now, context_.submitted()});
+                    }
                     journal_.insert(journal_.end(), changes.slots.begin(), changes.slots.end());
                     journal_seq_ += changes.slots.size();
                     g.synced = journal_seq_;
+                    // Only a generation that may be reused reads the journal; with the current one alone it is empty.
+                    if (generations_.size() == 1) {
+                        journal_.clear();
+                        journal_base_ = journal_seq_;
+                    }
                     slot_writes_ += changes.slots.size();
                     ++in_place_flushes_;
                     table_dirty_ = false;
@@ -346,6 +490,7 @@ bool MetalBindless::flush() {
     if (current_ != SIZE_MAX && pick != current_) {
         refills_.clear();
         empty_records_.clear();
+        release_tombstones(0, true);
         Generation& old = generations_[current_];
         old.retired = true;
         old.settled = false;
@@ -443,6 +588,8 @@ MetalBindless::Stats MetalBindless::stats() const {
     s.in_place_flushes = in_place_flushes_;
     s.in_place_refused_rekey = in_place_refused_rekey_;
     s.in_place_refused_refill = in_place_refused_refill_;
+    s.tombstones_live = tombstones_.size();
+    s.tombstones_made = tombstones_made_;
     return s;
 }
 

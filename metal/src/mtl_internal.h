@@ -90,13 +90,20 @@ private:
     std::array<std::atomic<std::uint64_t>, std::size_t(MemoryCategory::count)> bytes_{}, objects_{};
 };
 
+// Console VAs: handed out bump-first; a range given back (release) is reused only once the bump space is exhausted
+// and at least kReuseQuarantine after its release, so work recorded against the old owner has long completed.
 class VaSpace {
 public:
-    void init(std::uint64_t base, std::uint64_t size) { next_ = base; end_ = base + size; }
+    void init(std::uint64_t base, std::uint64_t size) { base_ = next_ = base; end_ = base + size; }
     std::uint64_t allocate(std::uint64_t size, std::uint64_t align);
+    void release(std::uint64_t va, std::uint64_t size);
     void add(std::uint64_t va, std::uint64_t size, MetalBuffer* buffer);
     void remove(std::uint64_t va, MetalBuffer* buffer);
     bool resolve(std::uint64_t va, MetalBuffer** buffer, std::uint64_t* offset) const;
+    struct Stats {
+        std::uint64_t bump_used = 0, bump_size = 0, free_bytes = 0, reused = 0, exhausted = 0;
+    };
+    Stats stats() const;
     template <class F> void visit(F&& f) const {
         std::lock_guard lock(mutex_);
         for (const auto& [va, e] : ranges_) f(e.buffer);
@@ -107,9 +114,14 @@ private:
         std::uint64_t size;
         MetalBuffer* buffer;
     };
+    struct Freed {
+        std::uint64_t size;
+        std::int64_t released_ms;
+    };
     mutable std::mutex mutex_;
     std::multimap<std::uint64_t, Entry> ranges_;
-    std::uint64_t next_ = 0, end_ = 0;
+    std::map<std::uint64_t, Freed> freed_;
+    std::uint64_t base_ = 0, next_ = 0, end_ = 0, freed_bytes_ = 0, reused_ = 0, exhausted_ = 0;
 };
 
 class MetalBuffer final : public gpu::Buffer {
@@ -119,6 +131,7 @@ public:
     ~MetalBuffer() override;
     bool resident() const { return resident_; }
     void make_resident();
+    void own_va() { owns_va_ = true; }
     MemoryCategory category() const { return category_; }
     std::uint64_t gpu_va() const override { return va_; }
     std::uint64_t host_gpu_address() const override { return buffer_.gpuAddress; }
@@ -133,6 +146,7 @@ private:
     id<MTLBuffer> buffer_;
     std::uint64_t va_, size_;
     bool placed_, tracked_;
+    bool owns_va_ = false;
     MemoryCategory category_;
     std::uint64_t accounted_ = 0;
     std::atomic<bool> resident_{true};
@@ -942,6 +956,8 @@ private:
     std::atomic<std::uint64_t> pressure_events_{0};
     dispatch_source_t pressure_source_ = nullptr;
     dispatch_queue_t pressure_queue_ = nullptr;
+    dispatch_source_t machine_guard_ = nullptr;
+    void start_machine_guard();
 };
 
 double now_seconds();

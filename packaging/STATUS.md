@@ -47,3 +47,31 @@ Entitlements (`entitlements.plist`): `cs.allow-jit`, `cs.allow-unsigned-executab
 ## Integration
 
 Standalone, nothing to add to `port/CMakeLists.txt`. Optional later: a custom target calling `packaging/make_app.sh --binary $<TARGET_FILE:gta6rt>`.
+
+## GTA6RT-Play.app: thin Metal launcher over the workspace (2026-11-27, round 12)
+
+```sh
+packaging/make_play_app.sh [--out build/packaging] [--workspace ..] [--version 0.2.0] [--min-macos 14.0]
+build/packaging/GTA6RT-Play.app/Contents/MacOS/GTA6RT [--vulkan|--metal] [--dry-run] [newgame] [gta6rt options]
+```
+
+- Bundle (32 KB): `Info.plist` (id `org.gta6rt.play`), `MacOS/GTA6RT` = `play_launcher.sh`, `Resources/workspace` (the
+  workspace path), `_CodeSignature` (ad hoc). No binary, game data, shader library or pipeline archive is copied.
+- Metal (default) = `./play.sh metal`: binary `port/build/metal-play-x86_64/bin/gta6rt` rebuilt by
+  `d3d12_metal/tools/build_play.sh` when the sources are newer (no prompt; `GTA6RT_APP_BUILD=0` skips, a failed build
+  keeps the old binary; `PLAY_METAL_BIN` overrides), the gta6rt slot wait, footprint cap 14,848 / 13,312 MiB with a
+  heavy job, `GTA6RT_METAL_CB_ABORT_MS=2000`, `GTA6RT_METAL_GPU_ERRORS` unset (stop at the first GPU error), the 4 Hz
+  guard (wired >= 9,728 MiB or a `[metal]` command-buffer failure / FAULTED line kills the run), start refused at
+  8,192 MiB wired, private save copy `port/run/play-saves`, archive `port/run/play-metal-archive`, `--hud min`,
+  `GTA6RT_AUDIO=on`, `PLAY_METAL_POOL=0`. Log `port/run/logs/app-metal.log`.
+- Vulkan: `--vulkan` or `GTA6RT_APP_GPU=vulkan` = `./play.sh` (binary `port/build/macos/gta6rt`, log `app.log`).
+- Workspace-relative: `GTA6RT_SOURCE_ROOT=<ws>/port` (shader store, overlay list, catalog, `build/pc7/arch-world`
+  tier) and explicit `--exe/--package/--run-dir` under the workspace; cwd is the workspace. Workspace =
+  `GTA6RT_WORKSPACE`, else `Resources/workspace`, else the bundle's location inside `port/build/packaging`.
+- Under Finder: PATH gets `/opt/homebrew/bin` (cmake/ninja for the build), a notification while building, a dialog
+  when a guard ends the run (`GTA6RT_APP_DIALOGS=0` turns it off). Inferred, not tested: macOS asks for Desktop-folder
+  access the first time (the workspace is under ~/Desktop).
+- Verified offline: `codesign --verify --deep --strict` ok; dry runs (`spike/r12-packaging/dryrun-*.txt`); with a fake
+  game the env and argv equal `play.sh metal`'s except the added `GTA6RT_SOURCE_ROOT` and `--exe/--package/--run-dir`
+  (same values as the compiled-in defaults); the GPU-error line and a faked wired reading end the run, the wired
+  pre-check refuses, no helper left (details: `spike/r12-packaging/STATUS.md`).

@@ -483,6 +483,16 @@ private:
     bool raw_ = false, stage_written_ = false, sentinel_ = false;
     Target stage_target_;
     Pass cur_;
+    // GTA6RT_METAL_SCENE_ALBEDO=<n>: every n-th upscaled frame the G-buffer's albedo and normal targets are copied at
+    // the end of each pass that wrote them (the last copy of the frame stays) and their coverage is logged.
+    void albedo_copy(gpu::CommandList& out, const Resolve& resolve);
+    void albedo_report();
+    std::uint64_t albedo_every_ = 0, albedo_frame_ = ~std::uint64_t(0), albedo_upscaled_ = 0, albedo_passes_ = 0;
+    std::uint64_t albedo_reports_ = 0;
+    std::string albedo_dir_;  // GTA6RT_METAL_SCENE_ALBEDO_PNG=<dir>: every 6th report as a PNG, black-albedo geometry magenta
+    std::unique_ptr<gpu::Buffer> albedo_buf_[2];
+    Target albedo_target_[2];
+    std::chrono::steady_clock::time_point created_ = std::chrono::steady_clock::now();
 };
 
 // Replays one closed IR list into `out` (ADAPTER.md section 4). Commands the backend cannot do yet are counted and

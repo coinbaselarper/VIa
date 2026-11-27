@@ -2423,7 +2423,7 @@ struct DeviceState {
         }();
         return on;
     }
-    std::uint64_t title_pool_chunk_bytes = 1ull << 20;  // GTA6RT_METAL_TITLE_POOL_CHUNK_MB
+    std::uint64_t title_pool_chunk_bytes = 64ull << 10;  // GTA6RT_METAL_TITLE_POOL_CHUNK_KB (1024: the old 1 MiB)
     static constexpr std::uint64_t kTitlePoolSpanBytes = 32ull << 20;  // the most a span buffer covers
     // GTA6RT_METAL_TITLE_POOL_NAMING=encoder: chunks named in every encoder (useResources) instead of the device
     // residency set; both wire a chunk whole until it goes, the set costs no CPU per encoder.
@@ -10099,6 +10099,28 @@ void note_tsharp_wanted(const void* title_address) {
 // these words, as write_image_descriptor does. Every field the layer does not encode (tiling, compression,
 // performance hints) only makes the key differ, so a title-built T# still finds its texture. Checked against the
 // texture first: a view of mips, layers or a dimension it lacks would be an invalid Vulkan view.
+// GTA6RT_METAL_TSHARP_2D_LAYERS=1: a title-built T# of a 1D or 2D (not array) type is decoded with word 4's array
+// fields (DEPTH, BASE_ARRAY) cleared. A sample through such a T# carries no slice, and the title keeps other data
+// there (measured: 2, 0x47521000, 0xc518dc00 on 2D BC7/BC1 T#s), which gfx10::decode reads as a layer range: "T# names
+// layers the texture lacks", or no T# at all when that range runs backwards. The words stay the lookup key.
+std::atomic<std::uint64_t> g_tsharp_2d_layers_cleared{0};
+bool decode_title_tsharp(const leonida::gfx10::ImageWords& words, leonida::gfx10::Image& image) {
+    static const bool on = [] {
+        const char* v = std::getenv("GTA6RT_METAL_TSHARP_2D_LAYERS");
+        return v && *v == '1';
+    }();
+    const std::uint32_t type = words[3] >> 28;
+    constexpr std::uint32_t kArrayFields = 0x1fffu | (0x1fffu << 16);
+    if (!on || (type != std::uint32_t(leonida::gfx10::ImageType::image_1d) &&
+                type != std::uint32_t(leonida::gfx10::ImageType::image_2d)) ||
+        !(words[4] & kArrayFields))
+        return leonida::gfx10::decode(words, image);
+    leonida::gfx10::ImageWords w = words;
+    w[4] &= ~kArrayFields;
+    g_tsharp_2d_layers_cleared.fetch_add(1, std::memory_order_relaxed);
+    return leonida::gfx10::decode(w, image);
+}
+
 TitleImage bind_title_image(DeviceState& device, const leonida::gfx10::ImageWords& words, const char** why) {
     namespace g = leonida::gfx10;
     const auto refuse = [why](const char* reason) {
@@ -10106,7 +10128,7 @@ TitleImage bind_title_image(DeviceState& device, const leonida::gfx10::ImageWord
         return TitleImage::refused;
     };
     g::Image image{};
-    if (!g::decode(words, image)) {
+    if (!decode_title_tsharp(words, image)) {
         if (why) *why = "not a valid T# (swizzle, levels or layers)";
         return TitleImage::not_tsharp;
     }
@@ -11039,6 +11061,68 @@ public:
         }
         if (leonida::metal_rt_alias::watching()) report_rt_alias(seconds);
         report_title_classes(seconds);
+        report_layer_sizes(seconds);
+    }
+
+    // Entry counts of the layer's registries (each read under its own lock when that lock is free, else "busy"), so a
+    // long run shows which one grows.
+    void report_layer_sizes(double seconds) {
+        std::string text;
+        const auto add = [&](const char* name, long long n) {
+            char t[96];
+            if (n < 0) std::snprintf(t, sizeof t, "%s%s busy", text.empty() ? "" : ", ", name);
+            else std::snprintf(t, sizeof t, "%s%s %lld", text.empty() ? "" : ", ", name, n);
+            text += t;
+        };
+        {
+            std::unique_lock lock(state_.descriptor_mutex, std::try_to_lock);
+            const bool ok = lock.owns_lock();
+            add("image entries", ok ? (long long)state_.image_entries.size() : -1);
+            add("image keys", ok ? (long long)state_.image_keys.size() : -1);
+            add("replaced images", ok ? (long long)state_.replaced_images.size() : -1);
+            add("samplers", ok ? (long long)state_.sampler_entries.size() : -1);
+            add("images by address", ok ? (long long)state_.images_by_address.size() : -1);
+            add("mip bases", ok ? (long long)state_.mip_bases.size() : -1);
+        }
+        {
+            std::unique_lock lock(state_.title_texture_mutex, std::try_to_lock);
+            const bool ok = lock.owns_lock();
+            add("title textures", ok ? (long long)state_.title_textures.size() : -1);
+            add("titles gone", ok ? (long long)state_.titles_gone.size() : -1);
+            add("retired titles", ok ? (long long)retired_title_textures_.size() : -1);
+        }
+        {
+            std::unique_lock lock(state_.title_image_mutex, std::try_to_lock);
+            add("title images", lock.owns_lock() ? (long long)state_.title_images.size() : -1);
+        }
+        {
+            std::unique_lock lock(state_.mapped_texture_mutex, std::try_to_lock);
+            add("mapped textures", lock.owns_lock() ? (long long)state_.mapped_textures.size() : -1);
+        }
+        {
+            std::unique_lock lock(state_.title_window_mutex, std::try_to_lock);
+            const bool ok = lock.owns_lock();
+            add("title windows", ok ? (long long)state_.title_windows.size() : -1);
+            add("pool chunks", ok ? (long long)state_.title_pool_chunks.size() : -1);
+            add("pool spans", ok ? (long long)state_.title_pool_spans.size() : -1);
+            add("pool aliases", ok ? (long long)state_.title_pool_aliases.size() : -1);
+            add("pool set aside", ok ? (long long)state_.title_pool_set_aside.size() : -1);
+        }
+        {
+            std::unique_lock lock(state_.external_mutex, std::try_to_lock);
+            add("external set aside", lock.owns_lock() ? (long long)state_.external_set_aside.size() : -1);
+        }
+        {
+            std::unique_lock lock(state_.layer_vsharp_mutex, std::try_to_lock);
+            add("layer V#s", lock.owns_lock() ? (long long)state_.layer_vsharps.size() : -1);
+        }
+        {
+            std::unique_lock lock(state_.backing_mutex, std::try_to_lock);
+            add("released log", lock.owns_lock() ? (long long)state_.released_log.size() : -1);
+        }
+        const auto bs = state_.bindless ? state_.bindless->stats() : leonida::MetalBindless::Stats{};
+        add("hash-table tombstones", (long long)bs.tombstones_live);
+        std::fprintf(stderr, "[rt] gpu-memory sizes t=%.0fs: %s\n", seconds, text.c_str());
     }
 
     void report_rt_alias(double seconds) {
@@ -11617,7 +11701,10 @@ public:
         // registry, and skips an entry without a resource.
         const auto entries = leonida::title_texture_snapshot(state_.title_textures);
         if (fill_tsharp_textures()) take_tsharp_wanted();
-        if (tsharp_textures_on()) make_orphan_textures();
+        if (tsharp_textures_on()) {
+            if (tsharp_worker_on()) kick_tsharp_builder();
+            else make_orphan_textures();
+        }
         dump_tsharp_samples();
         title_pass_ = true;
         std::uint64_t checked = 0, filled = 0, fill_pass_ns = 0;
@@ -11625,6 +11712,7 @@ public:
         const auto visit = [&](TitleTexture& t) {
             if (t.bink && !bink_visit) return;
             if (t.over_budget) return;
+            if (t.base_floor_made && t.unbound_bytes && tsharp_worker_on()) return;  // the T# texture worker's
             if (t.resource && t.resource->in_place()) return;
             // A slot-133 texture's guessed layout (no slot-70 view yet) is only used once the title maps it.
             if (t.gpu_written || !t.layout_known || !t.resource ||
@@ -11710,6 +11798,15 @@ public:
                     return !v || std::strcmp(v, "0");
                 }();
                 if (gone_retire && remapped && t.owned && t.fills && t.resource) gone_candidates_.push_back(entry.first);
+                if (remapped && t.resource && t.resource->in_place()) {
+                    // A texture over the title's pages (make_in_place) pins the pages it was made over: a remap of its
+                    // range leaves the GPU reading the old ones.
+                    if (++in_place_remapped_ <= 16)
+                        std::fprintf(stderr, "[rt] d3d12-metal: the title memory map changed over in-place texture 0x%llx "
+                                             "(CPU 0x%llx, %llu bytes, DXGI %d)\n",
+                                     static_cast<unsigned long long>(entry.first), static_cast<unsigned long long>(t.cpu),
+                                     static_cast<unsigned long long>(t.layout.layout.size), int(t.resource->desc().Format));
+                }
                 if (map_all || remapped) t.memory.retry();
                 // A texture holding its resident levels only is looked at again when its pages change: the title may
                 // have mapped more of them.
@@ -12205,6 +12302,99 @@ private:
         return true;
     }
 
+    // GTA6RT_METAL_TSHARP_WORKER=1: textures for title-built T#s are made (make_orphan_textures) and given their first
+    // fill on a worker of ours instead of in the submitting thread's refresh pass (1.5 ms a pass there), in slices of
+    // GTA6RT_METAL_TSHARP_SLICE_US (4000) with the registry lock released between them. Their Metal textures are shared,
+    // so a fill is a CPU write of the worker's (no queue work).
+    static bool tsharp_worker_on() {
+        static const bool on = [] {
+            const char* v = std::getenv("GTA6RT_METAL_TSHARP_WORKER");
+            return v && *v == '1';
+        }();
+        return on;
+    }
+    struct TsharpBuilder {
+        std::mutex mutex;
+        std::condition_variable wake;
+        bool kick = false, stop = false;
+        std::thread thread;
+        std::uint64_t slices = 0, busy_us = 0, made = 0, filled = 0;
+        ~TsharpBuilder() {
+            {
+                std::lock_guard lock(mutex);
+                stop = true;
+            }
+            wake.notify_one();
+            if (thread.joinable()) thread.join();
+        }
+    };
+    std::unique_ptr<TsharpBuilder> tsharp_builder_;
+    std::once_flag tsharp_builder_once_;
+    std::vector<std::uint64_t> tsharp_fill_queue_;  // under title_texture_mutex: T#-made textures a T# named
+    void kick_tsharp_builder() {
+        std::call_once(tsharp_builder_once_, [this] {
+            tsharp_builder_ = std::make_unique<TsharpBuilder>();
+            TsharpBuilder* b = tsharp_builder_.get();
+            b->thread = std::thread([this, b] { run_tsharp_builder(*b); });
+        });
+        {
+            std::lock_guard lock(tsharp_builder_->mutex);
+            tsharp_builder_->kick = true;
+        }
+        tsharp_builder_->wake.notify_one();
+    }
+    void run_tsharp_builder(TsharpBuilder& b) {
+        using clock = std::chrono::steady_clock;
+        static const auto slice = std::chrono::microseconds([] {
+            const char* v = std::getenv("GTA6RT_METAL_TSHARP_SLICE_US");
+            return v && *v ? std::max(100ll, std::strtoll(v, nullptr, 10)) : 4000ll;
+        }());
+        auto since = clock::now();
+        for (;;) {
+            {
+                std::unique_lock lock(b.mutex);
+                b.wake.wait_for(lock, std::chrono::milliseconds(50), [&] { return b.stop || b.kick; });
+                if (b.stop) return;
+                b.kick = false;
+            }
+            for (bool more = true; more;) {
+                const auto start = clock::now();
+                {
+                    std::lock_guard lock(state_.title_texture_mutex);
+                    const InTitleTextures inside;
+                    const std::uint64_t made = orphan_made_;
+                    more = make_orphan_textures(slice);
+                    b.made += orphan_made_ - made;
+                    std::size_t done = 0;
+                    const auto fills = clock::now();
+                    for (; done < tsharp_fill_queue_.size() && clock::now() - fills < slice; ++done) {
+                        const auto it = state_.title_textures.find(tsharp_fill_queue_[done]);
+                        if (it == state_.title_textures.end() || !it->second->resource) continue;
+                        TitleTexture& t = *it->second;
+                        if (!t.stale || t.gpu_written || !t.layout_known) continue;
+                        b.filled += fill_title_texture(t, false) != 0;
+                    }
+                    tsharp_fill_queue_.erase(tsharp_fill_queue_.begin(), tsharp_fill_queue_.begin() + std::ptrdiff_t(done));
+                    more |= !tsharp_fill_queue_.empty();
+                }
+                state_.drain_titles_gone();
+                const auto end = clock::now();
+                ++b.slices;
+                b.busy_us += std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+                if (end - since >= std::chrono::seconds(10)) {
+                    std::fprintf(stderr, "[rt] d3d12-metal: T# texture worker: %llu made, %llu filled in %llu slices, "
+                                         "%.0f ms busy in %.0f s\n",
+                                 static_cast<unsigned long long>(b.made), static_cast<unsigned long long>(b.filled),
+                                 static_cast<unsigned long long>(b.slices), double(b.busy_us) / 1000.0,
+                                 std::chrono::duration<double>(end - since).count());
+                    b.made = b.filled = b.slices = b.busy_us = 0;
+                    since = end;
+                }
+                if (more) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        }
+    }
+
     // LEONIDA_GEOMETRY_ASYNC: one worker runs GeometryViews::refresh whenever a submission asks and none is running.
     struct GeometryRefresher {
         std::mutex mutex;
@@ -12252,6 +12442,7 @@ private:
     std::vector<std::pair<std::vector<std::pair<leonida::gpu::Fence*, std::uint64_t>>, Resource*>>
         retired_title_textures_;  // likewise
     std::vector<std::uint64_t> gone_candidates_;                   // likewise
+    std::uint64_t in_place_remapped_ = 0;                          // likewise
     std::uint64_t gone_retired_ = 0, gone_retired_bytes_ = 0;      // likewise
     std::vector<std::uint8_t> title_tiled_, title_linear_;         // scratch, under title_texture_mutex
     std::vector<std::uint64_t> title_columns_;
@@ -13049,8 +13240,9 @@ private:
     }
 
     // A texture made from a title-written T# over its title memory (GTA6RT_METAL_TSHARP_TEXTURES), at most
-    // GTA6RT_METAL_TSHARP_TEXTURES_MB (512 by default) of title bytes. Caller holds title_texture_mutex.
-    void make_orphan_textures() {
+    // GTA6RT_METAL_TSHARP_TEXTURES_MB (512 by default) of title bytes, for at most `slice` (0: the pass budget,
+    // GTA6RT_METAL_TSHARP_TEXTURES_US). True when T#s are left for the next call. Caller holds title_texture_mutex.
+    bool make_orphan_textures(std::chrono::microseconds slice = std::chrono::microseconds(0)) {
         static const std::uint64_t budget = [] {
             const char* v = std::getenv("GTA6RT_METAL_TSHARP_TEXTURES_MB");
             return (v && *v ? std::strtoull(v, nullptr, 10) : 512ull) << 20;
@@ -13063,25 +13255,28 @@ private:
         }
         namespace g = leonida::gfx10;
         namespace xg = rt::xg_xs;
-        // At most GTA6RT_METAL_TSHARP_TEXTURES_US (1500) of a pass: the rest waits for the next pass (this runs on a
-        // submitting thread).
         static const auto pass_budget = std::chrono::microseconds([] {
             const char* v = std::getenv("GTA6RT_METAL_TSHARP_TEXTURES_US");
             return v && *v ? std::strtoll(v, nullptr, 10) : 1500ll;
         }());
+        const auto limit = slice.count() ? slice : pass_budget;
+        static const bool inside_ok = [] {
+            const char* v = std::getenv("GTA6RT_METAL_TSHARP_INSIDE");
+            return v && *v == '1';
+        }();
         const auto start = std::chrono::steady_clock::now();
         for (std::size_t i = 0; i < orphans.size(); ++i) {
-            if ((i & 15) == 15 && std::chrono::steady_clock::now() - start > pass_budget) {
+            if ((i & 15) == 15 && std::chrono::steady_clock::now() - start > limit) {
                 TsharpNotes& n = tsharp_notes();
                 std::lock_guard lock(n.mutex);
                 n.orphans.insert(n.orphans.begin(), orphans.begin() + std::ptrdiff_t(i), orphans.end());
                 ++orphan_passes_cut_;
-                break;
+                return true;
             }
             const auto& words = orphans[i];
             const auto skip = [&](const char* why) { ++orphan_skipped_[why]; };
             g::Image image{};
-            if (!g::decode(words, image)) { skip("not a T#"); continue; }
+            if (!decode_title_tsharp(words, image)) { skip("not a T#"); continue; }
             if (g::multisampled(image.type)) { skip("multisampled"); continue; }
             const DXGI_FORMAT format = dxgi_of_gfx10(image.format);
             if (format == DXGI_FORMAT_UNKNOWN) { skip("format"); continue; }
@@ -13105,68 +13300,62 @@ private:
                                                                                                     : chain);
             d.format = std::uint32_t(format);
             d.samples = 1;
-            // The swizzle mode: the T#'s when it names one the model has. Title-built T#s copy the layer's own words
-            // (mode 0 there whatever the layout, measured against the registered textures they name), and the title's
-            // texture assets are SW_4KB_S but for a few SW_64KB_D (leonida docs/textures.md); a dump of 400 such T#s
-            // scored by decoded block coherence picked 4KB_S for ~85%, linear for ~3%.
             if (auto it = state_.title_textures.find(image.address); it != state_.title_textures.end()) {
                 // Checked before the layout is scored: a T# queued again while its texture was being made.
                 const TitleTexture& old = *it->second;
                 xg::ResourceDesc od{};
                 std::memcpy(&od, old.desc.data(), sizeof(od));
-                if (!old.owned || !old.base_floor_made ||
-                    (old.resource && od.dimension == d.dimension && od.width == d.width && od.height == d.height &&
-                     od.depth_or_array == d.depth_or_array && od.mips == d.mips && od.format == d.format)) {
-                    skip("a texture is registered there now");
+                const bool same = old.resource && od.dimension == d.dimension && od.width == d.width &&
+                                  od.height == d.height && od.depth_or_array == d.depth_or_array && od.mips == d.mips &&
+                                  od.format == d.format;
+                if (!old.owned) {
+                    note_registered_there(image, words, old);
+                    continue;
+                }
+                if (!old.base_floor_made) { skip("a texture is registered there now (one made for slot-70 views)"); continue; }
+                if (same) {
+                    skip(state_.image_owner(image.address) == static_cast<const void*>(old.resource)
+                             ? "a texture is registered there now (made for a T# of this shape; its image is there)"
+                             : "a texture is registered there now (made for a T# of this shape; no image at its address)");
                     continue;
                 }
             }
+            // The swizzle mode: the T#'s when it names one the model has. Title-built T#s copy the layer's own words
+            // (mode 0 there whatever the layout, measured against the registered textures they name), and the title's
+            // texture assets are SW_4KB_S but for a few SW_64KB_D (leonida docs/textures.md); a dump of 400 such T#s
+            // scored by decoded block coherence picked 4KB_S for ~85%, linear for ~3%. The checks that need only the
+            // bytes the T# names run first with SW_4KB_S's span, before the bytes are scored.
             const std::uint32_t sw = (words[3] >> 20) & 0x1f;
             const bool named = sw == xg::k4kbS || sw == xg::k64kbS || sw == xg::k64kbD;
             const bool block = xg::format_info(std::uint32_t(format)).side == 4 && !volume && !line &&
                                image.first_layer + image.layer_count == 1;
-            d.layout = xg::kSwizzled | (named ? sw : block ? pick_tsharp_layout(d, image.first_mip, image.address)
-                                                           : xg::k4kbS);
             xg::Texture layout;
+            std::uint64_t span = 0;
+            std::uint32_t base_floor = 0;
             const char* why = nullptr;
-            if (!title_layout(d, layout, why)) { skip(why ? why : "layout"); continue; }
-            const std::uint32_t floor = image.first_mip < layout.layout.mips ? image.first_mip : 0;
-            const auto& floor_mip = layout.layout.plane[0].mips[floor];
-            // The bytes the title has: levels BASE_LEVEL and up, smallest first (a 2D texture of one layer); a
-            // texture of more layers or 3D needs its whole layout.
-            const bool partial = layout.array == 1 && layout.layout.dimension != xg::kTexture3D;
-            const std::uint64_t span = partial ? floor_mip.offset + floor_mip.size : layout.layout.size;
-            const std::uint32_t base_floor = partial ? floor : 0;
-            std::array<std::uint32_t, 14> desc{};
-            std::memcpy(desc.data(), &d, sizeof(d));
-            desc[2] = desc[3] = 0;
-            if (auto it = state_.title_textures.find(image.address); it != state_.title_textures.end()) {
-                // The title packs its streamed textures into pools it reuses: a texture made for an earlier T# at this
-                // address with another shape goes.
-                TitleTexture& old = *it->second;
-                if (!old.owned || !old.base_floor_made || (old.resource && old.desc == desc)) {
-                    skip("a texture is registered there now");
-                    continue;
-                }
-                ++orphan_replaced_;
-                orphan_bytes_ -= std::min(orphan_bytes_, old.span);
-                retire_title_texture(old);
-                state_.title_textures.erase(it);
-            }
-            if (orphan_bytes_ + span > budget) { skip("over the budget"); continue; }
-            if (!pool_covers(image.address, span)) { skip("title pool does not back all of it"); continue; }
+            const auto shape = [&](std::uint32_t mode) {
+                d.layout = xg::kSwizzled | mode;
+                if (!title_layout(d, layout, why)) return false;
+                const std::uint32_t floor = image.first_mip < layout.layout.mips ? image.first_mip : 0;
+                const auto& floor_mip = layout.layout.plane[0].mips[floor];
+                // The bytes the title has: levels BASE_LEVEL and up, smallest first (a 2D texture of one layer); a
+                // texture of more layers or 3D needs its whole layout.
+                const bool partial = layout.array == 1 && layout.layout.dimension != xg::kTexture3D;
+                span = partial ? floor_mip.offset + floor_mip.size : layout.layout.size;
+                base_floor = partial ? floor : 0;
+                return true;
+            };
+            // Textures made for earlier T#s over these bytes go (the title reuses its pool); any other registered
+            // texture there keeps them. GTA6RT_METAL_TSHARP_INSIDE=1: a registered title-filled texture that starts
+            // below the T#'s address does not keep its bytes from it; the title's own T# there says its used levels
+            // end before it (the title packs streamed textures behind the resident levels of another).
+            std::vector<std::uint64_t> older;
             bool inside = false;
-            {
-                // Textures made for earlier T#s over these bytes go (the title reuses its pool); any other registered
-                // texture there keeps them.
-                // GTA6RT_METAL_TSHARP_INSIDE=1: a registered title-filled texture that starts below the T#'s address
-                // does not keep its bytes from it; the title's own T# there says its used levels end before it (the
-                // title packs streamed textures behind the resident levels of another).
-                static const bool inside_ok = [] {
-                    const char* v = std::getenv("GTA6RT_METAL_TSHARP_INSIDE");
-                    return v && *v == '1';
-                }();
-                std::vector<std::uint64_t> older;
+            const auto blocked = [&]() -> const char* {
+                if (orphan_bytes_ + span > budget) return "over the budget";
+                if (!pool_covers(image.address, span)) return "title pool does not back all of it";
+                older.clear();
+                inside = false;
                 bool overlaps = false;
                 for (auto it = state_.title_textures.lower_bound(image.address + span);
                      it != state_.title_textures.begin();) {
@@ -13176,18 +13365,58 @@ private:
                         if (it->first + max_title_span_ <= image.address) break;
                         continue;
                     }
-                    if (e.owned && e.base_floor_made) older.push_back(it->first);
-                    else if (inside_ok && it->first < image.address && !e.gpu_written && e.resource) inside = true;
-                    else overlaps = true;
+                    if (e.owned && e.base_floor_made) {
+                        older.push_back(it->first);
+                    } else if (it->first < image.address && !e.gpu_written && e.resource) {
+                        note_inside_registered(image, it->first, e);
+                        if (inside_ok) inside = true;
+                        else overlaps = true;
+                    } else {
+                        overlaps = true;
+                    }
                 }
-                if (overlaps) { skip("overlaps a registered texture"); continue; }
-                for (const std::uint64_t a : older) {
-                    auto it = state_.title_textures.find(a);
-                    ++orphan_replaced_;
-                    orphan_bytes_ -= std::min(orphan_bytes_, it->second->span);
-                    retire_title_texture(*it->second);
-                    state_.title_textures.erase(it);
+                return overlaps ? "overlaps a registered texture" : nullptr;
+            };
+            const std::uint32_t first_mode = named ? sw : xg::k4kbS;
+            if (!shape(first_mode)) { skip(why ? why : "layout"); continue; }
+            if (const char* no = blocked()) { skip(no); continue; }
+            if (!named && block) {
+                const std::uint32_t mode = pick_tsharp_layout(d, image.first_mip, image.address);
+                if (mode != first_mode) {
+                    if (!shape(mode)) { skip(why ? why : "layout"); continue; }
+                    if (const char* no = blocked()) { skip(no); continue; }
                 }
+            }
+            std::array<std::uint32_t, 14> desc{};
+            std::memcpy(desc.data(), &d, sizeof(d));
+            desc[2] = desc[3] = 0;
+            if (auto it = state_.title_textures.find(image.address); it != state_.title_textures.end()) {
+                // The title packs its streamed textures into pools it reuses: a texture made for an earlier T# at this
+                // address with another shape goes.
+                TitleTexture& old = *it->second;
+                if (!old.owned || !old.base_floor_made || (old.resource && old.desc == desc)) {
+                    skip("a texture is registered there now (made for a T# of this shape and layout)");
+                    continue;
+                }
+                ++orphan_replaced_;
+                orphan_bytes_ -= std::min(orphan_bytes_, old.span);
+                retire_title_texture(old);
+                state_.title_textures.erase(it);
+            }
+            for (const std::uint64_t a : older) {
+                auto it = state_.title_textures.find(a);
+                if (it == state_.title_textures.end()) continue;
+                ++orphan_replaced_;
+                orphan_bytes_ -= std::min(orphan_bytes_, it->second->span);
+                retire_title_texture(*it->second);
+                state_.title_textures.erase(it);
+            }
+            if (base_floor_bytes_zero(layout, base_floor, image.address)) {
+                // Not streamed in yet: made from these bytes it would be sampled as zeros (a zero BC5 normal map
+                // decodes to a non-unit normal, and one non-finite texel turns the title's exposure black). The T#
+                // comes back once its slot is retried after the next census clears the queue's memory.
+                skip("its largest level is all zero bytes (not streamed in yet)");
+                continue;
             }
             D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
             srv.Format = format;
@@ -13196,6 +13425,7 @@ private:
             TitleTexture* t = make_title_texture(d, desc, srv, image.address, {}, base_floor, span);
             if (!t) { skip("not made (see the slot-70 refusals)"); continue; }
             t->base_floor_made = true;
+            if (tsharp_worker_on()) tsharp_fill_queue_.push_back(image.address);
             orphan_inside_ += inside;
             ++orphan_by_mode_[d.layout & 0x1f];
             orphan_bytes_ += span;
@@ -13207,7 +13437,93 @@ private:
                              unsigned(d.depth_or_array), unsigned(d.mips), int(format), (words[3] >> 20) & 0x1f,
                              static_cast<unsigned long long>(span));
         }
+        return false;
     }
+
+    // GTA6RT_METAL_TSHARP_ZERO_CHECK=1: the first 64 KiB of the largest level a T# names, read from the title's memory,
+    // are all zero.
+    bool base_floor_bytes_zero(const rt::xg_xs::Texture& layout, std::uint32_t level, std::uint64_t address) {
+        static const bool on = [] {
+            const char* v = std::getenv("GTA6RT_METAL_TSHARP_ZERO_CHECK");
+            return v && *v == '1';
+        }();
+        if (!on || level >= layout.layout.mips) return false;
+        const auto& mip = layout.layout.plane[0].mips[level];
+        const std::uint64_t cpu = leonida::title_gpu_views::to_cpu(address) + mip.offset;
+        const std::uint64_t bytes = std::min<std::uint64_t>(mip.size, 64u << 10);
+        if (!bytes || readable_prefix(cpu, bytes) < bytes) return false;
+        zero_probe_.resize(std::size_t(bytes));
+        if (!copy_guarded(zero_probe_.data(), reinterpret_cast<const std::uint8_t*>(cpu), std::size_t(bytes),
+                          title_memory_write_combined(cpu)))
+            return false;
+        return std::all_of(zero_probe_.begin(), zero_probe_.end(), [](std::uint8_t b) { return b == 0; });
+    }
+    std::vector<std::uint8_t> zero_probe_;  // under title_texture_mutex
+
+    // A T# naming a registered slot-133 texture's own address found no image there (bind_title_image): why, by what
+    // the registry and the image table hold now (a census key), with the first examples logged.
+    void note_registered_there(const leonida::gfx10::Image& image, const leonida::gfx10::ImageWords& words,
+                               const TitleTexture& e) {
+        const void* owner = state_.image_owner(image.address);
+        const Resource* r = e.resource;
+        const char* why = !r                                   ? "a slot-133 texture is registered there now (gone)"
+                          : !owner                             ? "a slot-133 texture is registered there now (no image at its address)"
+                          : owner != static_cast<const void*>(r) ? "a slot-133 texture is registered there now (another image at its address)"
+                          : TitleGpuPlacements<Resource>::matches(image, r->desc())
+                              ? "a slot-133 texture is registered there now (its image matches: bound at the next retry)"
+                              : "a slot-133 texture is registered there now (its image is of another shape)";
+        ++orphan_skipped_[why];
+        if (registered_there_logged_ >= 12) return;
+        ++registered_there_logged_;
+        const D3D12_RESOURCE_DESC* rd = r ? &r->desc() : nullptr;
+        std::fprintf(stderr,
+                     "[rt] texture census: T# %08x %08x %08x %08x at 0x%llx (format %u %ux%u mips %u-%u of %u) found no "
+                     "image: %s; registered DXGI %d %llux%u mips %u, image 0x%llx, layout %s, resident level %u\n",
+                     words[0], words[1], words[2], words[3], static_cast<unsigned long long>(image.address), image.format,
+                     image.width, image.height, image.first_mip, image.first_mip + image.mip_count - 1,
+                     image.resource_mips, why, rd ? int(rd->Format) : -1,
+                     static_cast<unsigned long long>(rd ? rd->Width : 0), rd ? rd->Height : 0u,
+                     rd ? unsigned(rd->MipLevels) : 0u, static_cast<unsigned long long>(r ? r->image_address() : 0),
+                     !e.layout_known ? "none" : e.layout_from_xg ? "xg" : e.layout_guessed ? "guess" : "view",
+                     e.resident_mip);
+    }
+    int registered_there_logged_ = 0;
+
+    // A T# inside a registered slot-133 texture's range: one of its levels (same format, the level's offset in its
+    // layout, that level's extent or its own with BASE_LEVEL there) or another texture packed behind its used levels.
+    void note_inside_registered(const leonida::gfx10::Image& image, std::uint64_t at, const TitleTexture& e) {
+        std::uint32_t level = ~0u;
+        if (e.layout_known && e.resource) {
+            const D3D12_RESOURCE_DESC& rd = e.resource->desc();
+            const DXGI_FORMAT f = dxgi_of_gfx10(image.format);
+            const bool format = f == rd.Format || e.resource->lists_castable_format(f) ||
+                                (rt::xg_xs::format_info(std::uint32_t(f)).bytes ==
+                                     rt::xg_xs::format_info(std::uint32_t(rd.Format)).bytes &&
+                                 rt::xg_xs::format_info(std::uint32_t(f)).side ==
+                                     rt::xg_xs::format_info(std::uint32_t(rd.Format)).side);
+            for (std::uint32_t l = 0; format && l < e.layout.layout.mips; ++l) {
+                if (at + e.layout.layout.plane[0].mips[l].offset != image.address) continue;
+                const std::uint32_t w = std::max<std::uint32_t>(1, std::uint32_t(rd.Width >> l));
+                const std::uint32_t h = std::max<std::uint32_t>(1, rd.Height >> l);
+                if ((image.width == w && image.height == h) ||
+                    (image.width == rd.Width && image.height == rd.Height && image.first_mip == l))
+                    level = l;
+            }
+        }
+        ++inside_kinds_[level != ~0u ? 0 : e.resident_mip || (e.resource && e.resource->tsharp_base() != ~0u) ? 1 : 2];
+        if (level != ~0u && inside_level_logged_ < 8) {
+            ++inside_level_logged_;
+            std::fprintf(stderr,
+                         "[rt] texture census: T# at 0x%llx (format %u %ux%u mips %u-%u) is level %u of registered 0x%llx\n",
+                         static_cast<unsigned long long>(image.address), image.format, image.width, image.height,
+                         image.first_mip, image.first_mip + image.mip_count - 1, level,
+                         static_cast<unsigned long long>(at));
+        }
+    }
+    // T#s inside a registered texture's range: a level of it; another texture behind its used levels (it holds part of
+    // its levels or a T# named a base level); another texture where its layout says its own levels lie.
+    std::array<std::uint64_t, 3> inside_kinds_{};
+    int inside_level_logged_ = 0;
 
     // The deferred textures title T#s named since the last pass are marked stale, so the pass fills them (visit).
     void take_tsharp_wanted() {
@@ -13228,6 +13544,12 @@ private:
             } else {
                 TitleTexture& t = *it->second;
                 const std::uint64_t full = t.resource->unbound_bytes();
+                if (tsharp_worker_on() && t.base_floor_made && full && !t.gpu_written && t.layout_known) {
+                    t.stale = true;  // its first fill is the T# texture worker's (visit leaves it)
+                    tsharp_fill_queue_.push_back(it->first);
+                    ++tsharp_fill_queued_;
+                    continue;
+                }
                 const std::uint64_t bytes = full && t.resident_mip ? t.resource->levels_bytes(t.resident_mip) : full;
                 if (!full && t.resource->mip_base() && t.resource->tsharp_base() < t.resource->mip_base()) {
                     t.memory.retry();
@@ -13541,9 +13863,16 @@ private:
             for (const auto& [why, n] : orphan_skipped_)
                 skipped += (skipped.empty() ? "" : ", ") + why + " " + std::to_string(n);
             std::fprintf(stderr, "[rt] texture census: textures made for title T#s %llu (%.0f MiB of title memory; %llu "
-                                 "inside a registered texture's range); not made: %s\n",
+                                 "inside a registered texture's range); not made: %s; T#s met inside a registered "
+                                 "texture's range: a level of it %llu, another texture behind its used levels %llu, "
+                                 "another texture where its own levels lie %llu; 1D/2D T#s decoded with word 4's array "
+                                 "fields cleared %llu\n",
                          static_cast<unsigned long long>(orphan_made_), double(orphan_bytes_) / 1048576.0,
-                         static_cast<unsigned long long>(orphan_inside_), skipped.c_str());
+                         static_cast<unsigned long long>(orphan_inside_), skipped.c_str(),
+                         static_cast<unsigned long long>(inside_kinds_[0]),
+                         static_cast<unsigned long long>(inside_kinds_[1]),
+                         static_cast<unsigned long long>(inside_kinds_[2]),
+                         static_cast<unsigned long long>(g_tsharp_2d_layers_cleared.load(std::memory_order_relaxed)));
         }
         std::fprintf(stderr,
                      "[rt] texture census: readable through the title pool %llu, with an unmapped last page %llu, streamed "

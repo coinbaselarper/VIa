@@ -1,16 +1,75 @@
 #include "mtl_internal.h"
 
+#include <chrono>
+#include <cstdio>
 #include <cstring>
 
 namespace gta6rt::metal {
 
+namespace {
+constexpr std::int64_t kReuseQuarantineMs = 10000;
+std::int64_t steady_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+}  // namespace
+
 std::uint64_t VaSpace::allocate(std::uint64_t size, std::uint64_t align) {
     std::lock_guard lock(mutex_);
     if (!align) align = 1;
+    if (!size) size = 1;
     std::uint64_t va = (next_ + align - 1) & ~(align - 1);
-    if (va + size > end_ || va + size < va) return 0;
-    next_ = va + size;
-    return va;
+    if (va + size <= end_ && va + size >= va) {
+        next_ = va + size;
+        return va;
+    }
+    const std::int64_t now = steady_ms();
+    for (auto it = freed_.begin(); it != freed_.end(); ++it) {
+        if (now - it->second.released_ms < kReuseQuarantineMs) continue;
+        const std::uint64_t lo = it->first, hi = it->first + it->second.size;
+        const std::uint64_t at = (lo + align - 1) & ~(align - 1);
+        if (at < lo || at + size > hi) continue;
+        const Freed f = it->second;
+        freed_.erase(it);
+        if (at > lo) freed_.emplace(lo, Freed{at - lo, f.released_ms});
+        if (at + size < hi) freed_.emplace(at + size, Freed{hi - at - size, f.released_ms});
+        freed_bytes_ -= size;
+        ++reused_;
+        return at;
+    }
+    if (exhausted_++ < 8 || !(exhausted_ & (exhausted_ - 1)))
+        std::fprintf(stderr, "[metal] console VA space exhausted: no %llu bytes (bump %llu of %llu MiB used, %llu MiB "
+                             "released, %llu reused ranges; %llu refusals): the buffer gets no console VA\n",
+                     (unsigned long long)size, (unsigned long long)((next_ - base_) >> 20),
+                     (unsigned long long)((end_ - base_) >> 20), (unsigned long long)(freed_bytes_ >> 20),
+                     (unsigned long long)reused_, (unsigned long long)exhausted_);
+    return 0;
+}
+
+void VaSpace::release(std::uint64_t va, std::uint64_t size) {
+    if (!va || !size) return;
+    std::lock_guard lock(mutex_);
+    const std::int64_t now = steady_ms();
+    std::uint64_t lo = va, hi = va + size;
+    auto it = freed_.lower_bound(lo);
+    if (it != freed_.begin()) {
+        auto prev = std::prev(it);
+        if (prev->first + prev->second.size == lo) {
+            lo = prev->first;
+            freed_.erase(prev);
+        }
+    }
+    it = freed_.lower_bound(hi);
+    if (it != freed_.end() && it->first == hi) {
+        hi += it->second.size;
+        freed_.erase(it);
+    }
+    freed_[lo] = Freed{hi - lo, now};
+    freed_bytes_ += size;
+}
+
+VaSpace::Stats VaSpace::stats() const {
+    std::lock_guard lock(mutex_);
+    return {next_ - base_, end_ - base_, freed_bytes_, reused_, exhausted_};
 }
 
 void VaSpace::add(std::uint64_t va, std::uint64_t size, MetalBuffer* buffer) {
@@ -62,6 +121,7 @@ void MetalBuffer::make_resident() {
 
 MetalBuffer::~MetalBuffer() {
     if (va_) device_->va_space().remove(va_, this);
+    if (va_ && owns_va_) device_->va_space().release(va_, size_);
     device_->retire(buffer_, placed_ ? nil : buffer_);
     if (!placed_) device_->ledger().remove(category_, accounted_);
 }
@@ -131,6 +191,7 @@ MetalHeap::MetalHeap(MetalDevice* device, id<MTLHeap> heap, std::uint64_t va_bas
 
 MetalHeap::~MetalHeap() {
     arena_.reset();
+    device_->va_space().release(va_base_, heap_.size);
     device_->retire(heap_, heap_);
     device_->ledger().remove(MemoryCategory::heap, accounted_);
 }

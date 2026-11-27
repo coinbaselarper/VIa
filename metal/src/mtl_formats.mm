@@ -113,23 +113,51 @@ bool native_format(std::uint32_t dxgi, NativeFormat& out) {
 }
 
 MTLVertexFormat vertex_format(std::uint32_t dxgi) {
+    // Every DXGI format a D3D12 input layout accepts with a Metal vertex format. R10G10B10A2_UINT (25) has none
+    // (Metal packs 10:10:10:2 only normalized) and stays Invalid, so its pipeline is refused by name.
     switch (dxgi) {
-    case format::r32g32b32a32_float: return MTLVertexFormatFloat4;
-    case format::r32g32b32a32_uint: return MTLVertexFormatUInt4;
-    case format::r32g32b32_float: return MTLVertexFormatFloat3;
-    case format::r32g32_float: return MTLVertexFormatFloat2;
-    case format::r32_float: return MTLVertexFormatFloat;
-    case format::r32_uint: return MTLVertexFormatUInt;
-    case format::r16g16b16a16_float: return MTLVertexFormatHalf4;
-    case format::r16g16b16a16_unorm: return MTLVertexFormatUShort4Normalized;
-    case format::r16g16_float: return MTLVertexFormatHalf2;
-    case format::r8g8b8a8_unorm: return MTLVertexFormatUChar4Normalized;
-    case format::r8g8b8a8_uint: return MTLVertexFormatUChar4;
-    case format::b8g8r8a8_unorm: return MTLVertexFormatUChar4Normalized_BGRA;
-    case format::r10g10b10a2_unorm: return MTLVertexFormatUInt1010102Normalized;
-    case format::r8g8_unorm: return MTLVertexFormatUChar2Normalized;
-    case format::r16_float: return MTLVertexFormatHalf;
-    case format::r8_unorm: return MTLVertexFormatUCharNormalized;
+    case 2: return MTLVertexFormatFloat4;
+    case 3: return MTLVertexFormatUInt4;
+    case 4: return MTLVertexFormatInt4;
+    case 6: return MTLVertexFormatFloat3;
+    case 7: return MTLVertexFormatUInt3;
+    case 8: return MTLVertexFormatInt3;
+    case 10: return MTLVertexFormatHalf4;
+    case 11: return MTLVertexFormatUShort4Normalized;
+    case 12: return MTLVertexFormatUShort4;
+    case 13: return MTLVertexFormatShort4Normalized;
+    case 14: return MTLVertexFormatShort4;
+    case 16: return MTLVertexFormatFloat2;
+    case 17: return MTLVertexFormatUInt2;
+    case 18: return MTLVertexFormatInt2;
+    case 24: return MTLVertexFormatUInt1010102Normalized;
+    case 26: return MTLVertexFormatFloatRG11B10;
+    case 28: return MTLVertexFormatUChar4Normalized;
+    case 30: return MTLVertexFormatUChar4;
+    case 31: return MTLVertexFormatChar4Normalized;
+    case 32: return MTLVertexFormatChar4;
+    case 34: return MTLVertexFormatHalf2;
+    case 35: return MTLVertexFormatUShort2Normalized;
+    case 36: return MTLVertexFormatUShort2;
+    case 37: return MTLVertexFormatShort2Normalized;
+    case 38: return MTLVertexFormatShort2;
+    case 41: return MTLVertexFormatFloat;
+    case 42: return MTLVertexFormatUInt;
+    case 43: return MTLVertexFormatInt;
+    case 49: return MTLVertexFormatUChar2Normalized;
+    case 50: return MTLVertexFormatUChar2;
+    case 51: return MTLVertexFormatChar2Normalized;
+    case 52: return MTLVertexFormatChar2;
+    case 54: return MTLVertexFormatHalf;
+    case 56: return MTLVertexFormatUShortNormalized;
+    case 57: return MTLVertexFormatUShort;
+    case 58: return MTLVertexFormatShortNormalized;
+    case 59: return MTLVertexFormatShort;
+    case 61: return MTLVertexFormatUCharNormalized;
+    case 62: return MTLVertexFormatUChar;
+    case 63: return MTLVertexFormatCharNormalized;
+    case 64: return MTLVertexFormatChar;
+    case 87: return MTLVertexFormatUChar4Normalized_BGRA;
     default: return MTLVertexFormatInvalid;
     }
 }

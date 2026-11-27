@@ -7,6 +7,14 @@ Host: M4 Pro, macOS 27.0.1, Metal compiler 32023.922 (`metal -c`), Homebrew `spi
 also as x86_64 under Rosetta). Numbers are measured in this module unless a spike is named. The machine was shared
 with other workers (load average 10-42 during this round); all timings below are loaded timings.
 
+## Round 14, shader-structure worker (2026-11-27 11:15-): translator fork; waterfall loops folded (in progress)
+
+Preliminary (this section is rewritten at the end of the task). Translator copy `port/shaders_vk/translator-fork/`
+(leonida d3b8251b + the s2-make-game computed-I/J patch; byte-identical corpus output without the new flags), tool
+`tools/sstruct.py`, tree `port/build/sstruct-x86_64`. Measured so far (offline mesh probe, safe+capture variants,
+2,048 groups, best of 5, load 3-5): `--fold-waterfalls` on `+MS_VS_PropFoliageDeferred_7cf79608_Wrapped~8`: 382 -> 262
+switch cases, zero-heap path 5.84 -> 4.48 us a group, 0 of all output words differ (3 inputs).
+
 ## Round 12, mesh-speed worker (2026-11-27 09:06-11:20): exact MSL passes on the translated mesh and pixel shaders; world G-buffer geometry -30%, fragment -58% a frame (same binary, pass timer)
 
 Tree `port/build/mspeed-x86_64`. M = measured (probe, tool or title log), I = inferred. Offline GPU jobs through

@@ -941,14 +941,17 @@ Status MetalQueue::signal(gpu::Fence* fence, std::uint64_t value) {
     auto* f = static_cast<MetalFence*>(fence);
     if (!f) return Status::invalid_argument;
     std::lock_guard submit(submit_mutex_);
-    id<MTLCommandBuffer> cb = begin_command_buffer();
-    {
-        std::lock_guard lock(mutex_);
-        [cb encodeWaitForEvent:timeline_ value:serial_];
+    // The caller's thread has no autorelease pool: without this one every signal's command buffer stayed alive.
+    @autoreleasepool {
+        id<MTLCommandBuffer> cb = begin_command_buffer();
+        {
+            std::lock_guard lock(mutex_);
+            [cb encodeWaitForEvent:timeline_ value:serial_];
+        }
+        f->track_mirror(value);
+        const EventSignal s{f->mtl(), value};
+        end_command_buffer(cb, std::span<const EventSignal>(&s, 1));
     }
-    f->track_mirror(value);
-    const EventSignal s{f->mtl(), value};
-    end_command_buffer(cb, std::span<const EventSignal>(&s, 1));
     return Status::ok;
 }
 
@@ -1481,6 +1484,11 @@ public:
             a.nonempty += p.nonempty;
             a.groups += p.groups;
             if (a.last.empty() && p.last != p.first) a.last = p.last;
+            KindAgg& k = kinds_[p.kind];
+            ++k.encoders;
+            k.work += p.work;
+            if (p.ms >= 0) k.ms += p.ms;
+            ++k.ended_by[p.ended_by.empty() ? std::string("-") : p.ended_by];
             if (tsv_)
                 std::fprintf(tsv_, "%d\t%s\t%llu\t%u\t%c\t%s\t%s\t%s\t%u\t%ux%u\t%s\t%s\t%.1f\t%.1f\t%s\t%d\t%s\t%llu\t%llu\t%llu\t%.4f\t%.4f\t%.4f\n",
                              windows_.load(), queue.c_str(), (unsigned long long)serial, p.index, p.kind, p.targets.c_str(),
@@ -1573,6 +1581,20 @@ private:
                          a.unsampled ? " (some unsampled)" : "", key.c_str(), a.last.empty() ? "" : " .. ",
                          a.last.substr(0, 80).c_str());
         }
+        for (auto& [kind, k] : kinds_) {
+            std::vector<std::pair<std::string, std::uint64_t>> by(k.ended_by.begin(), k.ended_by.end());
+            std::sort(by.begin(), by.end(), [](const auto& x, const auto& y) { return x.second > y.second; });
+            std::string ends;
+            for (std::size_t i = 0; i < by.size() && i < 8; ++i) {
+                char t[160];
+                std::snprintf(t, sizeof t, "%s%s %.1f", ends.empty() ? "" : ", ", by[i].first.c_str(), double(by[i].second) / frames);
+                ends += t;
+            }
+            std::fprintf(stderr, "[metal] pass timing by kind %c, per frame: %.1f encoders, %.2f ms, work %.1f (%.1f an encoder); ended by: %s\n",
+                         kind, double(k.encoders) / frames, k.ms / frames, double(k.work) / frames,
+                         k.encoders ? double(k.work) / double(k.encoders) : 0.0, ends.c_str());
+        }
+        kinds_.clear();
         if (tsv_) std::fflush(tsv_);
         agg_.clear();
         gpu_ms_.clear();
@@ -1593,6 +1615,12 @@ private:
     MetalDevice* device_ = nullptr;
     std::uint64_t presents0_ = 0, outstanding_ = 0, command_buffers_ = 0, untimed_ = 0;
     std::map<std::string, double> gpu_ms_, timed_ms_;
+    struct KindAgg {
+        std::uint64_t encoders = 0, work = 0;
+        double ms = 0;
+        std::map<std::string, std::uint64_t> ended_by;
+    };
+    std::map<char, KindAgg> kinds_;
     std::unordered_map<std::string, Agg> agg_;
     std::atomic<std::uint32_t> failures_{0};
     std::vector<std::pair<id<MTLCounterSampleBuffer>, std::uint64_t>> pool_;

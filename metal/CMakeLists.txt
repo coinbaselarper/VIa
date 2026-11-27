@@ -61,6 +61,11 @@ if(GTA6RT_METAL_TESTS)
       GTA6RT_METAL_SHADER_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/shaders")
   endforeach()
 
+  add_executable(metal_test_vertex_format tests/test_vertex_format.mm)
+  set_source_files_properties(tests/test_vertex_format.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+  target_link_libraries(metal_test_vertex_format PRIVATE gta6rt_metal)
+  add_test(NAME metal_vertex_format COMMAND metal_test_vertex_format)
+
   if(CMAKE_OSX_ARCHITECTURES STREQUAL "x86_64")
     target_link_options(metal_test_hostmem PRIVATE "LINKER:-pagezero_size,0x10000")
     target_link_options(metal_test_titlepool PRIVATE "LINKER:-pagezero_size,0x10000")

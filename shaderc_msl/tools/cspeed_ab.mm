@@ -1,7 +1,9 @@
 // A/B and timing of translated compute kernels on a dispatch captured in the title (cspeed_capcfg.py output):
 // both libraries run on identical copies of the captured heap, hash table, textures and samplers; every writable
 // texture and the whole heap are compared bit for bit afterwards.
-//   cspeed_ab <A.metallib> <B.metallib> <cfg.json> [--time N] [--seed S]
+//   cspeed_ab <A.metallib> <B.metallib> <cfg.json> [--time N] [--seed S] [--shared-writes]
+// --shared-writes: one large texture per writable binding, bound at every slot (title-sized targets: writes at real
+// coordinates land), and A runs twice first so a non-deterministic result (slots racing on one texel) is reported.
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #include <cstdio>
@@ -11,6 +13,7 @@
 #include <vector>
 
 static id<MTLDevice> dev;
+static bool shared_writes = false;
 
 struct Tex {
     id<MTLTexture> t;
@@ -46,7 +49,12 @@ static id<MTLTexture> make_texture(NSString* type, int klass, bool write, std::m
     else if ([type isEqualToString:@"texturecube"]) d.textureType = MTLTextureTypeCube, d.width = d.height = 32;
     else if ([type isEqualToString:@"texturecube_array"]) d.textureType = MTLTextureTypeCubeArray, d.width = d.height = 32, d.arrayLength = 2;
     else d.textureType = MTLTextureType2D;
-    if (write) {
+    if (write && shared_writes) {
+        if (d.textureType == MTLTextureType3D) d.width = d.height = d.depth = 160;
+        else if (d.textureType == MTLTextureType1D || d.textureType == MTLTextureType1DArray) d.width = 16384;
+        else if (d.textureType == MTLTextureType2DArray) d.width = d.height = 1024;
+        else if (d.textureType == MTLTextureType2D) d.width = 2048, d.height = 2560;
+    } else if (write) {
         if (d.textureType == MTLTextureType3D) d.width = d.height = d.depth = 8;
         else if (d.height > 1) d.width = d.height = 32;
     }
@@ -113,7 +121,11 @@ static bool setup(Run& r, NSDictionary* cfg, uint32_t seed) {
             NSString* type = b[@"type"];
             const bool wr = [b[@"write"] boolValue];
             ab = [dev newBufferWithLength:slots * 8 options:MTLResourceStorageModeShared];
-            if (wr) {
+            if (wr && shared_writes) {
+                id<MTLTexture> t = make_texture(type, class_of(b[@"elem"]), true, rng);
+                for (NSUInteger s = 0; s < slots; ++s) ((MTLResourceID*)ab.contents)[s] = t.gpuResourceID;
+                r.tex.push_back({t, true});
+            } else if (wr) {
                 for (NSUInteger s = 0; s < slots; ++s) {
                     id<MTLTexture> t = make_texture(type, class_of(b[@"elem"]), true, rng);
                     ((MTLResourceID*)ab.contents)[s] = t.gpuResourceID;
@@ -185,6 +197,9 @@ int main(int argc, char** argv) {
             if (!std::strcmp(argv[i], "--time")) reps = std::atoi(argv[i + 1]);
             if (!std::strcmp(argv[i], "--seed")) seed = uint32_t(std::atoi(argv[i + 1]));
         }
+        for (int i = 4; i < argc; ++i) {
+            if (!std::strcmp(argv[i], "--shared-writes")) shared_writes = true;
+        }
         dev = MTLCreateSystemDefaultDevice();
         NSDictionary* cfg = [NSJSONSerialization JSONObjectWithData:file(@(argv[3])) options:0 error:nil];
         if (!cfg) { std::printf("bad config\n"); return 2; }
@@ -211,6 +226,16 @@ int main(int argc, char** argv) {
             if (st != 4) { std::printf("RESULT status %d for %c\n", st, 'A' + k); return 1; }
             std::printf("RUN %c %.3f ms\n", 'A' + k, ms);
             res[k] = dump(r, &tex_words);
+        }
+        if (shared_writes) {
+            Run r;
+            setup(r, cfg, seed);
+            int st = 0;
+            run(ps[0], r, cfg, 1, &st);
+            const std::vector<uint32_t> again = dump(r, nullptr);
+            size_t nd = 0;
+            for (size_t i = 0; i < again.size(); ++i) nd += again[i] != res[0][i];
+            std::printf("DETERMINISM A vs A: %zu words differ\n", nd);
         }
         size_t diff = 0, changed = 0, tex_changed = 0, heap_changed = 0;
         for (size_t i = 0; i < res[0].size(); ++i) {

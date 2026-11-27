@@ -5,6 +5,7 @@
 #include <tlhelp32.h>
 #include <cerrno>
 #include <climits>
+#include <cstdio>
 #include <cstdlib>
 #include <ctime>
 #include <mach/mach.h>
@@ -163,6 +164,14 @@ void* trampoline(void* p) {
     while (t->start_suspend > 0) pthread_cond_wait(&t->gate_cv, &g_wait_mx);
     t->started = true;
     pthread_mutex_unlock(&g_wait_mx);
+    // Names set while the thread was suspended, or the guest start address for unnamed title threads (profiling).
+    char start_name[24];
+    if (!t->name[0] && t->guest && t->win_start) {
+        snprintf(start_name, sizeof start_name, "guest@%llx", (unsigned long long)t->win_start);
+        pthread_setname_np(start_name);
+    } else if (t->name[0]) {
+        pthread_setname_np(t->name);
+    }
     if (t->guest) run_start_hooks(t);
     t->fn(t->arg);
     if (t->exit_code == STILL_ACTIVE) t->exit_code = 0;

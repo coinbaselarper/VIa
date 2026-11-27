@@ -80,6 +80,48 @@ private:
     std::uint64_t pruned_ = 0;
 };
 
+// A CPU-only placeholder that keeps a slot emptied in place from taking another key until the GPU work that may have
+// read the old key has passed (MetalBindless::erase_key / flush). Its key hashes to exactly that slot, so the table
+// puts it there; the GPU copy of a tombstone slot stays all zeros (bindless::write_in_place). Key words 0-2 mark it.
+inline constexpr std::uint32_t kTombstoneMark[3] = {0x70AB570Eu, 0xDEADDEADu, 0x5107DEADu};
+
+inline bool is_tombstone(const std::uint32_t* key) {
+    return key[0] == kTombstoneMark[0] && key[1] == kTombstoneMark[1] && key[2] == kTombstoneMark[2];
+}
+
+inline std::uint32_t odd_inverse(std::uint32_t a) {
+    std::uint32_t x = a;
+    for (int i = 0; i < 5; ++i) x *= 2u - a * x;
+    return x;
+}
+
+// fmix32 run backwards: the value whose fmix32 is `h`.
+inline std::uint32_t unfinalize_descriptor_hash(std::uint32_t h) {
+    h ^= h >> 16;
+    h *= odd_inverse(0xC2B2AE35u);
+    h ^= (h >> 13) ^ (h >> 26);
+    h *= odd_inverse(0x85EBCA6Bu);
+    h ^= h >> 16;
+    return h;
+}
+
+// A tombstone key (serial makes each one distinct) whose hash under `kind` is `slot`, so its home slot is `slot`.
+inline DescriptorKey tombstone_key(std::uint32_t slot, std::uint64_t serial, DescriptorHashKind kind) {
+    DescriptorKey k{};
+    k[0] = kTombstoneMark[0];
+    k[1] = kTombstoneMark[1];
+    k[2] = kTombstoneMark[2];
+    k[3] = std::uint32_t(serial);
+    k[4] = std::uint32_t(serial >> 32);
+    k[5] = 0x7051u;
+    k[6] = slot;
+    std::uint32_t h = kFnvOffsetBasis;
+    for (int i = 0; i < 7; ++i) h = (h ^ k[i]) * kFnvPrime;
+    const std::uint32_t want = kind == DescriptorHashKind::fnv1a_fmix32 ? unfinalize_descriptor_hash(slot) : slot;
+    k[7] = h ^ (want * odd_inverse(kFnvPrime));
+    return k;
+}
+
 struct InPlaceResult {
     bool written = false;
     bool emptied = false;  // some slot was emptied: the caller records `record`
@@ -103,6 +145,7 @@ inline InPlaceResult write_in_place(std::uint32_t* gpu, const DescriptorTable& t
     };
     for (std::size_t i = 0; i < slots.size(); ++i) {
         if (slots[i] >= capacity || !table.read_slot(slots[i], &next[i * 10])) return out;
+        if (is_tombstone(&next[i * 10])) std::memset(&next[i * 10], 0, 40);
         const std::uint32_t* now = gpu + 1 + std::size_t(slots[i]) * 10;
         const std::uint32_t* to = &next[i * 10];
         if (std::memcmp(now, to, 32) == 0) {
@@ -174,6 +217,7 @@ public:
         std::uint64_t live_generations = 0, generation_bytes = 0, generations_made = 0, generations_freed = 0;
         std::uint64_t full_writes = 0, slot_writes = 0, in_place_flushes = 0, in_place_refused_rekey = 0;
         std::uint64_t in_place_refused_refill = 0;
+        std::uint64_t tombstones_live = 0, tombstones_made = 0;
     };
     Stats stats() const;
 
@@ -213,6 +257,20 @@ private:
     std::uint64_t journal_base_ = 0, journal_seq_ = 0, table_epoch_ = 0, full_writes_ = 0, slot_writes_ = 0;
     std::uint64_t throttled_flushes_ = 0, throttled_us_ = 0, in_place_flushes_ = 0;
     std::uint64_t in_place_refused_rekey_ = 0, in_place_refused_refill_ = 0;
+    // Tombstones by serial (bindless::tombstone_key): `record` is the empty record of the flush that zeroed the slot on
+    // the GPU (0: not flushed yet); the tombstone leaves the table once that record is released.
+    struct Tombstone {
+        DescriptorKey key;
+        std::uint64_t record = 0;
+    };
+    std::unordered_map<std::uint64_t, Tombstone> tombstones_;
+    std::uint64_t tombstone_serial_ = 0, tombstones_made_ = 0, tombstones_released_ = 0, tombstones_refused_ = 0;
+    void release_tombstones(std::uint64_t first_unreleased, bool all);
+    void date_tombstones(std::uint64_t record);
+    void free_settled_generations(std::chrono::steady_clock::time_point now);
+    bool cluster_refused(const DescriptorKey& key);
+    std::uint64_t cluster_refused_ = 0;
+    std::chrono::steady_clock::time_point last_free_scan_{};
     bool generation_free(Generation& g, std::chrono::steady_clock::time_point now);
     DescriptorTable::Changes take_all_changes();
     std::uint64_t release_empty_records(std::chrono::steady_clock::time_point now);
