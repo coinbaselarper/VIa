@@ -28,7 +28,7 @@ namespace gta6rt::pcache {
 
 namespace {
 
-enum class HeldState { queued, waiting_lib, building, ready, failed, dropped, released, adopted };
+enum class HeldState { queued, waiting_lib, building, ready, failed, dropped, released, adopted, on_demand };
 
 struct Held {
     Spec spec;
@@ -38,6 +38,8 @@ struct Held {
     HeldState state = HeldState::queued;
     bool hold = true;
     bool bootstrap = false;
+    bool archived = false;  // listed under this key by a tier or this directory's manifest: an archive lookup finds it
+    std::uint32_t runs = 0;  // the most runs any manifest says used it
     double t_start = 0, t_ready = 0;
     double expect_rel = 0;  // recorded first use, seconds after its phase began
     std::unique_ptr<gpu::RenderPipeline> render;
@@ -67,7 +69,7 @@ struct Stats {
     std::uint64_t first_uses = 0, adopted_ready = 0, adopted_compiling = 0, created = 0, demanded_queued = 0;
     std::uint64_t demand_ready_from_archive = 0, demand_compiled = 0, demand_failed = 0;
     std::uint64_t prebuilt = 0, prebuilt_from_archive = 0, prebuild_failed = 0, dropped = 0, bootstrap_matched = 0;
-    std::uint64_t released_unused = 0, tier_entries = 0;
+    std::uint64_t released_unused = 0, tier_entries = 0, on_demand = 0;
     std::uint64_t waits = 0;
     double wait_sum = 0, wait_longest = 0, prebuild_seconds = 0;
     std::string wait_longest_label;
@@ -94,6 +96,8 @@ struct State {
     Phase phase = Phase::boot;
     double phase_t0[8] = {};
     double release_s = 30, ahead_s = 10;
+    bool cold_only = false;  // GTA6RT_METAL_PCACHE_PREBUILD=cold
+    std::uint32_t min_runs = 1;  // GTA6RT_METAL_PCACHE_MIN_RUNS
     bool movie = false;
     double quiet_until = 0, quiet_s = 10;
     double world_t0 = 0, world_next = 0;
@@ -231,7 +235,7 @@ std::string report_locked(State& s) {
                   "t=%.0fs phase=%s: first uses %llu (adopted ready %llu, adopted compiling %llu, created at use %llu: "
                   "%llu from the archive, %llu compiled, %llu failed); prebuild: %zu known, %llu built (%llu archive "
                   "hits, %.1f s), %llu failed, %zu queued, %zu waiting for a shader, %zu holding, %llu dropped after "
-                  "build, %llu released unused, %zu tier entries, %llu bootstrap matches; first-use waits %llu (sum %.0f ms, longest %.0f ms: %s); manifest "
+                  "build, %llu released unused, %zu tier entries, %llu at first use only, %llu bootstrap matches; first-use waits %llu (sum %.0f ms, longest %.0f ms: %s); manifest "
                   "%zu earlier + %zu this run",
                   process_age_s(), phase_name(s.phase), (unsigned long long)t.first_uses,
                   (unsigned long long)t.adopted_ready, (unsigned long long)t.adopted_compiling,
@@ -239,7 +243,7 @@ std::string report_locked(State& s) {
                   (unsigned long long)t.demand_compiled, (unsigned long long)t.demand_failed, s.table.size(),
                   (unsigned long long)t.prebuilt, (unsigned long long)t.prebuilt_from_archive, t.prebuild_seconds,
                   (unsigned long long)t.prebuild_failed, queued, waiting, held, (unsigned long long)t.dropped,
-                  (unsigned long long)t.released_unused, std::size_t(t.tier_entries), (unsigned long long)t.bootstrap_matched, (unsigned long long)t.waits, t.wait_sum * 1e3,
+                  (unsigned long long)t.released_unused, std::size_t(t.tier_entries), (unsigned long long)t.on_demand, (unsigned long long)t.bootstrap_matched, (unsigned long long)t.waits, t.wait_sum * 1e3,
                   t.wait_longest * 1e3, t.wait_longest_label.empty() ? "-" : t.wait_longest_label.c_str(),
                   s.prior.size(), s.run.size());
     std::string out = buf;
@@ -768,6 +772,8 @@ void start(const StartConfig& config) {
     if (const char* v = std::getenv("GTA6RT_METAL_PCACHE_QUIET_S")) s.quiet_s = std::atof(v);
     if (const char* v = std::getenv("GTA6RT_METAL_PCACHE_RELEASE_S")) s.release_s = std::atof(v);
     if (const char* v = std::getenv("GTA6RT_METAL_PCACHE_AHEAD_S")) s.ahead_s = std::atof(v);
+    if (const char* v = std::getenv("GTA6RT_METAL_PCACHE_PREBUILD")) s.cold_only = std::string(v) == "cold";
+    if (const char* v = std::getenv("GTA6RT_METAL_PCACHE_MIN_RUNS")) s.min_runs = std::uint32_t(std::max(1, std::atoi(v)));
     ::mkdir(config.directory.c_str(), 0755);
     s.manifest_path = config.directory + "/pcache-manifest.txt";
     {
@@ -817,6 +823,8 @@ void start(const StartConfig& config) {
             }
             const bool fresh = !s.table.count(e.key);
             Held& h = add_locked(s, e.key, e.text, spec, e.phase, false);
+            if (!changed) h.archived = true;
+            h.runs = std::max(h.runs, e.runs);
             if (!fresh) {
                 h.expect_rel = std::min(h.expect_rel, rel[i].t);
                 continue;
@@ -845,13 +853,24 @@ void start(const StartConfig& config) {
         log_line("tier manifest %s: %zu pipelines, %zu not in this directory's manifest", path.c_str(), tier.size(), added);
     }
     s.queue.clear();
-    for (auto& [k, h] : s.table) s.queue.emplace(queue_key(*h));
+    for (auto& [k, h] : s.table) {
+        if ((s.cold_only || h->runs < s.min_runs) && h->archived) {
+            h->state = HeldState::on_demand;
+            ++s.stats.on_demand;
+            continue;
+        }
+        s.queue.emplace(queue_key(*h));
+    }
     load_bootstrap(s, config.directory + "/pcache-bootstrap.txt");
     if (rekeyed) log_line("%zu recorded pipelines re-keyed to the shaders' current content keys", rekeyed);
     log_line("manifest %s: %zu pipelines%s; prebuilding in phase order, %u at a time, holding up to %zu, %.0f s ahead of "
              "recorded first use, released %.0f s after it unused", s.manifest_path.c_str(),
              s.prior.size(), bad ? (" (" + std::to_string(bad) + " unreadable)").c_str() : "", s.cfg.max_in_flight,
              s.max_hold, s.ahead_s, s.release_s);
+    if (s.cold_only || s.min_runs > 1)
+        log_line("%s: %llu pipelines an archive lists are made at their first use, %zu prebuilt",
+                 s.cold_only ? "GTA6RT_METAL_PCACHE_PREBUILD=cold" : "GTA6RT_METAL_PCACHE_MIN_RUNS (fewer runs at first use)",
+                 (unsigned long long)s.stats.on_demand, s.queue.size());
     if (gta6rt_governor_register) gta6rt_governor_register(GTA6RT_GOV_COMPILE_SHRINK, "pcache prebuild", governor_reclaim, nullptr);
     s.worker = std::thread(worker_main);
     s.monitor = std::thread(monitor_main);

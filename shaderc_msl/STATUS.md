@@ -7,6 +7,134 @@ Host: M4 Pro, macOS 27.0.1, Metal compiler 32023.922 (`metal -c`), Homebrew `spi
 also as x86_64 under Rosetta). Numbers are measured in this module unless a spike is named. The machine was shared
 with other workers (load average 10-42 during this round); all timings below are loaded timings.
 
+## Round 12, mesh-speed worker (2026-11-27 09:06-11:20): exact MSL passes on the translated mesh and pixel shaders; world G-buffer geometry -30%, fragment -58% a frame (same binary, pass timer)
+
+Tree `port/build/mspeed-x86_64`. M = measured (probe, tool or title log), I = inferred. Offline GPU jobs through
+`tools/tmem_slot.sh` (binary `gta6rt_mspeed_probe`); 8 world runs `mspeed-a..l` (one at a time, slot + probe lock,
+hidden window, imported save, `GTA6RT_METAL_CB_ABORT_MS=2000`, cap 14,848 / 13,312 by the 05:00 rule, 4 Hz wired watch
+at 9,728 MiB, fault_stop): **0 failed command buffers, 0 GPU page faults, gpuEvent-gta6rt 9 before and 9 after every
+run**. Every world run ended on the wired watch or the footprint cap 10-65 s into the world (as for everyone this
+round). Load 2-7 at run starts; other workers' runs and builds shared the machine.
+
+### 1. What the generated code spends (M, offline; foliage `+MS_VS_PropFoliageDeferred_7cf79608_Wrapped~8` as the
+title runs it: store recipe + private outputs; probe `tools/mspeed_probe.mm`, 2,048 groups, idle GPU, best of 5)
+
+- The translation is an emulated-wave64 scheduler: every invocation runs one *segment* (a `case` of a switch over the
+  PC) per *round*, every round ends in a workgroup barrier (device+threadgroup+texture flags) plus two per-invocation
+  LDS atomics; segments that touch no LDS still ended their round. A wave64 is two SIMD groups, so every cross-lane op
+  (readfirstlane, exec/vcc votes: 159 of 382 cases in foliage) is an LDS exchange over one round.
+- Registers are NOT in memory: the AIR of foliage has 0 allocas (SROA), ~260 phis at each dispatch-loop header (every
+  emulated register with an upward-exposed use somewhere is live across the dispatch). Driver scratch 157 MiB (about
+  1.3 KiB a thread spilled), the same with every pass below.
+- Per-output staging: gone with private outputs (default since 09:10 for 6 rows; my rows add it to 395 more).
+- Typed-read three-way diamonds: present (66 samples x 3 in foliage); `merge_typed_reads` does not apply to mesh MSL
+  as written (helper not emitted); not pursued.
+- Synthetic inputs, not captured: the debug buffer is 64 KiB and its printed channels hold ~5.6k lossless words per
+  10 s report, a group reads more, and I may not edit the adapter. Inputs are structure-aware heaps
+  (`tools/mspeed_inputs.py`: descriptor tables of V#s, data patterns, a bindless table built from traced keys); a trace
+  variant (`mspeed.py trace`) checks every load is inside the heap. The zero-heap path is the longest found (116
+  segments a SIMD group, 154 rounds, 84 hash lookups); its 8.0 us a group is the title's order (13-20 us).
+
+| foliage~8 variant (zero-heap path) | us a group | vs base |
+|---|---:|---:|
+| base (title code) | 8.03 | |
+| chain_segments | 7.36 | -8% |
+| round_counts_simd + barrier_tg_only | 7.03 | -12% |
+| simd_votes | 8.09 | +1% |
+| fp_inline | 7.44 | -7% |
+| all five | 6.18 | -23% |
+| all five + hash_memo | 5.78 | -28% |
+| rfl_batch alone / with all | 8.89 / 6.57 | +11% / slower: **dropped** (3 KiB more workgroup memory) |
+| ablations from "all five" (wrong outputs, attribution only): no bindless hash lookups / no exec selects / no 48-bit sign extension / no denormal flushes / all four | 5.01 / 5.92 / 5.96 / 6.12 / 4.55 | |
+
+Rounds a group 154 -> 111 with chaining. Pixel shaders (no scheduler) carry 117-179 `[[clang::optnone]]` FP helper
+calls each: `fp_inline` + `hash_memo` there, fragment probe (`mspeed_psjob.py`, 256x256): foliage PS 3.18 -> 1.31 ns a
+pixel, `%PS_DeferredTextured_4dbafe93~6` 0.92 -> 0.68, `!PS_CompositeNMB_97148495` 0.91 -> 0.76 (structured input).
+
+### 2. The passes (`tools/mspeed_passes.py`, MSL level, each exact by construction; `tools/mspeed_overlay.py` builds rows)
+
+- `chain_segments`: a segment that touches no workgroup variable, no atomic/barrier/simd op and does not end the wave
+  or wait at s_barrier sets the chain flag, so the next segment runs in the same round. Only when the program writes no
+  device memory and no texture. Every memory-touching segment still ends its round, so two of them are still separated
+  by a barrier; exchanges still start in one round and resume in the next for both halves of a wave (the decision is
+  per segment). A thread chains at most 65,536 segments (the translator's guard).
+- `round_counts_simd`: the two per-invocation round-count atomics -> `simd_sum` + one atomic per SIMD group (same sums).
+- `barrier_tg_only`: the scheduler barrier orders threadgroup memory only when the program writes no device memory/texture.
+- `simd_votes`: exchange votes -> one `atomic_or` per SIMD group of the `simd_or` (per-invocation fallback when the word
+  differs inside a SIMD group); the sink-word stores of the non-clearing lanes (never read) dropped.
+- `fp_inline`: SPIRV-Cross's NoContraction helpers (`spvFMul/FAdd/FSub/...`, `[[clang::optnone]]`, one call per float
+  op) inlined with `#pragma clang fp contract(off) reassociate(off)`: still the same fma, nothing can fuse or reorder it.
+- `hash_memo`: the bindless FNV lookup keeps its last T# and S# answer per invocation (pure in its key and the table;
+  the adapter writes a table slot in place only when no submitted work can read it).
+- `rfl_batch` (readfirstlane chains fused into one exchange): built, exact on the probe, slower; not in the overlay.
+
+Exactness (M, `mspeed.py capture` + `tools/mspeed_cmp.py`, every output word bit-compared): foliage, 64 groups x 3
+inputs (zero heap; structured: 3,991 vertices, 3,636 primitives, 67,847 non-zero vertex words; NaN/Inf/-0/denormal
+heap: 3,530 / 3,462 / 60,010): **0 words differ** for every variant above. Pixel (3 shaders x 3 inputs incl.
+NaN/Inf/-0/denormal float textures, ~6 M words, 489k non-finite): **0 differ**. Limits: synthetic inputs; 3 of the 636
+pixel shaders and 1 of the 408 mesh shaders were compared on the GPU; the rest rely on the passes' construction.
+
+### 3. In the title (M; same binary = `build/metal-play-x86_64/bin/gta6rt` of 09:17 copied to my tree; the same tiers
+plus my archive; `GTA6RT_METAL_PASS_TIMING=78,2,4` + `_SPLIT=1`)
+
+Before = defaults (`mspeed-e` + `mspeed-g`, 9 windows, 18 frames); after = `build/mspeed-x86_64/overlay.tsv` first
+(`mspeed-h`, 10 windows, 20 frames). Single-pipeline segments, geometry = vertex-stage samples (per group is the
+comparable number; groups per frame match within 10%):
+
+| # | mesh shader | before: geometry ms/frame | groups/frame | us/group | after: geometry ms/frame | groups/frame | us/group | after/before (per group) | private outputs before |
+|---:|---|---:|---:|---:|---:|---:|---:|---:|---|
+| 1 | `+MS_VS_PropFoliageDeferred_7cf79608_Wrapped~8` | 25.7 | 1281 | 20.03 | 18.2 | 1204 | 15.13 | 0.76 | yes |
+| 2 | `_MSR_VS_TransformSkinD_DetailMapsOff_NoDeform_34f92402_Wrapped` | 24.4 | 1520 | 16.07 | 15.8 | 1428 | 11.09 | 0.69 | split64 |
+| 3 | `1MSNC_VS_PropFoliageSkinDeferred_4352f5e1_Wrapped~8` | 10.9 | 481 | 22.61 | 7.9 | 462 | 17.06 | 0.75 | yes |
+| 4 | `(MSNC_VS_TransformSkinD_9e3a1555_Wrapped~50` | 7.6 | 163 | 46.48 | 4.4 | 155 | 28.21 | 0.61 | no (added) |
+| 5 | `_MS_VS_TransformD_c5fd36bb_Wrapped~153` | 7.3 | 287 | 25.45 | 5.7 | 278 | 20.45 | 0.80 | yes |
+| 6 | `2MS_VS_TransformTerrainNormalTint_e74ae427_Wrapped~11` | 6.0 | 946 | 6.35 | 4.6 | 979 | 4.67 | 0.74 | yes |
+| 7 | `;MSNC_VS_CascadeShadows_drawskinnedTexture_a14f0f80_Wrapped~30` | 3.5 | 388 | 8.95 | 2.6 | 424 | 6.20 | 0.69 | no (added) |
+| 8 | `2MS_VS_TransformTerrainNormalTint_e74ae427_Wrapped~8` | 2.5 | 310 | 8.10 | 1.8 | 319 | 5.66 | 0.70 | yes |
+| 9 | `_MS_VS_TransformD_c5fd36bb_Wrapped~23` | 2.2 | 931 | 2.40 | 2.0 | 1120 | 1.80 | 0.75 | yes |
+| 10 | `_MS_VS_TransformD_c5fd36bb_Wrapped` | 2.2 | 263 | 8.30 | 1.3 | 317 | 4.20 | 0.51 | no (added) |
+
+- Sum over all single-pipeline segments, per frame: **geometry 123.1 -> 86.5 ms (-30%), fragment 112.4 -> 47.3 ms
+  (-58%)**; render encoders 410 -> 246 ms, compute 141 -> 133 (not touched). Foliage PS `490a951c~7` 29.4 -> 3.4 ms a
+  frame, `33e09f97~7` 12.9 -> 2.7, `942fcba4~30` 4.1 -> 1.3, `a9c57b97~28` 3.7 -> 1.1, composite 5.5 -> 3.9.
+- GPU per presented frame, 10 s lines in the world: with the timer 496-538 (before) vs 359-398 ms (after); without it
+  (`mspeed-k` vs `-l`, one line each, both partly loading screen) 457.7 vs 360.5 ms (15 vs 20 presents in those
+  10 s). Not 30 frames/s: the remaining cost is the scheduler itself (section 4).
+- Look: same-binary on/off presents and scene dumps show the same scene, geometry and known artefacts (garbage band at
+  rows ~380-410, black tile block, blue water blocks); depth coverage at upscaled frame 2 is 74.5% in both
+  (`mspeed-k-scene` / `mspeed-l-scene`). The title is not deterministic run to run, so no pixel diff exists.
+  Image: `/Users/a/Desktop/Projects/GTA-VI/port/run/present/mspeed-l-scene/scene_00006_gbuffer1.png` (G-buffer normals
+  drawn by the overlay's mesh and pixel shaders; still wrong in the frame: albedo 17% non-zero, black tile block).
+
+### 4. Deliverables
+
+- Overlay: `build/mspeed-x86_64/overlay.tsv` (1,044 rows): 408 mesh rows = every mesh shader of the world tier
+  (404, 927 pipelines) + 4 split64 rows the world uses (`_MSR_VS_TransformSkinD_DetailMapsOff_NoDeform_34f92402`,
+  `0MS_VS_TransformD_DetailMapsOff_7095f810` x3; split kept, packed as msl-overrides does) with private outputs where
+  they apply + chain_segments, round_counts_simd, barrier_tg_only, simd_votes, fp_inline, hash_memo; 636 pixel rows =
+  every world pixel shader without integer-output variants (fp_inline, hash_memo). Libraries in `ov3/cas`,
+  `ovps3/cas`; per-shader results `ov3/mspeed.jsonl`, `ovps3/mspeed.jsonl`.
+- Pipelines: 1,875 pipelines (every tier pipeline that uses these shaders, plus this tree's recorded ones) built with `prepare_shaders` (catalog
+  `build/mspeed-x86_64/catalog-final.tsv`, list `final.manifest.txt`) into `build/mspeed-x86_64/arch` (13 shards,
+  653 MiB): **0 refused**. Until the cache worker folds them in, runs need
+  `GTA6RT_METAL_ARCHIVE_TIERS=<port>/build/pc7/arch-world:<port>/build/mspeed-x86_64/arch`.
+- Default list (device shim, the `GTA6RT_METAL_SHADER_OVERLAY` default string, `shims/d3d12_metal_device.cpp` ~10650):
+  `(root + "/build/mspeed-x86_64/overlay.tsv:" + root + "/build/expo-x86_64/rectvs/manifest.tsv:" + root + "/build/gpass-x86_64/mop/overlay.tsv:" + root +`
+- Tools: `mspeed.py` (msl, trace, safe, capture, count, lib), `mspeed_probe.mm` (mesh and fragment modes),
+  `mspeed_inputs.py`, `mspeed_trace.py`, `mspeed_cmp.py`, `mspeed_psjob.py`, `mspeed_passes.py`, `mspeed_overlay.py`,
+  `mspeed_passes_tsv.py` (per-shader tables from pass-timer TSVs). `tmem_slot.sh` now polls at 0.2 s.
+
+### 5. Not done / next (ranked)
+
+1. The structural cost: the PC-switch scheduler keeps ~260 emulated registers live at every dispatch and a round per
+   exchange. The fix is in the translator (leonida, not mine): emit structured control flow per wave between exchange
+   points (relooper over the known segment graph), and readfirstlane/vote exchanges for values it can prove uniform.
+2. Compute: `fp_inline` + `hash_memo` apply unchanged to the library compute kernels (`lib_cs_02860..`, `02038..`,
+   28-41 ms a frame): build rows the same way (`mspeed_overlay.py` is ms/ps only today) and A/B on captured data.
+3. 283 world pixel shaders with integer-output variants (uintps rows) need the variants rebuilt with the passes.
+4. Hash lookups still cost ~19% of the probe path (one FNV + probe per T#/S#): a per-draw resolved index would remove
+   them (adapter + translator).
+
 ## Round 10, compiler-crash / mesh-fit worker (2026-11-27 04:58-05:45): the XPC crashes are a debug overlay; every world mesh pipeline builds
 
 Tree `port/build/mcc-x86_64`. Offline only: no title run of mine (single-pipeline probes and prepare_shaders; load

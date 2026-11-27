@@ -1,12 +1,17 @@
 #include "metal_present_planes.h"
 
 #include "present_dump.h"
+#include "upscale.h"
 
 #include <sys/stat.h>
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <mutex>
 #include <string>
 
 namespace leonida {
@@ -45,6 +50,178 @@ struct MetalPresenter::Dump {
     }
 };
 
+// GTA6RT_METAL_PRESENT_CHECK=1[,dir]: once the host upscaler has run (the world), plane 0 of every present is copied
+// to a shared buffer behind the present and inspected when that copy's fence completes, so the present path never
+// waits for the GPU. A present is black when under 5% of its texels have a channel >= 4, dark when its mean luma < 8.
+struct MetalPresenter::Check {
+    struct Slot {
+        std::unique_ptr<gpu::Buffer> buffer;
+        std::unique_ptr<gpu::CommandList> list;
+        std::uint32_t width = 0, height = 0, pitch = 0;
+        std::uint64_t present = 0, upscaled = 0;
+        std::atomic<bool> busy{false};
+    };
+    struct State {
+        std::mutex mutex;
+        std::string dir;
+        std::uint64_t checked = 0, black = 0, dark = 0, run = 0, longest = 0, missed = 0, dumped_black = 0, idle = 0;
+        std::array<Slot, 3> slots;
+    };
+    std::shared_ptr<State> state;
+    std::unique_ptr<gpu::Fence> fence;
+    std::uint64_t value = 0, last_upscaled = 0;
+    bool told_format = false;
+
+    static std::unique_ptr<Check> create(gpu::Device& device) {
+        const char* v = std::getenv("GTA6RT_METAL_PRESENT_CHECK");
+        if (!v || !*v || *v == '0') return nullptr;
+        auto c = std::make_unique<Check>();
+        c->state = std::make_shared<State>();
+        if (const char* comma = std::strchr(v, ',')) {
+            c->state->dir = comma + 1;
+            ::mkdir(c->state->dir.c_str(), 0755);
+        }
+        c->fence = device.create_fence(0);
+        if (!c->fence) return nullptr;
+        std::fprintf(stderr, "[rt] d3d12-metal present check: plane 0 of every world present is inspected%s%s\n",
+                     c->state->dir.empty() ? "" : "; black ones and every 20th written to ", c->state->dir.c_str());
+        return c;
+    }
+
+    static void inspect(State& s, Slot& slot) {
+        const auto* px = static_cast<const std::uint8_t*>(slot.buffer->cpu_pointer());
+        const std::uint64_t n = std::uint64_t(slot.width) * slot.height;
+        std::uint64_t lit = 0;
+        double sum[3] = {0, 0, 0};
+        for (std::uint32_t y = 0; y < slot.height; ++y) {
+            const std::uint8_t* row = px + std::size_t(y) * slot.pitch;
+            for (std::uint32_t x = 0; x < slot.width; ++x) {
+                const std::uint8_t* p = row + std::size_t(x) * 4;
+                lit += std::max({p[0], p[1], p[2]}) >= 4;
+                sum[0] += p[0], sum[1] += p[1], sum[2] += p[2];
+            }
+        }
+        const double share = n ? double(lit) / double(n) : 0.0;
+        const double m0 = sum[0] / double(n ? n : 1), m1 = sum[1] / double(n ? n : 1), m2 = sum[2] / double(n ? n : 1);
+        const double luma = 0.2126 * m0 + 0.7152 * m1 + 0.0722 * m2;
+        const bool black = share < 0.05, dark = !black && luma < 8.0;
+        std::string file;
+        {
+            std::lock_guard lock(s.mutex);
+            ++s.checked;
+            s.black += black;
+            s.dark += dark;
+            s.run = black ? 0 : s.run + 1;
+            s.longest = std::max(s.longest, s.run);
+            if (!s.dir.empty() && ((black && s.dumped_black < 8) || s.checked % 20 == 1)) {
+                s.dumped_black += black;
+                char name[80];
+                std::snprintf(name, sizeof name, "/present_check_%06llu%s.png",
+                              static_cast<unsigned long long>(slot.present), black ? "_black" : "");
+                file = s.dir + name;
+            }
+            std::fprintf(stderr,
+                         "[rt] d3d12-metal present check %llu (present %llu, upscaled %llu): %.1f%% lit, mean %.1f %.1f "
+                         "%.1f%s; non-black run %llu (longest %llu), black %llu, dark %llu, missed %llu\n",
+                         static_cast<unsigned long long>(s.checked), static_cast<unsigned long long>(slot.present),
+                         static_cast<unsigned long long>(slot.upscaled),
+                         100.0 * share, m0, m1, m2, black ? " BLACK" : dark ? " dark" : "",
+                         static_cast<unsigned long long>(s.run), static_cast<unsigned long long>(s.longest),
+                         static_cast<unsigned long long>(s.black), static_cast<unsigned long long>(s.dark),
+                         static_cast<unsigned long long>(s.missed));
+        }
+        if (!file.empty()) {
+            std::vector<std::uint8_t> rgba(std::size_t(n) * 4);
+            for (std::uint32_t y = 0; y < slot.height; ++y)
+                std::memcpy(rgba.data() + std::size_t(y) * slot.width * 4, px + std::size_t(y) * slot.pitch,
+                            std::size_t(slot.width) * 4);
+            for (std::size_t i = 3; i < rgba.size(); i += 4) rgba[i] = 255;
+            if (std::FILE* f = std::fopen(file.c_str(), "wb")) {
+                present_dump::write_png(f, VkExtent2D{slot.width, slot.height}, VK_FORMAT_R8G8B8A8_UNORM, false, rgba.data());
+                std::fclose(f);
+            }
+        }
+    }
+};
+
+void MetalPresenter::check_plane(gpu::Texture* source) {
+    if (!check_ || !source) return;
+    // A world frame is a present after which the upscaler ran again: presents with no new world render (the title's
+    // own fades and menus) are counted apart and leave the run of non-black world frames as it is.
+    const std::uint64_t upscaled = gta6rt::upscale::frames_upscaled();
+    if (!upscaled) return;
+    if (upscaled == check_->last_upscaled) {
+        std::lock_guard lock(check_->state->mutex);
+        if (++check_->state->idle <= 3 || !(check_->state->idle % 50))
+            std::fprintf(stderr, "[rt] d3d12-metal present check: present %llu has no new world render (%llu so far); not "
+                                 "counted\n",
+                         static_cast<unsigned long long>(presented_), static_cast<unsigned long long>(check_->state->idle));
+        return;
+    }
+    check_->last_upscaled = upscaled;
+    const gpu::TextureDesc& td = source->desc();
+    gpu::FormatInfo info;
+    if (!context_.gpu().describe_format(td.format, info) || info.block_bytes != 4 || info.block_dim != 1 || !td.width ||
+        !td.height) {
+        if (!check_->told_format) {
+            check_->told_format = true;
+            std::fprintf(stderr, "[rt] d3d12-metal present check: plane 0 format %u is not 4-byte texels; not checked\n",
+                         td.format);
+        }
+        return;
+    }
+    auto state = check_->state;
+    Check::Slot& slot = state->slots[check_->value % state->slots.size()];
+    if (slot.busy.exchange(true)) {
+        std::lock_guard lock(state->mutex);
+        ++state->missed;
+        return;
+    }
+    slot.width = td.width;
+    slot.height = td.height;
+    slot.pitch = td.width * 4;
+    slot.present = presented_;
+    slot.upscaled = gta6rt::upscale::frames_upscaled();
+    const std::uint64_t bytes = std::uint64_t(slot.pitch) * slot.height;
+    if (slot.buffer && slot.buffer->size() < bytes) slot.buffer.reset();
+    if (!slot.buffer || !slot.list) {
+        gpu::BufferDesc bd;
+        bd.size = bytes;
+        bd.memory = gpu::MemoryKind::shared;
+        bd.usage = gpu::usage::copy;
+        bd.label = "present check";
+        if (!slot.buffer) slot.buffer = context_.gpu().create_buffer(bd);
+        if (!slot.list) slot.list = context_.gpu().create_command_list(queue_.queue()->type());
+    }
+    if (!slot.buffer || !slot.buffer->cpu_pointer() || !slot.list) {
+        slot.busy = false;
+        return;
+    }
+    slot.list->reset();
+    gpu::BufferTextureCopy k;
+    k.buffer = slot.buffer.get();
+    k.row_pitch = slot.pitch;
+    k.texture = source;
+    k.width = slot.width;
+    k.height = slot.height;
+    slot.list->copy_texture_to_buffer(k);
+    if (slot.list->close() != gpu::Status::ok) {
+        slot.busy = false;
+        return;
+    }
+    gpu::CommandList* lists[] = {slot.list.get()};
+    if (queue_.queue()->execute(lists) != gpu::Status::ok ||
+        queue_.queue()->signal(check_->fence.get(), ++check_->value) != gpu::Status::ok) {
+        slot.busy = false;
+        return;
+    }
+    Check::Slot* sp = &slot;
+    check_->fence->on_completion(check_->value, [state, sp] {
+        Check::inspect(*state, *sp);
+        sp->busy = false;
+    });
+}
+
 MetalPresenter::MetalPresenter(MetalContext& context, MetalQueue& queue, void* layer,
                                std::function<bool(std::uint32_t&, std::uint32_t&)> extent)
     : context_(context), queue_(queue), layer_(layer), extent_(std::move(extent)), dump_(std::make_unique<Dump>()) {
@@ -59,6 +236,7 @@ MetalPresenter::MetalPresenter(MetalContext& context, MetalQueue& queue, void* l
         const std::uint32_t texel = 0xff000000u;
         black_->write_region(0, 0, 0, 0, 1, 1, &texel, 4);
     }
+    check_ = Check::create(context_.gpu());
     ensure_swapchain();
 }
 
@@ -105,6 +283,7 @@ std::int32_t MetalPresenter::submit(const gpu::PresentDesc& desc) {
         return kFail;
     }
     ++presented_;
+    check_plane(desc.planes[0].source);
     if (SceneProbe* scene = context_.scene()) scene->end_frame();
     context_.stats().presents.fetch_add(1, std::memory_order_relaxed);
     submit_phases::totals().presents.fetch_add(1, std::memory_order_relaxed);

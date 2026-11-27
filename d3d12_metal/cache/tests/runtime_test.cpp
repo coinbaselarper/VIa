@@ -1,6 +1,8 @@
 // The in-process recorder and prebuild on a real Metal device with store metallibs: a manifest's pipelines are
 // prebuilt in the background and adopted at first use, an unknown pipeline is created and its wait recorded, a
 // bootstrap name match prebuilds at creation, and the manifest written at flush merges this run into the earlier one.
+// With a second argument "cold" (GTA6RT_METAL_PCACHE_PREBUILD=cold): only the tier entry whose shader changed is
+// prebuilt; the pipelines a manifest lists under their current keys are made at their first use.
 
 #include "pcache.h"
 
@@ -30,7 +32,8 @@ static int failures = 0;
 
 int main(int argc, char** argv) {
     const std::string port = GTA6RT_PORT_ROOT;
-    const std::filesystem::path dir = argc > 1 ? argv[1] : "pcache-runtime-tmp";
+    const bool cold = argc > 2 && std::string(argv[2]) == "cold";
+    const std::filesystem::path dir = std::string(argc > 1 ? argv[1] : "pcache-runtime-tmp") + (cold ? "-cold" : "");
     std::filesystem::remove_all(dir);
     std::filesystem::create_directories(dir);
     const std::string catalog_path = port + "/build/shaderc_msl/runs/main/manifest.tsv";
@@ -51,6 +54,7 @@ int main(int argc, char** argv) {
     std::filesystem::create_directories(tier);
     ::setenv("GTA6RT_METAL_ARCHIVE_TIERS", tier.c_str(), 1);
     ::setenv("GTA6RT_METAL_PCACHE_RELEASE_S", "3", 1);
+    if (cold) ::setenv("GTA6RT_METAL_PCACHE_PREBUILD", "cold", 1);
     auto device = gta6rt::metal::create_device({});
     std::string log;
     CHECK(pc::open_archive(*device, dir.string(), "pcache runtime test", true, &log) == gpu::Status::ok);
@@ -144,14 +148,42 @@ int main(int argc, char** argv) {
         }
         return true;
     };
-    CHECK(wait_for([] { return pc::counters().prebuilt == 3; }, 60));
-
     int owner = 0;
     const auto refs = [&](auto& d) {
         d.vs = {library(vs, "vs", {}).library, "main0"};
         d.ps = {library(ps, "ps", {}).library, "main0"};
         d.root = root.get();
     };
+    if (cold) {
+        CHECK(wait_for([] { return pc::counters().prebuilt == 1; }, 60));
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+        CHECK(pc::counters().prebuilt == 1);
+        CHECK(pc::report().find("3 at first use only") != std::string::npos);
+        gpu::RenderPipelineDesc demand = blit;
+        refs(demand);
+        demand.mode = gpu::CompileMode::async;
+        demand.not_ready = gpu::NotReady::skip;
+        auto made = pc::make_render(*device, demand, &owner, vs, ps);
+        CHECK(made != nullptr);
+        CHECK(pc::counters().created == 1 && pc::counters().adopted_ready == 0);
+        CHECK(wait_for([&] { return made->state() == gpu::PipelineState::ready; }, 60));
+        gpu::RenderPipelineDesc from_tier = blit_tier;
+        refs(from_tier);
+        from_tier.mode = gpu::CompileMode::async;
+        from_tier.not_ready = gpu::NotReady::skip;
+        auto tiered = pc::make_render(*device, from_tier, &owner, vs, ps);
+        CHECK(tiered && tiered->state() == gpu::PipelineState::ready);
+        CHECK(pc::counters().adopted_ready == 1);
+        pc::flush("test");
+        pc::forget(&owner);
+        std::printf("%s\n", pc::report().c_str());
+        pc::stop();
+        std::filesystem::remove_all(tier);
+        std::printf("%s (%d failures)\n", failures ? "FAIL" : "PASS", failures);
+        return failures ? 1 : 0;
+    }
+    CHECK(wait_for([] { return pc::counters().prebuilt == 3; }, 60));
+
     gpu::RenderPipelineDesc demand = blit;
     refs(demand);
     demand.mode = gpu::CompileMode::async;

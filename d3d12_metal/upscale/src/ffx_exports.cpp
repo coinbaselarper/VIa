@@ -351,6 +351,7 @@ void patch_loader() {
 Mode selected_mode() { return g_mode; }
 gpu::Device* stage_device() { return g_device; }
 Counters& counters() { return g_counters; }
+std::uint64_t frames_upscaled() { return g_counters.ran.load(std::memory_order_relaxed); }
 
 bool frame_for(std::uint64_t id, Frame& out) {
     std::lock_guard lock(g_frames_mutex);

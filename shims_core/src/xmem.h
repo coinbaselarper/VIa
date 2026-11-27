@@ -82,6 +82,9 @@ std::uint64_t title_pool_removals(std::uint64_t since, std::vector<std::pair<std
 std::uint64_t title_pool_additions(std::uint64_t since, std::vector<std::pair<std::uint64_t, std::uint64_t>>& out);
 // The pool's host range, false when the title pool is off.
 bool title_pool_range(void** base, std::uint64_t* size);
+// Diagnostics: per 16 KiB of the pool's host range, 1 where a live physical page or a committed page of a virtual run
+// is backed, else 0 (a slot of a reservation the title never committed, a free slot). Empty when the pool is off.
+void title_pool_live_map(std::vector<std::uint8_t>& out);
 struct TitlePoolStats {
     bool on = false;
     std::uint64_t runs = 0, run_bytes = 0, runs_refused = 0, plain_commits = 0, plain_commit_bytes = 0;

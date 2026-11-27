@@ -134,6 +134,60 @@ inline PadState with_mouse(PadState s, float stick_x, float stick_y, bool left_b
     return s;
 }
 
+// Acceleration on top of the sensitivity: counts moved in dt are scaled by 1 + accel * speed / 2000 counts/s, the
+// speed term capped at 2 (so accel 0.5 doubles a fast flick and leaves slow aiming as it was). The host's deltas
+// already carry the system's pointer acceleration, so the default is 0.
+inline double mouse_accelerated(double counts, double dt, double accel) {
+    if (!(accel > 0) || !(dt > 0)) return counts;
+    double speed = std::fabs(counts) / dt / kMouseFullCountsPerSecond;
+    if (speed > 2.0) speed = 2.0;
+    return counts * (1.0 + accel * speed);
+}
+
+constexpr int kMouseToggleKey = 0x3A;  // F1 (HID usage); Escape stays the title's pause (the pad's Menu)
+
+// Mouse look as the keyboard pad sees it: accumulated deltas, the decaying stick, buttons, and the F1 pause. While
+// paused (or disabled) motion and buttons are dropped and the stick reads 0, and active() is false, which is what makes
+// the host window give the cursor back (it captures only while gta6rt_gameinput_mouse_active() is true).
+struct MouseLook {
+    bool enabled = false;
+    bool paused = false;
+    double sensitivity = 1.0;
+    double accel = 0.0;
+    float x = 0, y = 0;
+    double dx = 0, dy = 0;
+    bool left = false, right = false;
+
+    bool active() const { return enabled && !paused; }
+    void clear() { x = y = 0, dx = dy = 0, left = right = false; }
+    // A key edge from the keyboard; true when it was the toggle key (consumed).
+    bool key(int code, bool pressed) {
+        if (code != kMouseToggleKey) return false;
+        if (pressed && enabled) {
+            paused = !paused;
+            clear();
+        }
+        return true;
+    }
+    void motion(double mx, double my_up) {
+        if (!active()) return;
+        dx += mx;
+        dy += my_up;
+    }
+    bool buttons(bool l, bool r) {
+        if (!active() || (left == l && right == r)) return false;
+        left = l, right = r;
+        return true;
+    }
+    void step(double dt) {
+        if (!active()) return clear();
+        mouse_stick_step(&x, &y, mouse_accelerated(dx, dt, accel), mouse_accelerated(dy, dt, accel), dt, sensitivity);
+        dx = dy = 0;
+    }
+    bool idle() const { return x == 0 && y == 0 && dx == 0 && dy == 0; }
+    PadState apply(PadState s) const { return active() ? with_mouse(s, x, y, left, right) : s; }
+};
+
 enum class PadKind { Controller, Keyboard };
 
 constexpr uint32_t kRumbleLow = 1, kRumbleHigh = 2, kRumbleLeftTrigger = 4, kRumbleRightTrigger = 8;

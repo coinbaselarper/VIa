@@ -234,6 +234,14 @@ private:
                              static_cast<unsigned long long>(j.frame.id), why.c_str());
             counters().failed.fetch_add(1);
         }
+        static const bool probe_on = [] {
+            const char* v = std::getenv("GTA6RT_UPSCALE_PROBE");
+            return v && *v == '1';
+        }();
+        id<MTLBuffer> probe = ok && probe_on && j.motion
+                                  ? MetalUpscaler::encode_probe(cb, j.color, j.motion, j.output, in.render_w, in.render_h,
+                                                                in.output_w, in.output_h)
+                                  : nil;
         id<MTLTexture> dump_in = nil, dump_out = nil, dump_depth = nil, dump_motion = nil;
         const std::uint64_t ran = counters().ran.load() + 1;
         if (ok && !dump_dir_.empty() && (ran == dump_at_ || (dump_every_ && ran > dump_at_ && (ran - dump_at_) % dump_every_ == 0))) {
@@ -243,6 +251,7 @@ private:
             if (j.motion) dump_motion = MetalUpscaler::encode_readback(cb, j.motion, in.render_w, in.render_h);
         }
         const std::uint64_t n = j.n;
+        const bool reset = in.reset;
         const std::uint32_t slot = j.slot;
         const std::uint64_t frame = j.frame.id;
         const double budget = budget_ms_;
@@ -264,6 +273,9 @@ private:
                 counters().ran.fetch_add(1);
             }
             __atomic_store_n(&done[slot], n, __ATOMIC_RELEASE);
+            if (probe && b.status != MTLCommandBufferStatusError)
+                std::fprintf(stderr, "[upscale] probe frame %llu (n %llu, reset %d): %s\n", static_cast<unsigned long long>(frame),
+                             static_cast<unsigned long long>(n), int(reset), MetalUpscaler::probe_stats(probe).c_str());
             if (gpu > budget) {
                 const std::uint64_t k = counters().over_budget.fetch_add(1) + 1;
                 if (k <= 8 || !(k & (k - 1)))

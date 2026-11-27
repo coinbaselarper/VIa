@@ -38,6 +38,8 @@ target_link_libraries(pcache_runtime_test PRIVATE gta6rt_pcache gta6rt_pcache_ca
 target_compile_definitions(pcache_runtime_test PRIVATE GTA6RT_PORT_ROOT="${_port}")
 add_test(NAME pcache_runtime COMMAND pcache_runtime_test "${CMAKE_BINARY_DIR}/test-tmp/runtime")
 set_tests_properties(pcache_runtime PROPERTIES TIMEOUT 300)
+add_test(NAME pcache_runtime_cold COMMAND pcache_runtime_test "${CMAKE_BINARY_DIR}/test-tmp/runtime" cold)
+set_tests_properties(pcache_runtime_cold PROPERTIES TIMEOUT 300)
 
 add_executable(pcache_archive_test tests/archive_test.cpp)
 target_link_libraries(pcache_archive_test PRIVATE gta6rt_pcache gta6rt_pcache_catalog)

@@ -1045,6 +1045,11 @@ int decode_texel(std::uint32_t f, const std::uint8_t* p, float v[4]) {
     case 51: v[0] = std::max(-1.0f, float(std::int8_t(p[0])) / 127.0f), v[1] = std::max(-1.0f, float(std::int8_t(p[1])) / 127.0f);
         return 2;
     case 61: case 62: case 65: v[0] = float(p[0]) / 255.0f; return 1;
+    case 67: {
+        const float scale = std::ldexp(1.0f, int(w >> 27) - 24);
+        v[0] = float(w & 511) * scale, v[1] = float((w >> 9) & 511) * scale, v[2] = float((w >> 18) & 511) * scale;
+        return 3;
+    }
     case 42: case 57: v[0] = float(f == 42 ? w : (w & 0xffff)); return 1;
     default: return 0;
     }
@@ -1218,7 +1223,12 @@ bool SceneProbe::draw(const Target* rts, std::uint32_t count, const Target& dept
     std::uint32_t at_size = 0;
     for (std::uint32_t i = 0; i < count; ++i)
         if (rts[i].id && render_size(rts[i])) ++at_size;
+    static const std::uint32_t gbuffer_format = [] {
+        const char* v = std::getenv("GTA6RT_METAL_SCENE_GBUFFER_FORMAT");
+        return v && *v ? std::uint32_t(std::strtoul(v, nullptr, 10)) : 0u;
+    }();
     if (count >= 3 && at_size >= 3) {
+        if (gbuffer_format && rts[0].format != gbuffer_format) return copied;
         // The G-buffer is the render-size target set with the most draws this frame (a clear or a full-screen pass
         // over the same or another set draws once).
         Mrt* m = nullptr;
@@ -1319,6 +1329,19 @@ bool SceneProbe::dispatch(const char* pipeline, bool recorded, gpu::CommandList&
                      short_name(name).c_str(), hdr_.id ? target_text(hdr_).c_str() : "none", short_name(hdr_by_).c_str(),
                      gbuffer_count_, short_name(gbuffer_by_).c_str());
     bool copied = false;
+    static const bool ev_every = [] {
+        const char* v = std::getenv("GTA6RT_METAL_SCENE_EXPOSURE_EVERY");
+        return v && *v == '1';
+    }();
+    if (ev_every && exposure_target_.id)
+        if (gpu::Texture* t = resolve(exposure_target_.id)) {
+            char name[48];
+            std::snprintf(name, sizeof name, "ev_at_latch_%llu", static_cast<unsigned long long>(upscaled_frames_));
+            if (queue_readback(out, t, exposure_target_, name, false)) {
+                readbacks_.back().path.clear();
+                copied = true;
+            }
+        }
     gpu::Texture* colour = hdr_.id ? resolve(hdr_.id) : nullptr;
     if (present_mode_ && colour) {
         if (!copy_ || copy_->desc().format != hdr_.format || copy_->desc().width != hdr_.width ||
@@ -1503,6 +1526,7 @@ void SceneProbe::write_readback(Readback& r) {
                          r.name.c_str(), t.format, t.width, t.height, r.texel, r.pitch, raw.c_str());
         }
     }
+    if (r.path.empty() && r.name.compare(0, 3, "ev_") == 0) return;
     bool written = false;
     if (std::FILE* f = std::fopen(r.path.c_str(), "wb")) {
         written = present_dump::write_png(f, VkExtent2D{t.width, t.height}, VK_FORMAT_R8G8B8A8_UNORM, false, rgba.data());

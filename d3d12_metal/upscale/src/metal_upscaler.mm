@@ -65,6 +65,30 @@ kernel void up_depth_r32(depth2d<float, access::read> src [[texture(0)]],
     if (gid.x >= p.out_size.x || gid.y >= p.out_size.y) return;
     dst.write(float4(src.read(gid)), gid);
 }
+kernel void up_sanitize(texture2d<float, access::read> src [[texture(0)]],
+                        texture2d<float, access::write> dst [[texture(1)]],
+                        constant Scale& p [[buffer(0)]], uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.out_size.x || gid.y >= p.out_size.y) return;
+    float4 v = src.read(gid);
+    uint4 bits = as_type<uint4>(v);
+    bool4 bad = (bits & 0x7f800000u) == 0x7f800000u;
+    v = select(v, float4(0.0), bad);
+    dst.write(clamp(v, float4(-p.uv_scale.x), float4(p.uv_scale.x)), gid);
+}
+struct ProbeParams { uint2 grid; uint2 colour; uint2 output; };
+kernel void up_probe(texture2d<float, access::read> colour [[texture(0)]],
+                     texture2d<float, access::read> motion [[texture(1)]],
+                     texture2d<float, access::read> output [[texture(2)]],
+                     device float4* out [[buffer(0)]], constant ProbeParams& p [[buffer(1)]],
+                     uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.grid.x || gid.y >= p.grid.y) return;
+    const uint i = (gid.y * p.grid.x + gid.x) * 3u;
+    const uint2 c = (gid * p.colour + p.colour / 2u) / p.grid;
+    const uint2 o = (gid * p.output + p.output / 2u) / p.grid;
+    out[i] = colour.read(c);
+    out[i + 1] = motion.read(c);
+    out[i + 2] = output.read(o);
+}
 )MSL";
 
 struct ScaleParams {
@@ -90,11 +114,15 @@ struct MetalUpscaler::Impl {
     id<MTLDevice> device;
     Mode mode;
     Conventions conv = default_conventions();
-    id<MTLComputePipelineState> bilinear = nil, copy = nil, depth_r32 = nil;
+    id<MTLComputePipelineState> bilinear = nil, copy = nil, depth_r32 = nil, sanitize = nil;
     id<MTLFXTemporalScaler> temporal = nil;
     id<MTLFXSpatialScaler> spatial = nil;
     std::string key;
-    id<MTLTexture> depth_tmp = nil, out_tmp = nil;
+    id<MTLTexture> depth_tmp = nil, out_tmp = nil, color_clean = nil, motion_clean = nil;
+    bool sanitize_on = [] {
+        const char* v = std::getenv("GTA6RT_UPSCALE_SANITIZE");
+        return v && *v == '1';
+    }();
     bool depth_convert = false;
     bool first = true;
     std::string error;
@@ -118,7 +146,8 @@ struct MetalUpscaler::Impl {
         bilinear = make("up_bilinear");
         copy = make("up_copy");
         depth_r32 = make("up_depth_r32");
-        return bilinear && copy && depth_r32;
+        sanitize = make("up_sanitize");
+        return bilinear && copy && depth_r32 && sanitize;
     }
 
     void dispatch(id<MTLCommandBuffer> cb, id<MTLComputePipelineState> ps, id<MTLTexture> src, id<MTLTexture> dst,
@@ -273,9 +302,31 @@ struct MetalUpscaler::Impl {
             why = "no output texture MetalFX temporal can write";
             return false;
         }
-        temporal.colorTexture = in.color;
+        id<MTLTexture> color = in.color, motion = in.motion;
+        if (sanitize_on) {
+            // GTA6RT_UPSCALE_SANITIZE=1: non-finite colour and motion texels become 0 (and colour is clamped to the
+            // half range) before MetalFX sees them.
+            if (!kernels(why)) return false;
+            if (!color_clean || color_clean.width != in.render_w || color_clean.height != in.render_h ||
+                color_clean.pixelFormat != in.color.pixelFormat)
+                color_clean = make_texture(in.color.pixelFormat, in.render_w, in.render_h,
+                                           MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite);
+            if (!motion_clean || motion_clean.width != in.render_w || motion_clean.height != in.render_h ||
+                motion_clean.pixelFormat != in.motion.pixelFormat)
+                motion_clean = make_texture(in.motion.pixelFormat, in.render_w, in.render_h,
+                                            MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite);
+            if (!color_clean || !motion_clean) {
+                why = "no texture for the sanitized inputs";
+                return false;
+            }
+            dispatch(cb, sanitize, in.color, color_clean, 65504.0f, 0, in.render_w, in.render_h, "gta6rt upscale sanitize colour");
+            dispatch(cb, sanitize, in.motion, motion_clean, 65504.0f, 0, in.render_w, in.render_h, "gta6rt upscale sanitize motion");
+            color = color_clean;
+            motion = motion_clean;
+        }
+        temporal.colorTexture = color;
         temporal.depthTexture = depth;
-        temporal.motionTexture = in.motion;
+        temporal.motionTexture = motion;
         temporal.outputTexture = target;
         temporal.inputContentWidth = in.render_w;
         temporal.inputContentHeight = in.render_h;
@@ -335,6 +386,8 @@ std::uint64_t MetalUpscaler::memory_bytes() const {
     std::uint64_t n = 0;
     if (impl_->depth_tmp) n += impl_->depth_tmp.allocatedSize;
     if (impl_->out_tmp) n += impl_->out_tmp.allocatedSize;
+    if (impl_->color_clean) n += impl_->color_clean.allocatedSize;
+    if (impl_->motion_clean) n += impl_->motion_clean.allocatedSize;
     return n;
 }
 
@@ -377,6 +430,68 @@ id<MTLTexture> MetalUpscaler::encode_readback(id<MTLCommandBuffer> cb, id<MTLTex
     [enc dispatchThreads:MTLSizeMake(w, h, 1) threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
     [enc endEncoding];
     return dst;
+}
+
+id<MTLBuffer> MetalUpscaler::encode_probe(id<MTLCommandBuffer> cb, id<MTLTexture> color, id<MTLTexture> motion,
+                                          id<MTLTexture> output, std::uint32_t rw, std::uint32_t rh, std::uint32_t ow,
+                                          std::uint32_t oh) {
+    static std::mutex mu;
+    static id<MTLComputePipelineState> ps = nil;
+    id<MTLDevice> dev = cb.device;
+    {
+        std::lock_guard lock(mu);
+        if (!ps) {
+            NSError* e = nil;
+            id<MTLLibrary> lib = [dev newLibraryWithSource:[NSString stringWithUTF8String:kKernels] options:nil error:&e];
+            id<MTLFunction> fn = lib ? [lib newFunctionWithName:@"up_probe"] : nil;
+            ps = fn ? [dev newComputePipelineStateWithFunction:fn error:&e] : nil;
+            if (!ps) return nil;
+        }
+    }
+    struct {
+        std::uint32_t grid[2], colour[2], output[2];
+    } p{{kProbeW, kProbeH}, {rw, rh}, {ow, oh}};
+    id<MTLBuffer> out = [dev newBufferWithLength:std::size_t(kProbeW) * kProbeH * 3 * 16 options:MTLResourceStorageModeShared];
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    enc.label = @"gta6rt upscale probe";
+    [enc setComputePipelineState:ps];
+    [enc setTexture:color atIndex:0];
+    [enc setTexture:motion atIndex:1];
+    [enc setTexture:output atIndex:2];
+    [enc setBuffer:out offset:0 atIndex:0];
+    [enc setBytes:&p length:sizeof p atIndex:1];
+    [enc dispatchThreads:MTLSizeMake(kProbeW, kProbeH, 1) threadsPerThreadgroup:MTLSizeMake(16, 8, 1)];
+    [enc endEncoding];
+    return out;
+}
+
+std::string MetalUpscaler::probe_stats(id<MTLBuffer> b) {
+    const auto* v = static_cast<const float*>(b.contents);
+    const std::size_t n = std::size_t(kProbeW) * kProbeH;
+    std::size_t bad[3] = {0, 0, 0}, zero_out = 0;
+    double luma[2] = {0, 0}, mmax = 0;
+    for (std::size_t i = 0; i < n; ++i) {
+        const float* c = v + i * 12;
+        const float* m = c + 4;
+        const float* o = c + 8;
+        const auto finite3 = [](const float* x) { return std::isfinite(x[0]) && std::isfinite(x[1]) && std::isfinite(x[2]); };
+        if (!finite3(c)) ++bad[0];
+        else luma[0] += 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+        if (!std::isfinite(m[0]) || !std::isfinite(m[1])) ++bad[1];
+        else mmax = std::max(mmax, double(std::max(std::fabs(m[0]), std::fabs(m[1]))));
+        if (!finite3(o)) ++bad[2];
+        else {
+            luma[1] += 0.2126 * o[0] + 0.7152 * o[1] + 0.0722 * o[2];
+            zero_out += o[0] == 0 && o[1] == 0 && o[2] == 0;
+        }
+    }
+    char t[256];
+    std::snprintf(t, sizeof t,
+                  "colour non-finite %zu/%zu mean luma %.3g; motion non-finite %zu, max |mv| %.4g; output non-finite %zu, "
+                  "zero %zu, mean luma %.3g",
+                  bad[0], n, n > bad[0] ? luma[0] / double(n - bad[0]) : 0.0, bad[1], mmax, bad[2], zero_out,
+                  n > bad[2] ? luma[1] / double(n - bad[2]) : 0.0);
+    return t;
 }
 
 bool MetalUpscaler::write_png(const std::string& path, id<MTLTexture> t, std::string* stats) {

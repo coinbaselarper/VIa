@@ -26,6 +26,9 @@ void install(gpu::Device& device);
 
 bool is_marker(std::string_view label);
 
+// Frames the host upscaler has run (0 until the title's world phase starts dispatching it).
+std::uint64_t frames_upscaled();
+
 using TextureOf = std::function<gpu::Texture*(std::uintptr_t resource_id)>;
 // Replay of a marker into `out` (Metal backend). False when the frame or its textures are unknown (nothing recorded).
 bool record_metal(std::string_view label, gpu::CommandList& out, const TextureOf& texture);

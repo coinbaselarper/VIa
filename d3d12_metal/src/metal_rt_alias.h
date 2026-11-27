@@ -3,8 +3,9 @@
 // port/d3d12_metal: render targets the title keeps on the same physical memory share one placement MTLHeap (the
 // Vulkan path's rt_alias.h, d3d12_vulkan/src, for Metal). The title's slot-133 targets sit on far fewer pages than
 // their spans add up to: a console frame graph whose targets are never live at the same time. A target's title bytes
-// resolve to runs of (VM object, offset); two targets whose runs overlap by at least 64 KiB (or half the smaller)
-// alias: the console cannot keep both, so the title never has both live. Aliases may share bytes of one extent (a
+// resolve to runs of (VM object, offset); two targets whose runs share half the smaller one's bytes alias (aliases()):
+// the console cannot keep both, so the title never has both live. Targets under 256 KiB stay private (Pool::add).
+// Aliases may share bytes of one extent (a
 // placement heap); targets that do not alias never do. An extent is laid out at the first use of its first target
 // from every target registered by then; later ones go where they overlap only their aliases, else into an extent of
 // their own. Freed members stay in the layout (tombstones) so a non-alias never lands on memory whose GPU work may
@@ -120,9 +121,19 @@ inline std::uint64_t bytes(const Runs& r) {
     return n;
 }
 
+// GTA6RT_METAL_RT_ALIAS_SHARE_PCT=<p> (50 when unset; 0: the old rule, 64 KiB or half the smaller): two targets alias
+// only when they share p% of the smaller one's title bytes. A partial overlap on the console (the tail of one target on
+// the head of another) becomes a full one in the placement heap, where fit() starts aliases at the same offset.
 inline bool aliases(const Runs& a, const Runs& b) {
+    static const std::uint64_t pct = [] {
+        const char* v = std::getenv("GTA6RT_METAL_RT_ALIAS_SHARE_PCT");
+        return v && *v ? std::strtoull(v, nullptr, 10) : 50ull;
+    }();
     const std::uint64_t shared = overlap(a, b);
-    return shared && shared >= std::min<std::uint64_t>(65536, std::min(bytes(a), bytes(b)) / 2);
+    if (!shared) return false;
+    const std::uint64_t smaller = std::min(bytes(a), bytes(b));
+    if (pct) return shared * 100 >= smaller * pct;
+    return shared >= std::min<std::uint64_t>(65536, smaller / 2);
 }
 
 enum Use : int { use_read = 0, use_write = 1, use_fresh = 2, use_common = 3, use_wrote = 4 };
@@ -198,7 +209,12 @@ inline int note_use(const void* opaque, int use) {
                              w->shape, (unsigned long long)w->lo, (unsigned long long)w->hi,
                              handover ? "after " : "before any write", handover ? w->clobbered_by->shape : "");
         } else {
-            (handover ? c.loads_after_handover : c.loads_before_write).fetch_add(1, std::memory_order_relaxed);
+            const auto n = (handover ? c.loads_after_handover : c.loads_before_write).fetch_add(1, std::memory_order_relaxed);
+            if (n < 16)
+                std::fprintf(stderr, "[rt] rt-alias hazard: %s (+0x%llx..+0x%llx) loaded %s%s; not written, cleared or "
+                                     "discarded since\n",
+                             w->shape, (unsigned long long)w->lo, (unsigned long long)w->hi,
+                             handover ? "after " : "before any write", handover ? w->clobbered_by->shape : "");
         }
         action = poison() ? act_poison : !w->ever ? act_zero : act_none;
         if (action == act_poison) c.poisoned.fetch_add(1, std::memory_order_relaxed);
@@ -236,6 +252,20 @@ public:
     };
 
     void add(const void* owner, Candidate c) {
+        // GTA6RT_METAL_RT_ALIAS_MIN_KB=<n> (256 when unset; 0: every target aliases): a target under n KiB stays private. fit() puts aliases at the lowest
+        // offset, so a small target the title keeps on the tail of a big one's pages lands on that one's first bytes
+        // here (measured: the 1x1 exposure target, clobbered between PS_ResetExposure and PS_CompositeNMB).
+        static const std::uint64_t min_bytes = [] {
+            const char* v = std::getenv("GTA6RT_METAL_RT_ALIAS_MIN_KB");
+            return (v && *v ? std::strtoull(v, nullptr, 10) : 256ull) << 10;
+        }();
+        if (c.size < min_bytes) {
+            static std::atomic<int> told{0};
+            if (told.fetch_add(1, std::memory_order_relaxed) < 12)
+                std::fprintf(stderr, "[rt] rt-alias: %s (%llu KiB) under GTA6RT_METAL_RT_ALIAS_MIN_KB: private\n",
+                             c.watch ? c.watch->shape : "?", static_cast<unsigned long long>(c.size >> 10));
+            return;
+        }
         Runs runs;
         c.mapped = title_runs(c.cpu, c.span, runs);
         c.runs = std::move(runs);

@@ -1827,6 +1827,21 @@ bool title_pool_range(void** base, std::uint64_t* size) {
     return true;
 }
 
+void title_pool_live_map(std::vector<std::uint8_t>& out) {
+    constexpr uint64_t kUnit = 0x4000;
+    const std::lock_guard lock(g_mutex);
+    out.clear();
+    if (!g_entry || !g_pool.base) return;
+    out.assign(g_pool.size / kUnit, 0);
+    const auto mark = [&](uint64_t offset, uint64_t bytes) {
+        for (uint64_t u = offset / kUnit; u < (offset + bytes + kUnit - 1) / kUnit && u < out.size(); ++u) out[u] = 1;
+    };
+    for (const auto& [page, slot] : g_pages) mark((slot - 1) * kPhysicalPageSize, kPhysicalPageSize);
+    for (const auto& [base, run] : g_runs)
+        for (size_t i = 0; i < run.state.size(); ++i)
+            if (run.state[i] & kViewBit) mark((run.first_slot - 1) * kPhysicalPageSize + i * kSmallPage, kSmallPage);
+}
+
 TitlePoolStats title_pool_stats() {
     const std::lock_guard lock(g_mutex);
     TitlePoolStats s;

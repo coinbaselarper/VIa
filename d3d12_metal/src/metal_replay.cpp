@@ -13,6 +13,9 @@
 #include "vulkan_gpu_labels.h"
 #include "upscale.h"
 
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+
 #include <algorithm>
 #include <chrono>
 #include <bit>
@@ -802,6 +805,125 @@ private:
         }
         return Fate::recorded;
     }
+    // GTA6RT_METAL_CS_CAPTURE=<dir>:<label substring>[,<substring>...] (off by default): the first
+    // GTA6RT_METAL_CS_CAPTURE_MAX (4) recorded dispatches of each matching compute pipeline, 3 s apart and from
+    // GTA6RT_METAL_CS_CAPTURE_AFTER_S after the first matching dispatch, are written to <dir> as the
+    // CPU sees title memory at encode (the layer's buffers, else the title's own mapping of the VA): user data, group
+    // counts (an indirect dispatch's first record), every user-data word read as a table (up to 64 KiB) and the ranges
+    // of the buffer V#s in those tables (up to 16 MiB each, 256 MiB a capture). Input of
+    // port/shaderc_msl/tools/cspeed_ab.mm (offline A/B and timing on real inputs).
+    void cs_capture(const char* name, const std::array<std::uint32_t, 32>& user_data, std::uint32_t x, std::uint32_t y,
+                    std::uint32_t z, bool indirect) {
+        struct Config {
+            std::string dir;
+            std::vector<std::string> names;
+            int max = 4;
+        };
+        static const Config cfg = [] {
+            Config c;
+            const char* v = std::getenv("GTA6RT_METAL_CS_CAPTURE");
+            if (!v || !*v) return c;
+            std::string s = v;
+            const auto colon = s.find(':');
+            if (colon == std::string::npos) return c;
+            c.dir = s.substr(0, colon);
+            for (std::string t = s.substr(colon + 1); !t.empty();) {
+                const auto comma = t.find(',');
+                if (comma) c.names.push_back(t.substr(0, comma));
+                t = comma == std::string::npos ? "" : t.substr(comma + 1);
+            }
+            if (const char* m = std::getenv("GTA6RT_METAL_CS_CAPTURE_MAX")) c.max = std::max(1, std::atoi(m));
+            return c;
+        }();
+        if (cfg.names.empty() || !name) return;
+        const std::string label(name);
+        const auto hit = std::find_if(cfg.names.begin(), cfg.names.end(),
+                                      [&](const std::string& k) { return label.find(k) != std::string::npos; });
+        if (hit == cfg.names.end()) return;
+        static std::mutex mutex;
+        static std::unordered_map<std::string, std::pair<int, double>> taken;
+        static const double after_s = [] {
+            const char* a = std::getenv("GTA6RT_METAL_CS_CAPTURE_AFTER_S");
+            return a ? std::atof(a) : 0.0;
+        }();
+        static const auto t0 = std::chrono::steady_clock::now();
+        const double now = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        if (now < after_s) return;
+        int index = 0;
+        {
+            std::lock_guard lock(mutex);
+            auto& [n, last] = taken[*hit];
+            if (n >= cfg.max || (n && now - last < 3.0)) return;
+            index = n++;
+            last = now;
+        }
+        struct Region {
+            std::uint64_t va;
+            std::vector<std::uint8_t> bytes;
+            std::uint32_t kind;
+        };
+        std::vector<Region> regions;
+        std::set<std::uint64_t> seen;
+        std::uint64_t total = 0;
+        const auto take = [&](std::uint64_t va, std::uint64_t bytes, std::uint32_t kind) {
+            if (!seen.insert(va).second || total + bytes > (256ull << 20)) return false;
+            Region r{va, std::vector<std::uint8_t>(std::size_t(bytes)), kind};
+            mach_vm_size_t got = 0;
+            if (!read_va(va, r.bytes.data(), bytes) &&
+                (mach_vm_read_overwrite(mach_task_self(), va, bytes, mach_vm_address_t(r.bytes.data()), &got) != KERN_SUCCESS ||
+                 got != bytes)) {
+                seen.erase(va);
+                return false;
+            }
+            total += bytes;
+            regions.push_back(std::move(r));
+            return true;
+        };
+        for (std::uint32_t i = 0; i < 32; ++i) {
+            const std::uint64_t t = user_data[i] & ~3ull;
+            if (t < 0x10000) continue;
+            for (std::uint64_t n : {65536ull, 16384ull, 4096ull, 1024ull, 256ull})
+                if (take(t, n, 0)) break;
+        }
+        const std::size_t tables = regions.size();
+        for (std::size_t r = 0; r < tables; ++r) {
+            const std::vector<std::uint8_t> table = regions[r].bytes;
+            for (std::size_t at = 0; at + 16 <= table.size(); at += 16) {
+                gfx10::BufferWords bw{};
+                std::memcpy(bw.data(), table.data() + at, 16);
+                gfx10::Buffer v{};
+                if (!gfx10::decode(bw, v) || !v.num_records) continue;
+                const std::uint64_t base = std::uint64_t(std::int64_t(v.address << 16) >> 16);
+                const std::uint64_t bytes = v.stride ? std::uint64_t(v.stride) * v.num_records : v.num_records;
+                if (base < 0x10000 || !bytes || bytes > (16ull << 20)) continue;
+                take(base, (bytes + 3) & ~3ull, 1);
+            }
+        }
+        std::string file = label.substr(0, label.find(' '));
+        std::replace(file.begin(), file.end(), '/', '_');
+        file = cfg.dir + "/" + file + "_" + std::to_string(index) + ".cap";
+        std::FILE* f = std::fopen(file.c_str(), "wb");
+        if (!f) return;
+        const auto put32 = [&](std::uint32_t w) { std::fwrite(&w, 4, 1, f); };
+        std::fwrite("CSCAP001", 1, 8, f);
+        put32(std::uint32_t(label.size()));
+        std::fwrite(label.data(), 1, label.size(), f);
+        put32(x), put32(y), put32(z), put32(indirect);
+        std::fwrite(user_data.data(), 4, 32, f);
+        put32(std::uint32_t(regions.size()));
+        for (const Region& r : regions) {
+            std::fwrite(&r.va, 8, 1, f);
+            const std::uint64_t n = r.bytes.size();
+            std::fwrite(&n, 8, 1, f);
+            put32(r.kind);
+            std::fwrite(r.bytes.data(), 1, r.bytes.size(), f);
+        }
+        std::fclose(f);
+        std::fprintf(stderr, "[rt] d3d12-metal: cs capture %s: %ux%ux%u%s, %zu tables, %zu buffers, %.1f MiB\n",
+                     file.c_str(), x, y, z, indirect ? " (indirect, first record)" : "", tables, regions.size() - tables,
+                     double(total) / 1048576.0);
+    }
+
     void record(const Dispatch& c) {
         auto& st = context_.stats();
         MetalComputePipeline p;
@@ -818,6 +940,7 @@ private:
         }
         context_.note_work(Work::dispatch, Fate::recorded);
         if (MetalContext::census_on()) context_.note_census(p.name, "dispatch");
+        cs_capture(p.name, c.user_data, c.x, c.y, c.z, false);
         set_compute(p, c.user_data);
         out_.dispatch(c.x, c.y, c.z);
         st.dispatches.fetch_add(1, std::memory_order_relaxed);
@@ -849,6 +972,11 @@ private:
             return unsupported("ExecuteIndirect with an unknown argument or count buffer");
         }
         context_.note_work(Work::indirect_dispatch, Fate::recorded);
+        static const bool capture_on = std::getenv("GTA6RT_METAL_CS_CAPTURE") != nullptr;
+        if (const MetalBinding* ab = capture_on ? binding(c.argument_buffer, false) : nullptr; ab && ab->va) {
+            std::uint32_t g[3] = {};
+            if (read_va(ab->va + c.argument_offset, g, sizeof g)) cs_capture(p.name, c.user_data, g[0], g[1], g[2], true);
+        }
         set_compute(p, c.user_data);
         out_.execute_indirect(d);
         st.dispatches.fetch_add(1, std::memory_order_relaxed);
@@ -1035,11 +1163,29 @@ private:
         if (draw.viewports) unsupported("more than one viewport or scissor (the first is used)");
         return Fate::recorded;
     }
+    // GTA6RT_METAL_SKIP_DRAWS=<part of a pipeline name>[,...]: such draws are skipped (diagnostic bisection).
+    static bool skipped_by_name(const char* name) {
+        static const std::vector<std::string> parts = [] {
+            std::vector<std::string> out;
+            const char* v = std::getenv("GTA6RT_METAL_SKIP_DRAWS");
+            for (std::string s = v ? v : ""; !s.empty();) {
+                const auto comma = s.find(',');
+                if (comma) out.push_back(s.substr(0, comma));
+                s = comma == std::string::npos ? "" : s.substr(comma + 1);
+            }
+            return out;
+        }();
+        if (parts.empty() || !name) return false;
+        for (const std::string& part : parts)
+            if (std::strstr(name, part.c_str())) return true;
+        return false;
+    }
     void record(const Draw& draw) {
         auto& st = context_.stats();
         MetalGraphicsPipeline p;
         const char* why = nullptr;
         Fate f = graphics(draw, p, why);
+        if (f == Fate::recorded && skipped_by_name(p.name)) f = Fate::not_implemented, why = "GTA6RT_METAL_SKIP_DRAWS";
         if (f == Fate::recorded) f = bind_draw_state(draw, p, why);
         context_.note_work(work_of(draw, p, false), f, why);
         scene_draw(draw, p.name, work_of(draw, p, false), f == Fate::recorded);
@@ -1070,6 +1216,7 @@ private:
         MetalGraphicsPipeline p;
         const char* why = nullptr;
         Fate f = graphics(draw, p, why);
+        if (f == Fate::recorded && skipped_by_name(p.name)) f = Fate::not_implemented, why = "GTA6RT_METAL_SKIP_DRAWS";
         const Work work = work_of(draw, p, true);
         if (f == Fate::recorded)
             f = guard(a.argument_buffer, a.argument_offset, std::uint64_t(a.stride) * a.max_count, a.count_buffer,

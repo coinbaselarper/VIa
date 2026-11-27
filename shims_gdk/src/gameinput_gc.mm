@@ -364,15 +364,14 @@ private:
     void push_keyboard() {
         mac::KeySet keys;
         uint64_t handle;
-        float mx, my;
-        bool left, right;
+        mac::MouseLook look;
         {
             std::lock_guard lock(mu_);
             keys = keys_;
             handle = keyboard_handle_;
-            mx = mouse_x_, my = mouse_y_, left = mouse_left_, right = mouse_right_;
+            look = mouse_;
         }
-        if (handle) sink_->state(handle, mac::with_mouse(mac::pad_state_from_keys(keys), mx, my, left, right), false);
+        if (handle) sink_->state(handle, look.apply(mac::pad_state_from_keys(keys)), false);
     }
 
     void mouse_tick() {
@@ -382,9 +381,8 @@ private:
             std::lock_guard lock(mu_);
             const double dt = mouse_last_ns_ ? double(now - mouse_last_ns_) * 1e-9 : kMouseTickSeconds;
             mouse_last_ns_ = now;
-            mac::mouse_stick_step(&mouse_x_, &mouse_y_, mouse_dx_, mouse_dy_, dt, mouse_sensitivity_);
-            mouse_dx_ = mouse_dy_ = 0;
-            idle = mouse_x_ == 0 && mouse_y_ == 0;
+            mouse_.step(dt);
+            idle = mouse_.idle();
             if (idle && mouse_timer_) {
                 dispatch_source_cancel(mouse_timer_);
                 mouse_timer_ = nil;
@@ -406,28 +404,25 @@ private:
     }
 
 public:
-    bool mouse_enabled() const { return mouse_mode_ != 0; }
+    bool mouse_enabled() const { return mouse_.enabled; }
 
     bool mouse_active() {
         std::lock_guard lock(mu_);
-        return mouse_mode_ != 0 && keyboard_handle_ != 0;
+        return mouse_.active() && keyboard_handle_ != 0;
     }
 
     void mouse_motion(double dx, double dy_up) {
         if (!(dx != 0 || dy_up != 0)) return;
         std::lock_guard lock(mu_);
-        if (mouse_mode_ == 0 || !keyboard_handle_) return;
-        mouse_dx_ += dx;
-        mouse_dy_ += dy_up;
+        if (!mouse_.active() || !keyboard_handle_) return;
+        mouse_.motion(dx, dy_up);
         ensure_mouse_timer();
     }
 
     void mouse_buttons(bool left, bool right) {
         {
             std::lock_guard lock(mu_);
-            if (mouse_mode_ == 0 || !keyboard_handle_ || (mouse_left_ == left && mouse_right_ == right)) return;
-            mouse_left_ = left;
-            mouse_right_ = right;
+            if (!keyboard_handle_ || !mouse_.buttons(left, right)) return;
         }
         push_keyboard();
     }
@@ -435,9 +430,7 @@ public:
     void mouse_release() {
         {
             std::lock_guard lock(mu_);
-            mouse_x_ = mouse_y_ = 0;
-            mouse_dx_ = mouse_dy_ = 0;
-            mouse_left_ = mouse_right_ = false;
+            mouse_.clear();
             if (mouse_timer_) dispatch_source_cancel(mouse_timer_);
             mouse_timer_ = nil;
             mouse_last_ns_ = 0;
@@ -472,10 +465,20 @@ private:
         keyboard.handlerQueue = queue_;
         input.keyChangedHandler = ^(GCKeyboardInput*, GCControllerButtonInput*, GCKeyCode code, BOOL pressed) {
             if (code < 0 || code >= 256) return;
+            bool toggled = false;
             {
                 std::lock_guard lock(mu_);
-                keys_.set(static_cast<size_t>(code), pressed);
+                const bool was = mouse_.paused;
+                if (mouse_.key(int(code), pressed)) {
+                    toggled = was != mouse_.paused;
+                    if (toggled && mouse_timer_) dispatch_source_cancel(mouse_timer_), mouse_timer_ = nil, mouse_last_ns_ = 0;
+                } else {
+                    keys_.set(static_cast<size_t>(code), pressed);
+                }
             }
+            if (toggled)
+                std::fprintf(stderr, "[rt] gameinput: F1: mouse look %s\n",
+                             mouse_paused() ? "paused (cursor released)" : "resumed (cursor captured on focus)");
             push_keyboard();
         };
         push_keyboard();
@@ -502,24 +505,35 @@ private:
     bool keyboard_ok_ = true;
     mac::KeySet keys_;
     static constexpr double kMouseTickSeconds = 0.005;
-    int mouse_mode_ = 1;
-    double mouse_sensitivity_ = 1.0;
-    float mouse_x_ = 0, mouse_y_ = 0;
-    double mouse_dx_ = 0, mouse_dy_ = 0;
-    bool mouse_left_ = false, mouse_right_ = false;
+    mac::MouseLook mouse_;
     dispatch_source_t mouse_timer_ = nil;
     uint64_t mouse_last_ns_ = 0;
+
+    bool mouse_paused() {
+        std::lock_guard lock(mu_);
+        return mouse_.paused;
+    }
+
+    static double env_number(const char* name, double fallback, double lo, double hi) {
+        const char* s = std::getenv(name);
+        if (!s) return fallback;
+        char* end = nullptr;
+        const double v = std::strtod(s, &end);
+        if (end != s && !*end && v >= lo && v < hi) return v;
+        std::fprintf(stderr, "[rt] gameinput: %s=%s is not a number in [%g, %g); using %g\n", name, s, lo, hi, fallback);
+        return fallback;
+    }
 
 public:
     void configure_mouse() {
         const char* mode = std::getenv("GTA6RT_MOUSE");
-        if (!(mode && (!std::strcmp(mode, "on") || !std::strcmp(mode, "capture") || !std::strcmp(mode, "1")))) mouse_mode_ = 0;
-        if (const char* sens = std::getenv("GTA6RT_MOUSE_SENSITIVITY")) {
-            char* end = nullptr;
-            const double v = std::strtod(sens, &end);
-            if (end != sens && !*end && v > 0 && v < 100) mouse_sensitivity_ = v;
-            else std::fprintf(stderr, "[rt] gameinput: GTA6RT_MOUSE_SENSITIVITY=%s is not a number in (0, 100); using 1\n", sens);
-        }
+        mouse_.enabled = mode && (!std::strcmp(mode, "on") || !std::strcmp(mode, "capture") || !std::strcmp(mode, "1"));
+        mouse_.sensitivity = env_number("GTA6RT_MOUSE_SENSITIVITY", 1.0, 0.01, 100);
+        mouse_.accel = env_number("GTA6RT_MOUSE_ACCEL", 0.0, 0, 10);
+        if (mouse_.enabled)
+            std::fprintf(stderr, "[rt] gameinput: mouse look on (right stick, sensitivity %g, acceleration %g; left button "
+                                 "= right trigger, right button = left trigger; F1 pauses/resumes and releases the cursor)\n",
+                         mouse_.sensitivity, mouse_.accel);
     }
 };
 

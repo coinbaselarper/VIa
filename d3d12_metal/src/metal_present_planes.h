@@ -70,6 +70,9 @@ private:
     std::uint64_t presented_ = 0, composed_ = 0;
     struct Dump;
     std::unique_ptr<Dump> dump_;
+    struct Check;
+    std::unique_ptr<Check> check_;
+    void check_plane(gpu::Texture* source);
 };
 
 }  // namespace leonida

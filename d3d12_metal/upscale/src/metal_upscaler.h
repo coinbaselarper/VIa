@@ -46,6 +46,13 @@ public:
     // once `cb` completed (x / (1 + x), gamma 2.2: the dumps compare inputs and outputs, not the title's grading).
     static id<MTLTexture> encode_readback(id<MTLCommandBuffer> cb, id<MTLTexture> src, std::uint32_t w, std::uint32_t h);
     static bool write_png(const std::string& path, id<MTLTexture> rgba32f, std::string* stats = nullptr);
+    // GTA6RT_UPSCALE_PROBE: colour, motion (render size) and output sampled on a kProbeW x kProbeH grid into a shared
+    // buffer encoded into `cb`; probe_stats() reads it once `cb` completed.
+    static constexpr std::uint32_t kProbeW = 160, kProbeH = 90;
+    static id<MTLBuffer> encode_probe(id<MTLCommandBuffer> cb, id<MTLTexture> color, id<MTLTexture> motion,
+                                      id<MTLTexture> output, std::uint32_t rw, std::uint32_t rh, std::uint32_t ow,
+                                      std::uint32_t oh);
+    static std::string probe_stats(id<MTLBuffer> probe);
 
 private:
     struct Impl;
