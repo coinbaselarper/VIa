@@ -11,6 +11,7 @@
 #include "pipeline_workers.h"
 #include "queue_holds.h"
 #include "resource_tiling.h"
+#include "submission_marks.h"
 #include "submit_phases.h"
 #include "title_va_alias.h"
 #include "uav_clear.h"
@@ -177,8 +178,10 @@ public:
     }
     gpu::Buffer* arena_buffer() const { return arena_buffer_; }
     std::uint64_t arena_va() const { return arena_va_; }
-    void set_table(std::uint32_t binding, gpu::DescriptorHeap* table) { tables_[binding] = table; }
-    gpu::DescriptorHeap* table(std::uint32_t binding) const { return tables_[binding]; }
+    void set_table(std::uint32_t binding, gpu::DescriptorHeap* table) {
+        tables_[binding].store(table, std::memory_order_release);
+    }
+    gpu::DescriptorHeap* table(std::uint32_t binding) const { return tables_[binding].load(std::memory_order_acquire); }
 
     // Hooks the device installs, as on the Vulkan path (VulkanContext::set_before_execute and the others).
     void set_before_execute(std::function<void()> fn) { before_execute_ = std::move(fn); }
@@ -273,9 +276,14 @@ public:
     // The latest progress value each queue signalled, so a present (on its own queue) waits for the work before it.
     void note_submitted(gpu::Fence* progress, std::uint64_t value);
     void forget_queue(gpu::Fence* progress);
+    // With the values in-flight submissions will signal (submission_marks.h): for retiring what they may use.
     std::vector<std::pair<gpu::Fence*, std::uint64_t>> submitted() const;
+    std::vector<std::pair<gpu::Fence*, std::uint64_t>> submitted_only() const;
+    void begin_in_flight(gpu::Fence* progress, std::uint64_t value);
+    void end_in_flight(gpu::Fence* progress);
     // Every queue of `marks` that still exists has completed its value (a queue that went counts as done).
     bool reached(const std::vector<std::pair<gpu::Fence*, std::uint64_t>>& marks) const;
+    const SubmissionMarks<gpu::Fence*>& marks() const { return marks_; }
 
     // Null unless a scene switch is set (SceneProbe).
     SceneProbe* scene() const { return scene_.get(); }
@@ -312,7 +320,7 @@ private:
     const gpu::RootLayout* root_ = nullptr;
     std::uint64_t heap_base_ = 0, arena_va_ = 0, arena_size_ = 0;
     gpu::Buffer* arena_buffer_ = nullptr;
-    std::array<gpu::DescriptorHeap*, bindless::binding_count> tables_{};
+    std::array<std::atomic<gpu::DescriptorHeap*>, bindless::binding_count> tables_{};
     std::function<void()> before_execute_;
     TableScanner table_scanner_;
     std::function<bool(std::uint64_t, std::uint32_t)> sample_table_;
@@ -348,8 +356,7 @@ private:
     std::uint64_t unproduced_widest_ = 0;
     std::atomic<std::uint64_t> guard_passes_{0}, guard_tables_{0}, guard_pointers_{0}, guard_blind_{0};
     std::array<std::uint64_t, 4> guard_seen_{};
-    mutable std::mutex submitted_mutex_;
-    std::map<gpu::Fence*, std::uint64_t> submitted_;
+    SubmissionMarks<gpu::Fence*> marks_;
     std::unique_ptr<SceneProbe> scene_;
     std::unique_ptr<GpuDebug> gpu_debug_;
     std::function<bool(std::uint64_t, std::uint64_t&)> console_source_;
@@ -408,7 +415,7 @@ public:
     };
     using Resolve = std::function<gpu::Texture*(ResourceId)>;
     static std::unique_ptr<SceneProbe> create(MetalContext& context);
-    explicit SceneProbe(MetalContext& context);
+    explicit SceneProbe(MetalContext& context, bool check_only = false);
     ~SceneProbe();
 
     // True when copies were recorded into `out` before this draw (the caller binds its render targets again).
@@ -420,6 +427,11 @@ public:
     // The colour to show this present (null: none) and its exposure; the mode (0 off, 1 under the UI, 2 alone).
     gpu::Texture* present_source(float& exposure);
     int present_mode() const { return present_mode_; }
+    bool check_armed() const { return check_armed_.load(std::memory_order_acquire); }
+    // While the G-buffer check's frame is recorded: where one indirect draw's first argument record (16 bytes) and
+    // count word (+16) go; false when the census is full or the frame is over.
+    bool check_args_slot(const char* pipeline, bool mesh, bool has_count, std::uint32_t max_count, gpu::Buffer*& buffer,
+                         std::uint64_t& offset);
     std::uint64_t upscaled_frames() {
         std::lock_guard lock(mutex_);
         return upscaled_frames_;
@@ -493,6 +505,28 @@ private:
     std::unique_ptr<gpu::Buffer> albedo_buf_[2];
     Target albedo_target_[2];
     std::chrono::steady_clock::time_point created_ = std::chrono::steady_clock::now();
+    // GTA6RT_METAL_GBUFFER_CHECK=<s> (default 10, 0: off), in every run: the frame s seconds after the first upscaled
+    // one reads back RT0 of its main G-buffer pass (the render-size pass of 4+ targets with the most draws) and logs
+    // its coverage with a verdict. Without other scene switches the probe does nothing else.
+    static double check_seconds();
+    void check_boundary(gpu::CommandList& out, const Resolve& resolve, bool& copied);
+    void check_report();
+    bool check_only_ = false;
+    double check_after_s_ = 0;
+    std::atomic<bool> check_armed_{false};
+    bool check_done_ = false, check_started_ = false;
+    std::chrono::steady_clock::time_point first_latch_{};
+    std::uint64_t check_frame_ = 0, check_upscaled_ = 0, check_best_calls_ = 0, check_passes_ = 0;
+    std::string check_best_first_, check_best_last_;
+    std::vector<Readback> check_reads_;
+    struct ArgNote {
+        std::string name;
+        bool mesh = false, count = false;
+        std::uint32_t max_count = 0;
+    };
+    std::unique_ptr<gpu::Buffer> check_args_;
+    std::vector<ArgNote> check_arg_notes_;
+    void check_args_report();
 };
 
 // Replays one closed IR list into `out` (ADAPTER.md section 4). Commands the backend cannot do yet are counted and

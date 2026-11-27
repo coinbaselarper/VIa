@@ -6455,6 +6455,21 @@ struct DeviceState {
         }();
         return on;
     }
+    // GTA6RT_METAL_STENCIL_VIEW (on; =0 off): a T# of the stencil format (8_UINT) on a depth-stencil texture, the
+    // title's own or a plane-1 SRV's, is viewed as the texture's stencil (X32_Stencil8, stencil byte in R, placed by
+    // the T#'s swizzle). Off, the view is the texture's own Depth32Float_Stencil8 format, which reads the depth plane:
+    // a uint read of it gave the G-buffer fixup kernel random "2-G-buffer" classes (1/16 of all pixels).
+    static bool stencil_view_on() {
+        static const bool on = [] {
+            const char* v = std::getenv("GTA6RT_METAL_STENCIL_VIEW");
+            return !v || std::strcmp(v, "0") != 0;
+        }();
+        return on;
+    }
+    static constexpr VkFormat kStencilView = VK_FORMAT_S8_UINT;
+    std::atomic<std::uint64_t> stencil_views_made{0}, stencil_views_refused{0}, depth_plane_views_made{0};
+    std::atomic<std::uint64_t> stencil_tsharps_as_depth{0};
+    std::atomic<std::uint64_t> depth_uav_requests[2]{};
     struct SharedView {
         std::uint32_t index = 0;
         std::shared_ptr<leonida::gpu::Texture> sampled, storage;
@@ -6620,7 +6635,8 @@ struct DeviceState {
                                                      const leonida::gfx10::ImageWords& words) {
         namespace g = leonida::gfx10;
         leonida::gpu::TextureViewDesc d;
-        d.format = metal_format(view_format);
+        const bool stencil_view = view_format == kStencilView;
+        d.format = stencil_view ? DXGI_FORMAT_X32_TYPELESS_G8X24_UINT : metal_format(view_format);
         if (!d.format) {
             log_once("no Metal format for a view's Vulkan format", int(view_format));
             return nullptr;
@@ -6676,6 +6692,8 @@ struct DeviceState {
         }
         std::string error;
         auto view = gpu->create_texture_view(texture, d, &error);
+        if (stencil_view) (view ? stencil_views_made : stencil_views_refused).fetch_add(1, std::memory_order_relaxed);
+        else if (view && (aspects & VK_IMAGE_ASPECT_DEPTH_BIT)) depth_plane_views_made.fetch_add(1, std::memory_order_relaxed);
         if (!view) {
             if (first_diagnostic("texture view refused by Metal", int(view_format)))
                 std::fprintf(stderr, "[rt] d3d12-metal: texture view refused (Vulkan format %d, type %d): %s\n",
@@ -6749,6 +6767,11 @@ struct DeviceState {
         default:
             log_once("set 0 has no array for this image type:", int(image.type));
             return false;
+        }
+        if (!storage && (aspects & VK_IMAGE_ASPECT_STENCIL_BIT) && image.format == g::stencil_format &&
+            g::is_depth_stencil_format(view_format)) {
+            if (stencil_view_on()) view_format = channels_format = kStencilView;
+            else stencil_tsharps_as_depth.fetch_add(1, std::memory_order_relaxed);
         }
         const bool depth_or_stencil = (aspects & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) != 0;
         if (storage && depth_or_stencil) {
@@ -12513,6 +12536,16 @@ public:
                 std::fprintf(stderr, "[rt] d3d12-metal: bindless: %llu images live, %llu refused (an index array was full)\n",
                              static_cast<unsigned long long>(bs.images), static_cast<unsigned long long>(bs.full));
             }
+            std::fprintf(stderr, "[rt] d3d12-metal: depth-stencil views: stencil %llu made, %llu refused, %llu stencil T#s "
+                                 "viewed as depth (%s); depth plane %llu made; UAVs asked of depth-stencil textures: depth "
+                                 "plane %llu, stencil plane %llu\n",
+                         static_cast<unsigned long long>(state_.stencil_views_made.load(std::memory_order_relaxed)),
+                         static_cast<unsigned long long>(state_.stencil_views_refused.load(std::memory_order_relaxed)),
+                         static_cast<unsigned long long>(state_.stencil_tsharps_as_depth.load(std::memory_order_relaxed)),
+                         DeviceState::stencil_view_on() ? "GTA6RT_METAL_STENCIL_VIEW on" : "GTA6RT_METAL_STENCIL_VIEW off",
+                         static_cast<unsigned long long>(state_.depth_plane_views_made.load(std::memory_order_relaxed)),
+                         static_cast<unsigned long long>(state_.depth_uav_requests[0].load(std::memory_order_relaxed)),
+                         static_cast<unsigned long long>(state_.depth_uav_requests[1].load(std::memory_order_relaxed)));
         }
         inside.reset();
         lock.unlock();
@@ -16320,6 +16353,25 @@ public:
             return;
         }
         const bool depth_uav = r->depth_stencil_uav(0) != nullptr;
+        if (r->aspects() & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) {
+            const UINT plane = !desc ? 0
+                               : desc->ViewDimension == D3D12_UAV_DIMENSION_TEXTURE2D      ? desc->Texture2D.PlaneSlice
+                               : desc->ViewDimension == D3D12_UAV_DIMENSION_TEXTURE2DARRAY ? desc->Texture2DArray.PlaneSlice
+                                                                                           : 0;
+            const std::uint64_t n = state_.depth_uav_requests[plane ? 1 : 0].fetch_add(1, std::memory_order_relaxed);
+            const D3D12_RESOURCE_DESC& rd = r->desc();
+            static std::mutex seen_mutex;
+            static std::set<std::tuple<int, int, UINT, std::uint64_t, UINT>> seen;
+            std::lock_guard seen_lock(seen_mutex);
+            if (seen.size() < 24 &&
+                seen.insert({int(rd.Format), desc ? int(desc->Format) : -1, plane, rd.Width, rd.Height}).second)
+                std::fprintf(stderr, "[rt] d3d12-metal: UAV asked of a depth-stencil texture (#%llu of plane %u): texture DXGI "
+                                     "%d %llux%u layers %u flags 0x%x, view format %d dimension %d, image 0x%llx\n",
+                             static_cast<unsigned long long>(n + 1), plane, int(rd.Format),
+                             static_cast<unsigned long long>(rd.Width), rd.Height, unsigned(rd.DepthOrArraySize),
+                             unsigned(rd.Flags), desc ? int(desc->Format) : -1, desc ? int(desc->ViewDimension) : -1,
+                             static_cast<unsigned long long>(r->image_address()));
+        }
         if (!depth_uav && !(r->desc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) {
             log_once("unordered-access view of a texture created without ALLOW_UNORDERED_ACCESS; flags",
                      int(r->desc().Flags));

@@ -4,6 +4,7 @@
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
 #include <pthread.h>
+#include <sys/stat.h>
 #include <sys/sysctl.h>
 #include <sys/time.h>
 #include <unistd.h>
@@ -811,6 +812,9 @@ private:
     double budget_ms_ = 0, report_s_ = 10, abort_ms_ = 0;
     std::uint64_t over_ = 0;
 };
+int budget_cb_window();
+void budget_cb_done(int window, const std::string& queue, const void* key, std::uint64_t serial, id<MTLCommandBuffer> done,
+                    const std::string& summary, double encoded_at, double held_ms);
 }  // namespace
 
 static const char* encoder_state_name(MTLCommandEncoderErrorState s) {
@@ -844,7 +848,11 @@ void MetalQueue::end_command_buffer(id<MTLCommandBuffer> cb, std::span<const Eve
     const std::string queue_label = queue_.label ? queue_.label.UTF8String : "queue";
     MetalDevice* device = device_;
     auto held_ms = std::make_shared<double>(0.0);
+    const int budget_window = budget_cb_window();
+    const double encoded_at = budget_window >= 0 ? CACurrentMediaTime() : 0.0;
     [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+      if (budget_window >= 0)
+          budget_cb_done(budget_window, queue_label, queue_key, serial, done, summary, encoded_at, *held_ms);
       const double gpu = done.GPUStartTime > 0 && done.GPUEndTime > done.GPUStartTime ? done.GPUEndTime - done.GPUStartTime : 0;
       if (in_flight->on()) in_flight->completed(queue_key, serial, gpu * 1000.0);
       GpuTime::get().add(device, queue_key, queue_label, done.GPUStartTime, done.GPUEndTime, *held_ms);
@@ -1353,6 +1361,10 @@ private:
 // GTA6RT_METAL_PASS_TIMING_TSV=<file>: one line per timed encoder as well. GTA6RT_METAL_PASS_TIMING_SERIAL=0: no waits.
 // GTA6RT_METAL_PASS_TIMING_SPLIT=1: in the window an implicit render pass also ends where the pipeline changes, so each
 // segment is one pipeline's draws (each split adds a load and a store of the attachments); =2: from the second window.
+// GTA6RT_METAL_PASS_TIMING_MODES=<b|s|p>...: window k takes mode k % length (b: no waits, no splits, every command
+// buffer of every queue in <TSV>.cb, with clock calibration rows; s: waits, render passes (explicit ones too) split at
+// pipeline changes and compute encoders at kernel changes; p: waits).
+// GTA6RT_METAL_PASS_TIMING_TRIGGER=<file>: the start counts from when that file exists.
 class PassTiming {
 public:
     static constexpr std::uint32_t kSamples = 4096;
@@ -1361,11 +1373,44 @@ public:
         return *t;
     }
     bool on() const { return on_; }
-    bool serial() const { return serial_; }
-    bool split() const { return split_ == 1 || (split_ == 2 && windows_ > 0); }
+    char mode() const { return modes_.empty() ? 0 : modes_[std::size_t(windows_.load()) % modes_.size()]; }
+    bool serial() const {
+        const char m = mode();
+        return m ? m == 's' || m == 'p' : serial_;
+    }
+    bool split() const {
+        const char m = mode();
+        return m ? m == 's' : split_ == 1 || (split_ == 2 && windows_ > 0);
+    }
+    int cb_window() {
+        if (!on_ || !cb_tsv_) return -1;
+        std::lock_guard lock(mutex_);
+        if (open_) return windows_;
+        return CACurrentMediaTime() < tail_until_ ? windows_ - 1 : -1;
+    }
+    void cb_done(int window, const std::string& queue, const void* key, std::uint64_t serial, id<MTLCommandBuffer> done,
+                 const std::string& summary, double encoded_at, double held_ms) {
+        std::string s = summary.substr(0, 200);
+        for (char& c : s)
+            if (c == '\t' || c == '\n') c = ' ';
+        std::lock_guard lock(mutex_);
+        calibrate_locked();
+        std::fprintf(cb_tsv_, "cb\t%d\t%s\t%p\t%llu\t%.9f\t%.9f\t%.9f\t%.9f\t%d\t%s\t%.9f\t%.4f\n", window, queue.c_str(),
+                     key, (unsigned long long)serial, done.kernelStartTime, done.kernelEndTime, done.GPUStartTime,
+                     done.GPUEndTime, int(done.status), s.c_str(), encoded_at, held_ms);
+    }
     bool begin_command_buffer(MetalDevice* device) {
         const double now = CACurrentMediaTime() - t0_;
         std::lock_guard lock(mutex_);
+        if (!trigger_.empty()) {
+            if (now - trigger_checked_ < 0.5) return false;
+            trigger_checked_ = now;
+            struct stat st {};
+            if (::stat(trigger_.c_str(), &st) != 0) return false;
+            log("pass timing: %s exists at %.1f s; first window %.1f s later", trigger_.c_str(), now, start_);
+            start_ += now;
+            trigger_.clear();
+        }
         if (done_ || closed_ || now < start_) return false;
         if (!open_) {
             open_ = true;
@@ -1384,53 +1429,90 @@ public:
         ++command_buffers_;
         return true;
     }
-    // Buffers are reused: a sample a stage did not take this time keeps an older value, which is never above the
-    // largest value the buffer held when it was last resolved, so those are read as missing.
-    id<MTLCounterSampleBuffer> take_buffer(MetalDevice* d, std::uint64_t* high) {
-        {
-            std::lock_guard lock(mutex_);
-            if (!pool_.empty()) {
-                id<MTLCounterSampleBuffer> b = pool_.back().first;
-                *high = pool_.back().second;
-                pool_.pop_back();
-                return b;
+    // Metal gives a process at most 32 counter sample buffers (measured), so command buffers share "slabs": each takes
+    // ranges of the current slab, and a slab goes back to the pool once every command buffer that took from it is done.
+    // A sample a stage did not take keeps an older value, never above the largest value the slab held when it last went
+    // back to the pool, so those are read as missing.
+    struct Slab {
+        id<MTLCounterSampleBuffer> buf = nil;
+        std::uint64_t high = 0, top = 0;
+        std::uint32_t used = 0, users = 0;
+    };
+    struct Chunk {
+        Slab* slab = nullptr;
+        std::uint32_t local = 0, count = 0, virt = 0;
+        std::uint64_t high = 0;
+    };
+    bool take(MetalDevice* d, std::uint32_t n, std::vector<Chunk>& chunks, std::uint32_t virt, std::uint32_t* local) {
+        std::lock_guard lock(mutex_);
+        if (!cur_ || cur_->used + n > kSamples) {
+            if (cur_ && !cur_->users) {
+                cur_->high = cur_->top;
+                free_.push_back(cur_);
             }
+            cur_ = nullptr;
+            if (!free_.empty()) {
+                cur_ = free_.back();
+                free_.pop_back();
+            } else {
+                MTLCounterSampleBufferDescriptor* sd = [MTLCounterSampleBufferDescriptor new];
+                sd.counterSet = d->timestamp_counters();
+                sd.sampleCount = kSamples;
+                sd.storageMode = MTLStorageModeShared;
+                NSError* e = nil;
+                id<MTLCounterSampleBuffer> b = [d->mtl() newCounterSampleBufferWithDescriptor:sd error:&e];
+                if (!b) {
+                    if (failures_.fetch_add(1) < 4) log("pass timing: %s", e.localizedDescription.UTF8String);
+                    return false;
+                }
+                cur_ = new Slab;
+                cur_->buf = b;
+            }
+            cur_->used = 0;
         }
-        *high = 0;
-        MTLCounterSampleBufferDescriptor* sd = [MTLCounterSampleBufferDescriptor new];
-        sd.counterSet = d->timestamp_counters();
-        sd.sampleCount = kSamples;
-        sd.storageMode = MTLStorageModeShared;
-        NSError* e = nil;
-        id<MTLCounterSampleBuffer> b = [d->mtl() newCounterSampleBufferWithDescriptor:sd error:&e];
-        if (!b && failures_.fetch_add(1) < 4) log("pass timing: %s", e.localizedDescription.UTF8String);
-        return b;
+        Slab* sl = cur_;
+        *local = sl->used;
+        sl->used += n;
+        if (!chunks.empty() && chunks.back().slab == sl && chunks.back().local + chunks.back().count == *local &&
+            chunks.back().virt + chunks.back().count == virt) {
+            chunks.back().count += n;
+            return true;
+        }
+        bool counted = false;
+        for (const Chunk& c : chunks) counted |= c.slab == sl;
+        if (!counted) ++sl->users;
+        chunks.push_back({sl, *local, n, virt, sl->high});
+        return true;
     }
-    void completed(std::vector<PassRecord>& passes, NSArray* buffers, const std::vector<std::uint64_t>& highs,
-                   std::uint32_t last_used, double tick_ns, double gpu_ms, std::uint64_t serial,
-                   const std::string& queue, std::uint32_t untimed) {
-        std::vector<std::uint64_t> stamps;
-        std::vector<std::pair<id<MTLCounterSampleBuffer>, std::uint64_t>> back;
-        for (NSUInteger b = 0; b < buffers.count; ++b) {
-            const std::uint32_t used = b + 1 == buffers.count ? last_used : kSamples;
-            id<MTLCounterSampleBuffer> buf = buffers[b];
-            NSData* data = used ? [buf resolveCounterRange:NSMakeRange(0, used)] : nil;
+    void completed(std::vector<PassRecord>& passes, const std::vector<Chunk>& chunks, std::uint32_t total, double tick_ns,
+                   double gpu_ms, std::uint64_t serial, const std::string& queue, std::uint32_t untimed, double cb_start,
+                   double cb_end, double cb_kernel) {
+        std::vector<std::uint64_t> stamps(total, 0);
+        std::vector<std::pair<Slab*, std::uint64_t>> tops;
+        for (const Chunk& c : chunks) {
+            NSData* data = c.count ? [c.slab->buf resolveCounterRange:NSMakeRange(c.local, c.count)] : nil;
             const auto* st = data ? static_cast<const MTLCounterResultTimestamp*>(data.bytes) : nullptr;
             const std::size_t n = data ? data.length / sizeof(MTLCounterResultTimestamp) : 0;
-            const std::uint64_t high = b < highs.size() ? highs[b] : 0;
-            std::uint64_t top = high;
-            stamps.resize(std::size_t(b) * kSamples + kSamples, 0);
-            for (std::size_t i = 0; i < n; ++i) {
+            std::uint64_t top = 0;
+            for (std::size_t i = 0; i < n && c.virt + i < stamps.size(); ++i) {
                 const std::uint64_t t = st[i].timestamp;
-                if (t == MTLCounterErrorValue || t <= high) continue;
-                stamps[std::size_t(b) * kSamples + i] = t;
+                if (t == MTLCounterErrorValue || t <= c.high) continue;
+                stamps[c.virt + i] = t;
                 top = std::max(top, t);
             }
-            back.emplace_back(buf, top);
+            tops.emplace_back(c.slab, top);
         }
         auto ok = [&](std::uint32_t i) { return i < stamps.size() && stamps[i]; };
         std::lock_guard lock(mutex_);
-        for (auto& b : back) pool_.push_back(std::move(b));
+        for (const auto& [sl, top] : tops) sl->top = std::max(sl->top, top);
+        for (std::size_t k = 0; k < chunks.size(); ++k) {
+            Slab* sl = chunks[k].slab;
+            bool seen = false;
+            for (std::size_t j = 0; j < k; ++j) seen |= chunks[j].slab == sl;
+            if (seen || !sl->users || --sl->users || sl == cur_) continue;
+            sl->high = sl->top;
+            free_.push_back(sl);
+        }
         for (PassRecord& p : passes) {
             const std::uint32_t count = p.kind == 'R' ? 4 : 2;
             std::uint64_t lo = UINT64_MAX, hi = 0;
@@ -1489,15 +1571,20 @@ public:
             k.work += p.work;
             if (p.ms >= 0) k.ms += p.ms;
             ++k.ended_by[p.ended_by.empty() ? std::string("-") : p.ended_by];
+            std::uint64_t raw[4] = {};
+            for (std::uint32_t r = 0; p.timed && r < count; ++r) raw[r] = ok(p.sample + r) ? stamps[p.sample + r] : 0;
             if (tsv_)
-                std::fprintf(tsv_, "%d\t%s\t%llu\t%u\t%c\t%s\t%s\t%s\t%u\t%ux%u\t%s\t%s\t%.1f\t%.1f\t%s\t%d\t%s\t%llu\t%llu\t%llu\t%.4f\t%.4f\t%.4f\n",
+                std::fprintf(tsv_, "%d\t%s\t%llu\t%u\t%c\t%s\t%s\t%s\t%u\t%ux%u\t%s\t%s\t%.1f\t%.1f\t%s\t%d\t%s\t%llu\t%llu\t%llu\t%.4f\t%.4f\t%.4f\t%c\t%llu\t%llu\t%llu\t%llu\t%.9f\t%.9f\t%.9f\t%.3f\n",
                              windows_.load(), queue.c_str(), (unsigned long long)serial, p.index, p.kind, p.targets.c_str(),
                              p.first.c_str(), p.last.c_str(), p.work, p.w, p.h, p.loads.c_str(), p.stores.c_str(),
                              double(p.load_bytes) / 1048576.0, double(p.store_bytes) / 1048576.0, p.ended_by.c_str(),
                              p.same_targets ? (p.adjacent ? 2 : 1) : 0, p.split_by.c_str(),
                              (unsigned long long)p.issued, (unsigned long long)p.nonempty, (unsigned long long)p.groups, p.ms,
-                             p.vertex_ms, p.fragment_ms);
+                             p.vertex_ms, p.fragment_ms, mode() ? mode() : '-', (unsigned long long)raw[0],
+                             (unsigned long long)raw[1], (unsigned long long)raw[2], (unsigned long long)raw[3], cb_start,
+                             cb_end, cb_kernel, double(p.clear_bytes) / 1048576.0);
         }
+        if (cb_tsv_) calibrate_locked();
         untimed_ += untimed;
         gpu_ms_[queue] += gpu_ms;
         if (outstanding_) --outstanding_;
@@ -1537,14 +1624,30 @@ private:
         period_ = got >= 3 ? c : 0;
         serial_ = !env_is_zero("GTA6RT_METAL_PASS_TIMING_SERIAL");
         if (const char* sp = std::getenv("GTA6RT_METAL_PASS_TIMING_SPLIT")) split_ = std::atoi(sp);
+        if (const char* tr = std::getenv("GTA6RT_METAL_PASS_TIMING_TRIGGER"); tr && *tr) trigger_ = tr;
+        if (const char* m = std::getenv("GTA6RT_METAL_PASS_TIMING_MODES"); m && *m) {
+            for (const char* c = m; *c; ++c)
+                if (*c == 'b' || *c == 's' || *c == 'p') modes_ += *c;
+                else {
+                    log("GTA6RT_METAL_PASS_TIMING_MODES: '%c' is not one of b (budget), s, p", *c);
+                    std::abort();
+                }
+        }
         if (const char* p = std::getenv("GTA6RT_METAL_PASS_TIMING_TSV"); p && *p) {
             tsv_ = std::fopen(p, "w");
             if (tsv_)
                 std::fprintf(tsv_, "window\tqueue\tcb\tindex\tkind\ttargets\tfirst\tlast\twork\tsize\tloads\tstores\tload_mib\t"
-                                   "store_mib\tended_by\tsame_targets\tsplit_by\tissued\tnonempty\tgroups\tms\tvertex_ms\tfragment_ms\n");
+                                   "store_mib\tended_by\tsame_targets\tsplit_by\tissued\tnonempty\tgroups\tms\tvertex_ms\tfragment_ms\t"
+                                   "mode\tt0\tt1\tt2\tt3\tcb_gpu_start\tcb_gpu_end\tcb_kernel_start\tclear_mib\n");
+            cb_tsv_ = std::fopen((std::string(p) + ".cb").c_str(), "w");
+            if (cb_tsv_)
+                std::fprintf(cb_tsv_, "cb\twindow\tqueue\tkey\tserial\tkernel_start\tkernel_end\tgpu_start\tgpu_end\tstatus\tsummary\t"
+                                      "encoded_at\theld_ms\n"
+                                      "cal\tmedia_before\tcpu\tgpu\tmedia_after\n");
         }
-        log("pass timing: %llu frames from %.1f s after start%s%s", (unsigned long long)frames_, start_,
-            period_ > 0 ? " (repeated)" : "", serial_ ? ", encoders serialized" : "");
+        log("pass timing: %llu frames from %.1f s after %s%s%s%s", (unsigned long long)frames_, start_,
+            trigger_.empty() ? "start" : trigger_.c_str(), period_ > 0 ? " (repeated)" : "",
+            !modes_.empty() ? ", window modes " : serial_ ? ", encoders serialized" : "", modes_.c_str());
     }
     void report(double now) {
         const double frames = std::max(1.0, double(presents1_ - presents0_));
@@ -1596,6 +1699,8 @@ private:
         }
         kinds_.clear();
         if (tsv_) std::fflush(tsv_);
+        if (cb_tsv_) std::fflush(cb_tsv_);
+        tail_until_ = CACurrentMediaTime() + 2.0;
         agg_.clear();
         gpu_ms_.clear();
         timed_ms_.clear();
@@ -1623,9 +1728,30 @@ private:
     std::map<char, KindAgg> kinds_;
     std::unordered_map<std::string, Agg> agg_;
     std::atomic<std::uint32_t> failures_{0};
-    std::vector<std::pair<id<MTLCounterSampleBuffer>, std::uint64_t>> pool_;
+    Slab* cur_ = nullptr;
+    std::vector<Slab*> free_;
     FILE* tsv_ = nullptr;
+    FILE* cb_tsv_ = nullptr;
+    std::string modes_, trigger_;
+    double tail_until_ = 0, last_cal_ = 0, trigger_checked_ = 0;
+    void calibrate_locked() {
+        if (!cb_tsv_ || !device_) return;
+        const double now = CACurrentMediaTime();
+        if (now - last_cal_ < 0.25) return;
+        last_cal_ = now;
+        MTLTimestamp cpu = 0, gpu = 0;
+        const double before = CACurrentMediaTime();
+        [device_->mtl() sampleTimestamps:&cpu gpuTimestamp:&gpu];
+        const double after = CACurrentMediaTime();
+        std::fprintf(cb_tsv_, "cal\t%.9f\t%llu\t%llu\t%.9f\n", before, (unsigned long long)cpu, (unsigned long long)gpu, after);
+    }
 };
+
+int budget_cb_window() { return PassTiming::get().cb_window(); }
+void budget_cb_done(int window, const std::string& queue, const void* key, std::uint64_t serial, id<MTLCommandBuffer> done,
+                    const std::string& summary, double encoded_at, double held_ms) {
+    PassTiming::get().cb_done(window, queue, key, serial, done, summary, encoded_at, held_ms);
+}
 
 class Encoder {
 public:
@@ -1819,21 +1945,41 @@ private:
     std::uint32_t pass_index_ = 0;
     int pass_cb_ = -1;
     id<MTLCounterSampleBuffer> pass_samples_ = nil;
-    NSMutableArray* pass_buffers_ = nil;
-    std::vector<std::uint64_t> pass_highs_;
+    std::vector<PassTiming::Chunk> pass_chunks_;
     std::uint32_t pass_used_ = 0, pass_untimed_ = 0;
     std::vector<PassRecord> passes_;
     void note_att(MetalTexture* t, std::uint32_t mip, MTLLoadAction load, MTLStoreAction store, bool depth) {
         if (census_ && t) atts_.push_back({t, mip, load, store, depth});
     }
-    bool pass_sample(std::uint32_t n, std::uint32_t* base);
+    bool pass_sample(std::uint32_t n, std::uint32_t* base, std::uint32_t* local);
     bool pass_serial() const { return pass_cb_ == 1 && PassTiming::get().serial(); }
     const void* split_pso_ = nullptr;
+    const void* split_cs_ = nullptr;
+    void timing_split_compute(const void* pso) {
+        if (compute_ && pass_cb_ == 1 && PassTiming::get().split() && split_cs_ && split_cs_ != pso && label_work_) {
+            cause_ = "timing split (kernel change)";
+            end_encoder();
+        }
+        split_cs_ = pso;
+    }
+    bool explicit_deferred_ = false, explicit_splitting_ = false;
+    RenderPassDesc explicit_desc_{};
     void timing_split(const void* pso) {
-        if (!render_ || explicit_ || pass_cb_ != 1 || !PassTiming::get().split() || !pso) return;
+        if (!render_ || pass_cb_ != 1 || !PassTiming::get().split() || !pso) return;
+        if (explicit_ && !explicit_deferred_) return;
         if (split_pso_ && split_pso_ != pso && label_work_) {
             cause_ = "timing split (pipeline change)";
-            end_encoder();
+            if (explicit_) {
+                explicit_splitting_ = true;
+                end_encoder();
+                explicit_splitting_ = false;
+                RenderPassDesc next = explicit_desc_;
+                for (std::uint32_t i = 0; i < next.target_count; ++i) next.targets[i].load = LoadOp::preserve;
+                next.depth_load = LoadOp::preserve;
+                open_explicit(next);
+            } else {
+                end_encoder();
+            }
         }
         split_pso_ = pso;
     }
@@ -2203,13 +2349,13 @@ void Encoder::visit(const Cmd& cmd) {
 id<MTLBlitCommandEncoder> Encoder::blit() {
     if (render_ || compute_) end_encoder();
     if (!blit_) {
-        std::uint32_t sample = 0;
-        const bool timed = pass_sample(2, &sample);
+        std::uint32_t sample = 0, local = 0;
+        const bool timed = pass_sample(2, &sample, &local);
         if (timed) {
             MTLBlitPassDescriptor* bpd = [MTLBlitPassDescriptor blitPassDescriptor];
             bpd.sampleBufferAttachments[0].sampleBuffer = pass_samples_;
-            bpd.sampleBufferAttachments[0].startOfEncoderSampleIndex = sample % PassTiming::kSamples;
-            bpd.sampleBufferAttachments[0].endOfEncoderSampleIndex = sample % PassTiming::kSamples + 1;
+            bpd.sampleBufferAttachments[0].startOfEncoderSampleIndex = local;
+            bpd.sampleBufferAttachments[0].endOfEncoderSampleIndex = local + 1;
             blit_ = [cb_ blitCommandEncoderWithDescriptor:bpd];
         } else {
             blit_ = [cb_ blitCommandEncoder];
@@ -2230,14 +2376,14 @@ id<MTLBlitCommandEncoder> Encoder::blit() {
 id<MTLComputeCommandEncoder> Encoder::compute() {
     if (render_ || blit_) end_encoder();
     if (!compute_) {
-        std::uint32_t sample = 0;
-        const bool timed = pass_sample(2, &sample);
+        std::uint32_t sample = 0, local = 0;
+        const bool timed = pass_sample(2, &sample, &local);
         if (timed) {
             MTLComputePassDescriptor* cpd = [MTLComputePassDescriptor computePassDescriptor];
             cpd.dispatchType = MTLDispatchTypeConcurrent;
             cpd.sampleBufferAttachments[0].sampleBuffer = pass_samples_;
-            cpd.sampleBufferAttachments[0].startOfEncoderSampleIndex = sample % PassTiming::kSamples;
-            cpd.sampleBufferAttachments[0].endOfEncoderSampleIndex = sample % PassTiming::kSamples + 1;
+            cpd.sampleBufferAttachments[0].startOfEncoderSampleIndex = local;
+            cpd.sampleBufferAttachments[0].endOfEncoderSampleIndex = local + 1;
             compute_ = [cb_ computeCommandEncoderWithDescriptor:cpd];
         } else {
             compute_ = [cb_ computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
@@ -2273,6 +2419,8 @@ bool Encoder::discard_follows(const gpu::Resource* r) const {
     return false;
 }
 
+static MTLStoreAction store_action(StoreOp op);
+
 void Encoder::end_encoder() {
     if (render_) {
         if (!explicit_) {
@@ -2298,6 +2446,14 @@ void Encoder::end_encoder() {
                 if (pass_depth_stencil_)
                     [render_ setStencilStoreAction:drop ? MTLStoreActionDontCare : MTLStoreActionStore];
                 note_store(pass_depth_.texture, true, drop);
+            }
+        } else if (explicit_deferred_) {
+            const auto act = [&](StoreOp op) { return explicit_splitting_ ? MTLStoreActionStore : store_action(op); };
+            for (std::uint32_t i = 0; i < pass_count_ && i < explicit_desc_.target_count; ++i)
+                if (pass_targets_[i].texture) [render_ setColorStoreAction:act(explicit_desc_.targets[i].store) atIndex:i];
+            if (pass_has_depth_) {
+                [render_ setDepthStoreAction:act(explicit_desc_.depth_store)];
+                if (pass_depth_stencil_) [render_ setStencilStoreAction:act(explicit_desc_.depth_store)];
             }
         }
         if (active_.heap && pass_vis_ == active_.heap && !span_logged_) {
@@ -2357,12 +2513,11 @@ void Encoder::begin_render(MTLRenderPassDescriptor* rp, std::uint32_t w, std::ui
         keep(vis->results());
     }
     id<MTLFence> extra = prepass_fence_;
-    std::uint32_t sample = 0;
-    const bool timed = pass_sample(4, &sample);
+    std::uint32_t sample = 0, local = 0;
+    const bool timed = pass_sample(4, &sample, &local);
     if (timed) {
         MTLRenderPassSampleBufferAttachmentDescriptor* sa = rp.sampleBufferAttachments[0];
         sa.sampleBuffer = pass_samples_;
-        const std::uint32_t local = sample % PassTiming::kSamples;
         sa.startOfVertexSampleIndex = local;
         sa.endOfVertexSampleIndex = local + 1;
         sa.startOfFragmentSampleIndex = local + 2;
@@ -2410,6 +2565,14 @@ static MTLStoreAction store_action(StoreOp op) {
 void Encoder::open_explicit(const RenderPassDesc& desc) {
     MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
     std::uint32_t w = 0, h = 0;
+    bool defer = false;
+    if (PassTiming& pt = PassTiming::get(); pt.on() && d_->timestamp_counters()) {
+        if (pass_cb_ < 0) pass_cb_ = pt.begin_command_buffer(d_) ? 1 : 0;
+        defer = pass_cb_ == 1 && pt.split();
+    }
+    explicit_deferred_ = defer;
+    explicit_desc_ = desc;
+    const auto stored = [&](StoreOp op) { return defer ? MTLStoreActionUnknown : store_action(op); };
     pass_count_ = desc.target_count;
     for (std::uint32_t i = 0; i < desc.target_count; ++i) {
         const RenderPassTarget& t = desc.targets[i];
@@ -2420,7 +2583,7 @@ void Encoder::open_explicit(const RenderPassDesc& desc) {
             status_ = Status::not_implemented;
         }
         discarded_.erase(t.view.texture);
-        attach(rp, t.view, i, load_action(t.load), store_action(t.store), t.clear);
+        attach(rp, t.view, i, load_action(t.load), stored(t.store), t.clear);
         w = std::max(1u, t.view.texture->desc().width >> t.view.mip);
         h = std::max(1u, t.view.texture->desc().height >> t.view.mip);
     }
@@ -2436,14 +2599,14 @@ void Encoder::open_explicit(const RenderPassDesc& desc) {
         note_target(t);
         rp.depthAttachment.texture = t->mtl();
         rp.depthAttachment.loadAction = load_action(desc.depth_load);
-        rp.depthAttachment.storeAction = store_action(desc.depth_store);
+        rp.depthAttachment.storeAction = stored(desc.depth_store);
         rp.depthAttachment.clearDepth =
             t->format().info.emulated ? quantize_d24(desc.clear_depth) : desc.clear_depth;
         pass_depth_stencil_ = t->format().info.stencil;
         if (pass_depth_stencil_) {
             rp.stencilAttachment.texture = t->mtl();
             rp.stencilAttachment.loadAction = load_action(desc.depth_load);
-            rp.stencilAttachment.storeAction = store_action(desc.depth_store);
+            rp.stencilAttachment.storeAction = stored(desc.depth_store);
             rp.stencilAttachment.clearStencil = desc.clear_stencil;
         }
         w = t->desc().width;
@@ -3186,6 +3349,7 @@ void Encoder::dispatch(const CmdDispatch& c) {
         }
         return;
     }
+    timing_split_compute(p);
     const bool timed = timed_compute(p);
     if (!timed) compute();
     if (!bind_compute(s, p)) {
@@ -3315,6 +3479,7 @@ void Encoder::indirect(const CmdIndirect& c) {
             base = pr.offset;
             stride = packed;
         }
+        timing_split_compute(p);
         const bool timed = timed_compute(p);
         if (!timed) compute();
         if (!bind_compute(s, p)) {
@@ -3585,24 +3750,17 @@ void Encoder::finish_timing() {
     timing_used_ = 0;
 }
 
-bool Encoder::pass_sample(std::uint32_t n, std::uint32_t* base) {
+bool Encoder::pass_sample(std::uint32_t n, std::uint32_t* base, std::uint32_t* local) {
     PassTiming& t = PassTiming::get();
     if (!t.on() || !d_->timestamp_counters()) return false;
     if (pass_cb_ < 0) pass_cb_ = t.begin_command_buffer(d_) ? 1 : 0;
     if (pass_cb_ != 1) return false;
-    if (!pass_buffers_) pass_buffers_ = [NSMutableArray new];
-    if (!pass_samples_ || pass_used_ + n > PassTiming::kSamples) {
-        std::uint64_t high = 0;
-        pass_samples_ = pass_buffers_.count < 16 ? t.take_buffer(d_, &high) : nil;
-        if (!pass_samples_) {
-            ++pass_untimed_;
-            return false;
-        }
-        [pass_buffers_ addObject:pass_samples_];
-        pass_highs_.push_back(high);
-        pass_used_ = 0;
+    if (!t.take(d_, n, pass_chunks_, pass_used_, local)) {
+        ++pass_untimed_;
+        return false;
     }
-    *base = std::uint32_t(pass_buffers_.count - 1) * PassTiming::kSamples + pass_used_;
+    pass_samples_ = pass_chunks_.back().slab->buf;
+    *base = pass_used_;
     pass_used_ += n;
     return true;
 }
@@ -3683,13 +3841,11 @@ void Encoder::finish_pass_timing() {
     }
     auto passes = std::make_shared<std::vector<PassRecord>>(std::move(passes_));
     passes_.clear();
-    NSArray* buffers = pass_buffers_ ? pass_buffers_ : [NSArray new];
-    const std::uint32_t used = std::min(pass_used_, PassTiming::kSamples);
+    auto chunks = std::make_shared<std::vector<PassTiming::Chunk>>(std::move(pass_chunks_));
+    pass_chunks_.clear();
+    const std::uint32_t used = pass_used_;
     const std::uint32_t untimed = pass_untimed_;
-    std::vector<std::uint64_t> highs = std::move(pass_highs_);
-    pass_highs_.clear();
     pass_samples_ = nil;
-    pass_buffers_ = nil;
     pass_used_ = pass_untimed_ = 0;
     const double tick_ns = d_->caps().timestamp_frequency ? 1e9 / double(d_->caps().timestamp_frequency) : 1.0;
     const std::uint64_t serial = q_->last_serial() + 1;
@@ -3698,7 +3854,8 @@ void Encoder::finish_pass_timing() {
     [cb_ addCompletedHandler:^(id<MTLCommandBuffer> done) {
       const double gpu_ms =
           done.GPUStartTime > 0 && done.GPUEndTime > done.GPUStartTime ? (done.GPUEndTime - done.GPUStartTime) * 1e3 : 0;
-      PassTiming::get().completed(*passes, buffers, highs, used, tick_ns, gpu_ms, serial, queue, untimed);
+      PassTiming::get().completed(*passes, *chunks, used, tick_ns, gpu_ms, serial, queue, untimed, done.GPUStartTime,
+                                  done.GPUEndTime, done.kernelStartTime);
     }];
 }
 

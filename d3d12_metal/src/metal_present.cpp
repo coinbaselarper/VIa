@@ -272,7 +272,7 @@ std::int32_t MetalPresenter::submit(const gpu::PresentDesc& desc) {
     if (abort_ && abort_()) return kOk;
     if (!ensure_swapchain()) return kFail;
     gpu::Fence* own = nullptr;
-    for (const auto& [fence, value] : context_.submitted())
+    for (const auto& [fence, value] : context_.submitted_only())
         if (value) queue_.queue()->wait(fence, value), own = fence;
     (void)own;
     const gpu::Status s = queue_.queue()->present_planes(swapchain_.get(), desc);

@@ -83,6 +83,8 @@ const Row kRows[] = {
     {86, MTLPixelFormatBGR5A1Unorm, 2, 1, false, false, false, "B5G5R5A1_UNORM", ""},
     {96, MTLPixelFormatBC6H_RGBFloat, 16, 4, false, false, false, "BC6H_SF16", ""},
     {99, MTLPixelFormatBC7_RGBAUnorm_sRGB, 16, 4, false, false, false, "BC7_UNORM_SRGB", ""},
+    {22, MTLPixelFormatX32_Stencil8, 8, 1, false, true, false, "X32_TYPELESS_G8X24_UINT",
+     "views only: the stencil of a Depth32Float_Stencil8 texture, read as uint with the byte in R"},
     {format::b4g4r4a4_unorm, MTLPixelFormatABGR4Unorm, 2, 1, false, false, true, "B4G4R4A4_UNORM",
      "ABGR4Unorm (R in bits 12-15); sampled through a swizzle view in DXGI order; as a render target the stored bits "
      "are Metal's order (measured, DESIGN.md F17)"},

@@ -1010,7 +1010,10 @@ std::unique_ptr<gpu::Texture> MetalDevice::create_texture_view(gpu::Texture* tex
     if (nf.pixel != base.pixelFormat) {
         const NativeFormat& src = mt->format();
         const bool compressed = src.info.block_dim > 1 || nf.info.block_dim > 1;
-        if (compressed) {
+        if (nf.pixel == MTLPixelFormatX32_Stencil8) {
+            if (base.pixelFormat != MTLPixelFormatDepth32Float_Stencil8 || !(base.usage & MTLTextureUsagePixelFormatView))
+                return fail("a stencil view needs a Depth32Float_Stencil8 texture made with pixel-format views");
+        } else if (compressed) {
             static const std::pair<MTLPixelFormat, MTLPixelFormat> twins[] = {
                 {MTLPixelFormatBC1_RGBA, MTLPixelFormatBC1_RGBA_sRGB}, {MTLPixelFormatBC2_RGBA, MTLPixelFormatBC2_RGBA_sRGB},
                 {MTLPixelFormatBC3_RGBA, MTLPixelFormatBC3_RGBA_sRGB}, {MTLPixelFormatBC7_RGBAUnorm, MTLPixelFormatBC7_RGBAUnorm_sRGB}};

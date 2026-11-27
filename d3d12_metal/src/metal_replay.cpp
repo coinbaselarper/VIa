@@ -64,6 +64,7 @@ public:
         if (event_depth_) {
             for (; event_depth_; --event_depth_) out_.end_event();
         }
+        flush_check_copies();
         return ReplayResult::success;
     }
 
@@ -1326,6 +1327,37 @@ private:
             context_.gpu_debug()->note_table_slot(draw.user_data[9], 0x80);
         out_.execute_indirect(d);
         st.draws.fetch_add(1, std::memory_order_relaxed);
+        if (SceneProbe* s = context_.scene(); s && s->check_armed()) note_check_args(*s, a, p);
+    }
+    // The G-buffer check's frame: each indirect draw's count word and first argument record, copied at the end of
+    // the list (the values the draws used, unless the list rewrites them later).
+    struct CheckCopy {
+        gpu::Buffer* dst = nullptr;
+        std::uint64_t offset = 0;
+        Resolved args, count;
+        std::uint32_t bytes = 0;
+    };
+    std::vector<CheckCopy> check_copies_;
+    void note_check_args(SceneProbe& s, const IndirectDrawArgs& a, const MetalGraphicsPipeline& p) {
+        CheckCopy c;
+        c.bytes = std::min<std::uint32_t>(std::max<std::uint32_t>(a.stride, 12), 16);
+        if (!buffer_of(a.argument_buffer, a.argument_offset, c.bytes, c.args)) return;
+        const bool count = a.count_buffer && buffer_of(a.count_buffer, a.count_offset, 4, c.count);
+        if (!s.check_args_slot(p.name, p.mesh, count, a.max_count, c.dst, c.offset)) return;
+        if (!count) c.count = {};
+        check_copies_.push_back(c);
+    }
+    void flush_check_copies() {
+        if (check_copies_.empty()) return;
+        gpu::Barrier fence;
+        fence.type = gpu::BarrierType::uav;
+        out_.barrier({&fence, 1});
+        for (const CheckCopy& c : check_copies_) {
+            out_.copy_buffer(c.dst, c.offset, c.args.buffer, c.args.offset, c.bytes);
+            if (c.count.buffer) out_.copy_buffer(c.dst, c.offset + 16, c.count.buffer, c.count.offset, 4);
+        }
+        out_.barrier({&fence, 1});
+        check_copies_.clear();
     }
 
     // GTA6RT_METAL_INDIRECT_ARGS_DUMP=<part of a pipeline name>[,...]: the first 24 indirect draws of such pipelines

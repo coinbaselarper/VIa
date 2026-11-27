@@ -456,27 +456,24 @@ std::string MetalContext::take_work_report(std::uint64_t presents) {
     return out;
 }
 
-void MetalContext::note_submitted(gpu::Fence* progress, std::uint64_t value) {
-    std::lock_guard lock(submitted_mutex_);
-    auto& v = submitted_[progress];
-    v = std::max(v, value);
+void MetalContext::note_submitted(gpu::Fence* progress, std::uint64_t value) { marks_.note_submitted(progress, value); }
+
+void MetalContext::forget_queue(gpu::Fence* progress) { marks_.forget(progress); }
+
+std::vector<std::pair<gpu::Fence*, std::uint64_t>> MetalContext::submitted() const { return marks_.submitted(); }
+
+std::vector<std::pair<gpu::Fence*, std::uint64_t>> MetalContext::submitted_only() const {
+    return marks_.submitted_only();
 }
 
-void MetalContext::forget_queue(gpu::Fence* progress) {
-    std::lock_guard lock(submitted_mutex_);
-    submitted_.erase(progress);
+void MetalContext::begin_in_flight(gpu::Fence* progress, std::uint64_t value) {
+    marks_.begin_in_flight(progress, value);
 }
 
-std::vector<std::pair<gpu::Fence*, std::uint64_t>> MetalContext::submitted() const {
-    std::lock_guard lock(submitted_mutex_);
-    return {submitted_.begin(), submitted_.end()};
-}
+void MetalContext::end_in_flight(gpu::Fence* progress) { marks_.end_in_flight(progress); }
 
 bool MetalContext::reached(const std::vector<std::pair<gpu::Fence*, std::uint64_t>>& marks) const {
-    std::lock_guard lock(submitted_mutex_);
-    for (const auto& [fence, value] : marks)
-        if (submitted_.count(fence) && fence->completed_value() < value) return false;
-    return true;
+    return marks_.reached(marks);
 }
 
 // ---- MetalQueue ----
@@ -698,6 +695,19 @@ gpu::CommandList* MetalQueue::list_slot(std::size_t index) {
 
 ReplayResult MetalQueue::execute_now(std::span<const CommandList* const> lists, Waits& waits, std::uint64_t* ticket) {
     using clock = std::chrono::steady_clock;
+    // From before anything the submission reads is picked until its progress value exists; a submission that failed
+    // still signals that value, so marks taken meanwhile are reached.
+    struct InFlight {
+        MetalQueue& q;
+        const std::uint64_t value;
+        InFlight(MetalQueue& queue) : q(queue), value(queue.submitted_ + 1) {
+            q.context_.begin_in_flight(q.progress_.get(), value);
+        }
+        ~InFlight() {
+            if (q.submitted_ < value && !q.context_.is_device_lost()) q.mark_progress();
+            q.context_.end_in_flight(q.progress_.get());
+        }
+    } in_flight(*this);
     auto& st = context_.stats();
     const auto t0 = clock::now();
     context_.run_before_execute();
@@ -1070,11 +1080,26 @@ std::unique_ptr<SceneProbe> SceneProbe::create(MetalContext& context) {
     const char* d = std::getenv("GTA6RT_METAL_SCENE_DUMP");
     const char* l = std::getenv("GTA6RT_METAL_SCENE_LOG");
     const char* a = std::getenv("GTA6RT_METAL_SCENE_ALBEDO");
-    if (!(p && *p && *p != '0') && !(d && *d) && !(l && *l == '1') && !(a && *a && *a != '0')) return nullptr;
+    if (!(p && *p && *p != '0') && !(d && *d) && !(l && *l == '1') && !(a && *a && *a != '0'))
+        return check_seconds() > 0 ? std::make_unique<SceneProbe>(context, true) : nullptr;
     return std::make_unique<SceneProbe>(context);
 }
 
-SceneProbe::SceneProbe(MetalContext& context) : context_(context) {
+double SceneProbe::check_seconds() {
+    static const double s = [] {
+        const char* v = std::getenv("GTA6RT_METAL_GBUFFER_CHECK");
+        return v && *v ? std::max(0.0, std::strtod(v, nullptr)) : 10.0;
+    }();
+    return s;
+}
+
+SceneProbe::SceneProbe(MetalContext& context, bool check_only)
+    : context_(context), check_only_(check_only), check_after_s_(check_seconds()) {
+    if (check_only_) {
+        std::fprintf(stderr, "[rt] d3d12-metal G-buffer check: at world+%.0f s (GTA6RT_METAL_GBUFFER_CHECK=0: off)\n",
+                     check_after_s_);
+        return;
+    }
     if (const char* s = std::getenv("GTA6RT_METAL_SCENE_SIZE"); s && *s) {
         unsigned w = 0, h = 0;
         if (std::sscanf(s, "%ux%u", &w, &h) == 2 && w && h) width_ = w, height_ = h;
@@ -1179,6 +1204,7 @@ bool SceneProbe::pass_boundary(const Target* rts, std::uint32_t count, const std
 
 bool SceneProbe::draw(const Target* rts, std::uint32_t count, const Target& depth, const char* pipeline,
                       const char* kind, bool recorded, gpu::CommandList& out, const Resolve& resolve) {
+    if (check_only_ && !check_armed_.load(std::memory_order_acquire)) return false;
     std::lock_guard lock(mutex_);
     const char* name = pipeline ? pipeline : "";
     bool copied = false;
@@ -1186,6 +1212,7 @@ bool SceneProbe::draw(const Target* rts, std::uint32_t count, const Target& dept
         bool same = cur_.count == std::min<std::uint32_t>(count, 8) && cur_.depth.id == depth.id && !cur_.first.empty();
         for (std::uint32_t i = 0; same && i < cur_.count; ++i) same = cur_.rts[i].id == rts[i].id;
         if (!same) {
+            if (check_armed_.load(std::memory_order_relaxed) && !cur_.first.empty()) check_boundary(out, resolve, copied);
             if (logging_ && (stages_max_ || !after_.empty()) && !cur_.first.empty())
                 copied = pass_boundary(rts, std::min<std::uint32_t>(count, 8), name, out, resolve);
             if (albedo_every_ && !latched_ && cur_.count >= 3 && cur_.rts[0].id && cur_.rts[1].id &&
@@ -1315,6 +1342,15 @@ bool SceneProbe::queue_readback(gpu::CommandList& out, gpu::Texture* texture, co
 }
 
 bool SceneProbe::dispatch(const char* pipeline, bool recorded, gpu::CommandList& out, const Resolve& resolve) {
+    if (check_only_) {
+        const char* n = pipeline ? pipeline : "";
+        if (std::strncmp(n, "fspx/", 5) && std::strncmp(n, "gta6rt-upscale", 14)) return false;
+        std::lock_guard lock(mutex_);
+        if (latched_) return false;
+        latched_ = true;
+        if (++upscaled_frames_ == 1) first_latch_ = std::chrono::steady_clock::now();
+        return false;
+    }
     std::lock_guard lock(mutex_);
     const std::string name = pipeline ? pipeline : "";
     if (logging_ && passes_.size() < max_passes_) {
@@ -1332,7 +1368,7 @@ bool SceneProbe::dispatch(const char* pipeline, bool recorded, gpu::CommandList&
                           name.compare(0, 14, "gta6rt-upscale") == 0;
     if (!upscaler || latched_) return false;
     latched_ = true;
-    ++upscaled_frames_;
+    if (++upscaled_frames_ == 1) first_latch_ = std::chrono::steady_clock::now();
     if (hdr_.id) stage_target_ = hdr_;
     if (upscaled_frames_ == 1 || upscaled_frames_ == 10 || upscaled_frames_ % 100 == 0)
         std::fprintf(stderr, "[rt] d3d12-metal scene latch %llu (frame %llu, at %s): colour %s by %s; G-buffer %u by %s\n",
@@ -1644,8 +1680,149 @@ void SceneProbe::finish_readbacks(bool all) {
     }
 }
 
+void SceneProbe::check_boundary(gpu::CommandList& out, const Resolve& resolve, bool& copied) {
+    if (cur_.count < 4 || !cur_.rts[0].id || !render_size(cur_.rts[0])) return;
+    ++check_passes_;
+    if (cur_.calls <= check_best_calls_ || check_reads_.size() >= 16) return;
+    gpu::Texture* t = resolve(cur_.rts[0].id);
+    if (!t || !queue_readback(out, t, cur_.rts[0], "gbuffer-check", false)) return;
+    check_reads_.push_back(std::move(readbacks_.back()));
+    readbacks_.pop_back();
+    check_best_calls_ = cur_.calls;
+    check_best_first_ = cur_.first;
+    check_best_last_ = cur_.last;
+    copied = true;
+}
+
+bool SceneProbe::check_args_slot(const char* pipeline, bool mesh, bool has_count, std::uint32_t max_count,
+                                 gpu::Buffer*& buffer, std::uint64_t& offset) {
+    constexpr std::size_t kSlots = 8192;
+    std::lock_guard lock(mutex_);
+    if (!check_armed_.load(std::memory_order_relaxed) || check_arg_notes_.size() >= kSlots) return false;
+    if (!check_args_) {
+        gpu::BufferDesc d;
+        d.size = kSlots * 32;
+        d.memory = gpu::MemoryKind::shared;
+        d.usage = gpu::usage::copy;
+        d.label = "G-buffer check indirect arguments";
+        check_args_ = context_.gpu().create_buffer(d);
+        if (!check_args_ || !check_args_->cpu_pointer()) {
+            check_args_.reset();
+            return false;
+        }
+        std::memset(check_args_->cpu_pointer(), 0xff, kSlots * 32);
+    }
+    buffer = check_args_.get();
+    offset = std::uint64_t(check_arg_notes_.size()) * 32;
+    check_arg_notes_.push_back({pipeline ? pipeline : "?", mesh, has_count, max_count});
+    return true;
+}
+
+// Per pipeline family (the name up to its first '~' or ','): indirect draws of the check frame, how many had nothing
+// to draw (count word 0, or a first record of 0 groups / 0 vertices / 0 instances) and the groups their first records
+// name; the families with most draws first.
+void SceneProbe::check_args_report() {
+    if (!check_args_ || check_arg_notes_.empty()) {
+        std::fprintf(stderr, "[rt] d3d12-metal G-buffer check: no indirect draw in the check frame\n");
+        return;
+    }
+    struct Family {
+        std::uint64_t draws = 0, empty = 0, uncopied = 0, groups = 0;
+    };
+    std::map<std::string, Family> families;
+    Family all, mesh;
+    const auto* w = static_cast<const std::uint32_t*>(check_args_->cpu_pointer());
+    for (std::size_t i = 0; i < check_arg_notes_.size(); ++i) {
+        const ArgNote& n = check_arg_notes_[i];
+        const std::uint32_t* r = w + i * 8;
+        std::string fam = n.name.substr(0, n.name.find_first_of("~,"));
+        Family& f = families[fam];
+        const bool uncopied = r[0] == 0xffffffffu && r[1] == 0xffffffffu;
+        const std::uint32_t count = n.count ? std::min(r[4], std::max(n.max_count, 1u)) : 1u;
+        const std::uint64_t work = n.mesh ? std::uint64_t(r[0]) * r[1] * r[2] : std::uint64_t(r[0]) * r[1];
+        const bool empty = !uncopied && (count == 0 || work == 0);
+        for (Family* x : {&f, &all, n.mesh ? &mesh : nullptr}) {
+            if (!x) continue;
+            ++x->draws;
+            x->uncopied += uncopied;
+            x->empty += empty;
+            if (!uncopied && count && n.mesh) x->groups += std::min<std::uint64_t>(work, 1u << 24);
+        }
+    }
+    std::vector<std::pair<std::string, Family>> rows(families.begin(), families.end());
+    std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) { return a.second.draws > b.second.draws; });
+    std::string text;
+    char b[256];
+    for (std::size_t i = 0; i < rows.size() && i < 8; ++i) {
+        std::snprintf(b, sizeof b, "%s%s %llu draws, %llu empty, %llu groups", i ? "; " : "", short_name(rows[i].first).c_str(),
+                      static_cast<unsigned long long>(rows[i].second.draws),
+                      static_cast<unsigned long long>(rows[i].second.empty),
+                      static_cast<unsigned long long>(rows[i].second.groups));
+        text += b;
+    }
+    std::fprintf(stderr,
+                 "[rt] d3d12-metal G-buffer check: indirect draws of the check frame %llu (%llu empty, %llu not copied); "
+                 "mesh %llu (%llu empty, %llu groups in their first records) || %s\n",
+                 static_cast<unsigned long long>(all.draws), static_cast<unsigned long long>(all.empty),
+                 static_cast<unsigned long long>(all.uncopied), static_cast<unsigned long long>(mesh.draws),
+                 static_cast<unsigned long long>(mesh.empty), static_cast<unsigned long long>(mesh.groups), text.c_str());
+}
+
+void SceneProbe::check_report() {
+    check_args_report();
+    check_args_.reset();
+    check_arg_notes_.clear();
+    const double world_s = check_after_s_;
+    if (check_reads_.empty()) {
+        std::fprintf(stderr, "[rt] d3d12-metal G-buffer check (world+%.0f s, upscaled frame %llu): no render-size pass of "
+                             "4+ targets in the frame (%llu seen): UNKNOWN\n",
+                     world_s, static_cast<unsigned long long>(check_upscaled_),
+                     static_cast<unsigned long long>(check_passes_));
+        return;
+    }
+    const Readback& r = check_reads_.back();
+    const Target& t = r.target;
+    const auto* src = static_cast<const std::uint8_t*>(r.buffer->cpu_pointer());
+    std::uint64_t rgb = 0, any = 0, n = 0;
+    for (std::uint32_t y = 0; y < t.height; ++y)
+        for (std::uint32_t x = 0; x < t.width; ++x, ++n) {
+            float v[4] = {0, 0, 0, 0};
+            const int c = decode_texel(t.format, src + std::size_t(y) * r.pitch + std::size_t(x) * r.texel, v);
+            const bool col = (c > 0 && v[0] > 0) || (c > 1 && v[1] > 0) || (c > 2 && v[2] > 0);
+            rgb += col;
+            any += col || (c > 3 && v[3] > 0);
+        }
+    static const double min_pct = [] {
+        const char* v = std::getenv("GTA6RT_METAL_GBUFFER_CHECK_MIN");
+        return v && *v ? std::strtod(v, nullptr) : 50.0;
+    }();
+    const double pct = n ? 100.0 * double(rgb) / double(n) : 0;
+    std::fprintf(stderr,
+                 "[rt] d3d12-metal G-buffer check (world+%.0f s, upscaled frame %llu): main G-buffer pass %s%s%s (%llu "
+                 "draws; %llu passes of 4+ render-size targets): RT0 %s %.1f%% of texels with colour, %.1f%% any "
+                 "channel: %s\n",
+                 world_s, static_cast<unsigned long long>(check_upscaled_), short_name(check_best_first_).c_str(),
+                 check_best_last_ != check_best_first_ ? " .. " : "",
+                 check_best_last_ != check_best_first_ ? short_name(check_best_last_).c_str() : "",
+                 static_cast<unsigned long long>(check_best_calls_), static_cast<unsigned long long>(check_passes_),
+                 target_text(t).c_str(), pct, n ? 100.0 * double(any) / double(n) : 0, pct < min_pct ? "BROKEN" : "ok");
+    check_reads_.clear();
+}
+
 void SceneProbe::end_frame() {
     std::lock_guard lock(mutex_);
+    if (check_armed_.load(std::memory_order_relaxed)) {
+        check_armed_.store(false, std::memory_order_release);
+        check_started_ = true;
+        check_frame_ = frame_;
+    } else if (check_started_ && !check_done_ && frame_ >= check_frame_ + 3) {
+        check_done_ = true;
+        check_report();
+    } else if (!check_started_ && check_after_s_ > 0 && upscaled_frames_ &&
+               std::chrono::steady_clock::now() - first_latch_ >= std::chrono::duration<double>(check_after_s_)) {
+        check_upscaled_ = upscaled_frames_ + 1;
+        check_armed_.store(true, std::memory_order_release);
+    }
     if (logging_ && latched_ && !passes_.empty()) {
         std::fprintf(stderr, "[rt] d3d12-metal scene frame %llu (upscaled frame %llu): %zu passes\n",
                      static_cast<unsigned long long>(frame_), static_cast<unsigned long long>(upscaled_frames_),

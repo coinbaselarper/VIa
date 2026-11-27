@@ -2,9 +2,10 @@
 # usage: d3d12_metal/tools/s7_world_run.sh NAME SECONDS [ENV=value ...]   (S4_BIN: another binary; S3_DUMP_EVERY)
 # s4_world_run.sh with a private run directory: saves, persistent storage, registry, drives and the Metal pipeline
 # archive live in build/d3m-s4-x86_64/rundir, reset from rundir-template (the imported user set) before every run,
-# so port/run/saves and port/run/overlay are never written. One gta6rt at a time: the slot is polled and a run that
-# collided with another title in its first seconds is killed and retried after a back-off.
-port="$(cd "$(dirname "$0")/../.." && pwd)"
+# so port/run/saves and port/run/overlay are never written. The slot, the per-run binary copy and every guard are
+# slot_lib.sh's; a run that collided with another title in its first seconds is killed and retried after a back-off.
+. "$(dirname "$0")/slot_lib.sh"
+port="$SLOT_PORT"
 root="$(cd "$port/.." && pwd)"
 name="$1"; secs="$2"; shift 2
 tree=$port/build/d3m-s4-x86_64
@@ -28,16 +29,15 @@ fi
 # S7_B_AFTER=T: from T s on, B instead of A every 5 s (B is "GOT IT" on the title's COULDN'T AUTOSAVE page, which A
 # retries: with A only the world phase stays behind that page from about +110 s).
 script="$(python3 -I -c 'import sys; s, b = int(sys.argv[1]), int(sys.argv[2]); print(",".join(("b@%d" if t >= b else "a@%d") % t for t in range(40, s - 19, 5)))' "$secs" "${S7_B_AFTER:-100000}")"
-busy() { ps -axo comm= | awk '{ n = $1; sub(/.*\//, "", n); if (n == "gta6rt" || n ~ /^gta6rt_/) f = 1 } END { exit !f }'; }
-mkdir -p $tree/run
 for attempt in $(seq 1 400); do
-  while busy; do sleep 0.2; done
+  slot_take "$name"
   rm -rf "$rd/saves" "$rd/overlay"
   cp -R "$tpl/saves" "$tpl/overlay" "$rd/"
-  cp -p ${S4_BIN:-$tree/gta6rt} $tree/run/gta6rt
+  slot_copy ${S4_BIN:-$tree/gta6rt} || exit 2
   rm -rf "$present"; mkdir -p "$present"; rm -f "$shapes"
   start=$(date +%s)
-  env GTA6RT_METAL_FOOTPRINT_CAP_MB=13312 GTA6RT_BIN=$tree/run/gta6rt GTA6RT_GPU=metal LEONIDA_PRESENT_FIRST_LIT="$present" \
+  echo "attempt $attempt $SLOT_START_LINE copy $SLOT_BIN" >> $scratch/$name.meta
+  env $(slot_env) GTA6RT_BIN=$SLOT_BIN GTA6RT_GPU=metal LEONIDA_PRESENT_FIRST_LIT="$present" \
       LEONIDA_SAVE_DIR="$rd/saves" GTA6RT_METAL_ARCHIVE_DIR="$rd/pipeline-archive" \
       LEONIDA_DSTORAGE_SHAPES="$shapes" "$@" "$port/host/tools/run.sh" "$((secs + 15))" "$name" --hidden-window \
       --run-dir "$rd" --trace=0 --trace-match BinkOpenWithOptions,BinkClose --watchdog "$secs" --memory-report 30 \
@@ -45,20 +45,19 @@ for attempt in $(seq 1 400); do
       --title-watchdog on --input-script "$script" &
   rpid=$!
   sleep 3
-  others=$(ps -axo pid=,comm= | awk -v me="$tree/run/gta6rt" '{ n = $2; sub(/.*\//, "", n); if ((n == "gta6rt" || n ~ /^gta6rt_/) && $2 != me) print $1 }')
-  if [ -n "$others" ]; then
-    pkill -9 -f "$tree/run/gta6rt"; wait $rpid
-    echo "attempt $attempt collided with $others at $(date +%T); backing off" >> $scratch/$name.meta
-    rm -f "$log"; sleep $((10 + RANDOM % 20)); continue
+  if slot_collided 2>> $scratch/$name.meta; then
+    wait $rpid; rm -f "$log"; slot_finish $scratch/$name.meta; sleep $((10 + RANDOM % 20)); continue
   fi
+  slot_guard $rpid "$log" $scratch/$name.meta
   ( log stream --style compact --level default --predicate 'process == "gta6rt" AND (messageType == error OR messageType == fault)' > $scratch/$name.unified.log 2>&1 ) &
   lpid=$!
   wait $rpid; rc=$?
   pkill -P $lpid 2>/dev/null; kill $lpid 2>/dev/null
   echo "attempt $attempt rc $rc $(date +%T) load $(sysctl -n vm.loadavg)" >> $scratch/$name.meta
-  [ $rc -eq 125 ] && continue
+  [ $rc -eq 125 ] && { slot_finish $scratch/$name.meta; continue; }
   break
 done
+slot_finish $scratch/$name.meta
 rm -rf "$rd/saves" "$rd/overlay"
 echo "[s3] saves: private copy of the imported set (LEONIDA_SAVE_DIR=$rd/saves, reset after the run)" >> "$log"
 python3 -I "$port/host/tools/s3_evidence.py" "$log" "$present" "$start" "$tool" "$shapes"

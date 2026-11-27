@@ -348,13 +348,7 @@ void MetalBindless::free_settled_generations(std::chrono::steady_clock::time_poi
 }
 
 bool MetalBindless::generation_free(Generation& g, std::chrono::steady_clock::time_point now) {
-    if (!g.retired) return false;
-    if (!g.settled) {
-        if (now - g.retired_time < std::chrono::milliseconds(100)) return false;
-        g.settle_marks = context_.submitted();
-        g.settled = true;
-    }
-    return context_.reached(g.retired_marks) && context_.reached(g.settle_marks);
+    return g.retired && context_.marks().passed(g.retired_marks, g.retired_time, now, g.settled, g.settle_marks);
 }
 
 // The table's changes since the last take, with any an in-place attempt took and left to the generation path.
@@ -373,12 +367,7 @@ DescriptorTable::Changes MetalBindless::take_all_changes() {
 std::uint64_t MetalBindless::release_empty_records(std::chrono::steady_clock::time_point now) {
     while (!empty_records_.empty()) {
         EmptyRecord& r = empty_records_.front();
-        if (!r.settled) {
-            if (now - r.time < std::chrono::milliseconds(100)) break;
-            r.settle_marks = context_.submitted();
-            r.settled = true;
-        }
-        if (!context_.reached(r.marks) || !context_.reached(r.settle_marks)) break;
+        if (!context_.marks().passed(r.marks, r.time, now, r.settled, r.settle_marks)) break;
         empty_records_.pop_front();
     }
     const std::uint64_t first = empty_records_.empty() ? next_record_ : empty_records_.front().id;
