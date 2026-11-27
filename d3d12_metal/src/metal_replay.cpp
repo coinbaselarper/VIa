@@ -4,6 +4,7 @@
 
 #include "metal_formats.h"
 #include "metal_context.h"
+#include "gfx10_descriptors.h"
 #include "rect_list_geometry.h"
 #include "title_va_alias.h"
 #include "vulkan_gpu_labels.h"
@@ -649,11 +650,20 @@ private:
 
     // GTA6RT_METAL_DRAW_TRACE=<part of a pipeline name>: the first 8 draws of such pipelines, with their vertex
     // buffers and the first two vertices' first 32 bytes as floats (read at the buffer's CPU address).
+    // GTA6RT_METAL_DRAW_TRACE_EVERY=N: then every Nth such draw too, 64 lines at most. GTA6RT_METAL_DRAW_TRACE_TABLE=
+    // <hex offsets>: the descriptor table at s8 (as the shader reads it, heap_base + s8) and, for each listed offset
+    // holding a V#, the V# and the first 32 words of the memory it names.
     void trace_draw(const Draw& draw, const MetalGraphicsPipeline& p) {
         static const char* want = std::getenv("GTA6RT_METAL_DRAW_TRACE");
         if (!want || !*want || !p.name || !std::strstr(p.name, want)) return;
-        static std::atomic<int> traced{0};
-        if (traced.fetch_add(1) >= 8) return;
+        static const unsigned every = [] {
+            const char* v = std::getenv("GTA6RT_METAL_DRAW_TRACE_EVERY");
+            return v ? unsigned(std::strtoul(v, nullptr, 10)) : 0u;
+        }();
+        static std::atomic<unsigned> seen{0}, printed{0};
+        const unsigned n = seen.fetch_add(1);
+        if (n >= 8 && (!every || n % every)) return;
+        if (printed.fetch_add(1) >= 64) return;
         std::string text;
         char line[256];
         std::snprintf(line, sizeof line, "%s: count %u instances %u first %u indexed %d topology %u viewport %.0f,%.0f %.0fx%.0f",
@@ -680,7 +690,64 @@ private:
                 text += line;
             }
         }
-        std::fprintf(stderr, "[rt] d3d12-metal: draw trace %s\n", text.c_str());
+        std::fprintf(stderr, "[rt] d3d12-metal: draw trace %u %s\n", n, text.c_str());
+        trace_table(draw);
+    }
+    bool read_va(std::uint64_t address, void* to, std::uint64_t bytes) {
+        std::uint64_t n = bytes;
+        gpu::Buffer* b = nullptr;
+        std::uint64_t off = 0;
+        if (!context_.buffer_at(address, n, b, off) || !b || !b->cpu_pointer() || n < bytes) return false;
+        std::memcpy(to, static_cast<const std::uint8_t*>(b->cpu_pointer()) + off, std::size_t(bytes));
+        return true;
+    }
+    void trace_table(const Draw& draw) {
+        static const char* offsets = std::getenv("GTA6RT_METAL_DRAW_TRACE_TABLE");
+        if (!offsets) return;
+        const std::uint64_t table = draw.user_data[8] & ~3u;
+        std::string text;
+        char line[160];
+        std::snprintf(line, sizeof line, "user s0..s15:");
+        text = line;
+        for (int i = 0; i < 16; ++i) {
+            std::snprintf(line, sizeof line, " %08x", draw.user_data[i]);
+            text += line;
+        }
+        std::uint32_t words[64] = {};
+        const bool ok = read_va(table, words, sizeof words);
+        std::snprintf(line, sizeof line, "; table 0x%llx%s", static_cast<unsigned long long>(table), ok ? ":" : " (not read)");
+        text += line;
+        for (int i = 0; ok && i < 64; ++i) {
+            std::snprintf(line, sizeof line, "%s%08x", i % 4 ? " " : " | ", words[i]);
+            text += line;
+        }
+        std::fprintf(stderr, "[rt] d3d12-metal: draw trace table %s\n", text.c_str());
+        for (const char* at = offsets; ok && *at;) {
+            char* end = nullptr;
+            const unsigned long o = std::strtoul(at, &end, 16);
+            if (end == at) break;
+            at = *end ? end + 1 : end;
+            if (o + 16 > sizeof words) continue;
+            gfx10::BufferWords w{words[o / 4], words[o / 4 + 1], words[o / 4 + 2], words[o / 4 + 3]};
+            gfx10::Buffer v{};
+            if (!gfx10::decode(w, v)) {
+                std::fprintf(stderr, "[rt] d3d12-metal: draw trace table +0x%lx: not a V#\n", o);
+                continue;
+            }
+            const std::uint64_t base = std::uint64_t(std::int64_t(v.address << 16) >> 16);
+            std::uint32_t cb[32] = {};
+            const bool read = v.num_records && read_va(base, cb, sizeof cb);
+            text.clear();
+            for (int i = 0; read && i < 32; ++i) {
+                float f;
+                std::memcpy(&f, &cb[i], 4);
+                std::snprintf(line, sizeof line, "%s%g", i % 4 ? " " : " | ", f);
+                text += line;
+            }
+            std::fprintf(stderr, "[rt] d3d12-metal: draw trace table +0x%lx: V# base 0x%llx stride %u records %u%s%s\n",
+                         o, static_cast<unsigned long long>(base), v.stride, v.num_records,
+                         read ? ", words as floats:" : " (not read)", text.c_str());
+        }
     }
 
     struct Cached {

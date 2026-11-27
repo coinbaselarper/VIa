@@ -8294,6 +8294,19 @@ public:
                      static_cast<unsigned long long>(bs.full_writes), static_cast<unsigned long long>(bs.slot_writes),
                      L::mib(std::int64_t(state_.arena.size)),
                      L::mib(std::int64_t(arena_in_use)), L::mib(std::int64_t(arena_peak)));
+        {
+            const auto ds = state_.gpu->stats();
+            std::fprintf(stderr,
+                         "[rt] gpu-releases t=%.0fs: %llu held until the command buffers before them completed, %llu "
+                         "released at once (nothing in flight); waiting now %llu (%.0f MiB of allocations), most %llu; "
+                         "command buffers %llu, failed %llu\n",
+                         seconds, static_cast<unsigned long long>(ds.releases_deferred),
+                         static_cast<unsigned long long>(ds.releases_immediate),
+                         static_cast<unsigned long long>(ds.releases_waiting), double(ds.releases_waiting_bytes) / 1048576.0,
+                         static_cast<unsigned long long>(ds.releases_waiting_max),
+                         static_cast<unsigned long long>(ds.command_buffers),
+                         static_cast<unsigned long long>(ds.command_buffer_errors));
+        }
         report_title_classes(seconds);
     }
 
@@ -8922,7 +8935,7 @@ public:
         stats.max_pass_bytes = std::max(stats.max_pass_bytes, filled);
         std::vector<Resource*> release;
         std::erase_if(retired_title_textures_, [&](const auto& r) {
-            if (now - r.first < std::chrono::seconds(3)) return false;  // descriptors may still be in flight
+            if (!state_.context->reached(r.first)) return false;  // a submission made before may still read it
             retired_backing_ -= r.second->image_backing_bytes();
             release.push_back(r.second);
             return true;
@@ -9399,7 +9412,8 @@ private:
     std::chrono::steady_clock::time_point title_retry_all_{};      // likewise
     leonida::TitleWriteRanges title_map_changes_;                  // likewise, scratch
     VkDeviceSize retired_backing_ = 0;
-    std::vector<std::pair<std::chrono::steady_clock::time_point, Resource*>> retired_title_textures_;  // likewise
+    std::vector<std::pair<std::vector<std::pair<leonida::gpu::Fence*, std::uint64_t>>, Resource*>>
+        retired_title_textures_;  // likewise
     std::vector<std::uint64_t> gone_candidates_;                   // likewise
     std::uint64_t gone_retired_ = 0, gone_retired_bytes_ = 0;      // likewise
     std::vector<std::uint8_t> title_tiled_, title_linear_;         // scratch, under title_texture_mutex
@@ -9618,10 +9632,10 @@ private:
     void retire_title_texture(TitleTexture& t) {
         if (!t.owned || !t.resource) return;
         // Its T#s leave the hash table now (a later texture at the address takes them over); the image itself goes
-        // a few seconds later, when no submission can still read it.
+        // once every queue completed what it had submitted by now.
         if (t.resource->image_address()) state_.forget_image(t.resource->image_address());
         retired_backing_ += t.resource->image_backing_bytes();
-        retired_title_textures_.emplace_back(std::chrono::steady_clock::now(), t.resource);
+        retired_title_textures_.emplace_back(state_.context->submitted(), t.resource);
         t.resource = nullptr;
         ++title_stats_.retired;
     }

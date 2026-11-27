@@ -1,5 +1,5 @@
 #!/bin/bash
-# usage: d3d12_metal/cache/tools/pcache_series.sh landing|far|prepared|prepared2
+# usage: d3d12_metal/cache/tools/pcache_series.sh landing|far|prepared|prepared2|world
 # The title runs behind STATUS-cache.md, one after another (each waits for the gta6rt slot). Archive directories under
 # build/pcache/runs/. A prepare_shaders whose pid is in build/pcache/prepare.pid is sent SIGSTOP during each run (this had
 # no effect under the measuring session's sandbox, so offline builds were run between title runs instead).
@@ -54,5 +54,13 @@ prepared2)
     run pcm-story-b 120 "$runs/big-a" MTL_SHADER_CACHE_SIZE=0 S2_INPUT_SCRIPT=a@40,a@55,a@70,a@85
     run pcm-prep-b 100 "$runs/prep-b" MTL_SHADER_CACHE_SIZE=0 S2_INPUT_SCRIPT=a@40,a@55,a@70,a@85
     ;;
-*) echo "usage: $0 landing|far|prepared|prepared2" >&2; exit 2 ;;
+world)
+    # Warm runs into the world phase on the directories prep-a / prep-b recorded (their manifests now hold the
+    # pipelines used up to the world's first frame), and a control with the cache off.
+    rm -rf "$runs/off-a"
+    run pcm-world-warm-a 100 "$runs/prep-a" MTL_SHADER_CACHE_SIZE=0 S2_INPUT_SCRIPT=a@40,a@55,a@70,a@85
+    run pcm-world-off-a 100 "$runs/off-a" MTL_SHADER_CACHE_SIZE=0 GTA6RT_METAL_PCACHE=0 S2_INPUT_SCRIPT=a@40,a@55,a@70,a@85
+    run pcm-world-warm-b 100 "$runs/prep-b" MTL_SHADER_CACHE_SIZE=0 S2_INPUT_SCRIPT=a@40,a@55,a@70,a@85
+    ;;
+*) echo "usage: $0 landing|far|prepared|prepared2|world" >&2; exit 2 ;;
 esac

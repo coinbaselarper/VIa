@@ -42,6 +42,9 @@ bool native_format(std::uint32_t dxgi, NativeFormat& out);
 MTLVertexFormat vertex_format(std::uint32_t dxgi);
 float quantize_d24(float depth);
 
+// Queue timelines and the values they must reach (MetalDevice::retire).
+using RetireMarks = std::vector<std::pair<id<MTLSharedEvent>, std::uint64_t>>;
+
 struct AtomicStats {
     std::atomic<std::uint64_t> pipelines_created{0}, pipelines_compiled{0}, render_encoders{0}, blit_encoders{0},
         compute_encoders{0}, barriers_noop{0}, barriers_fenced{0}, clears_folded{0}, command_buffers{0},
@@ -52,6 +55,8 @@ struct AtomicStats {
         queries_occlusion{0}, timestamps{0}, draws_skipped_not_ready{0}, d24_fragment_pipelines{0}, archive_hits{0},
         archive_misses{0}, pipelines_refused_limit{0}, presents{0}, present_planes{0};
     std::atomic<std::uint64_t> command_buffer_errors{0}, command_buffer_victims{0}, event_signals_repaired{0};
+    std::atomic<std::uint64_t> releases_deferred{0}, releases_immediate{0}, releases_waiting{0},
+        releases_waiting_bytes{0}, releases_waiting_max{0};
 };
 
 struct QueueErrors {
@@ -220,6 +225,11 @@ private:
     std::vector<id> kept_;
     std::vector<id<MTLAllocation>> slot_allocation_;
     std::unordered_map<void*, std::uint32_t> allocation_refs_;
+    struct PendingRemoval {
+        id<MTLAllocation> allocation;
+        RetireMarks marks;
+    };
+    std::deque<PendingRemoval> pending_removals_;
     bool dirty_ = false;
     std::uint64_t accounted_ = 0;
 };
@@ -623,6 +633,11 @@ public:
         std::lock_guard lock(mutex_);
         return serial_;
     }
+    // The timeline value every command buffer committed or being encoded now signals once it is done.
+    std::uint64_t retire_mark() {
+        std::lock_guard lock(mutex_);
+        return serial_ + open_;
+    }
 
 private:
     static constexpr std::uint32_t kFencePool = 9;
@@ -639,6 +654,7 @@ private:
     std::mutex mutex_;
     std::mutex submit_mutex_;
     std::uint64_t serial_ = 0;
+    std::uint64_t open_ = 0;
     std::vector<std::pair<id<MTLSharedEvent>, std::uint64_t>> pending_waits_;
     std::shared_ptr<QueueErrors> errors_ = std::make_shared<QueueErrors>();
     std::atomic<bool> inject_failure_{false}, inject_victim_{false};
@@ -807,6 +823,18 @@ public:
     void commit_residency();
     bool table_residency() const { return table_residency_; }
 
+    // Releases wait for the GPU (spike/r7-device-loss): Metal fails a command buffer with InvalidResource when an
+    // allocation it names (bound, in an argument buffer, in a residency set it uses) is released before the command
+    // buffer was scheduled, e.g. while it waits at an event. retire() keeps `object` and leaves `evict_allocation` in
+    // the device residency set until every command buffer committed or being encoded on any queue at the call has
+    // completed (its queue's timeline reached it); collect_retired() releases what has.
+    RetireMarks retire_marks();
+    static bool marks_reached(const RetireMarks& marks);
+    void retire(id object, id<MTLAllocation> evict_allocation = nil);
+    void collect_retired(bool everything = false);
+    void add_queue(MetalQueue* queue);
+    void remove_queue(MetalQueue* queue);
+
     // Set by a completed handler when Metal stopped running this process's work: a GPU timeout, submissions
     // ignored, device removed. Every later execute answers device_lost.
     std::atomic<bool>& gpu_fatal() { return gpu_fatal_; }
@@ -840,6 +868,16 @@ private:
     std::mutex residency_mutex_;
     id<MTLResidencySet> resident_ = nil;
     bool resident_dirty_ = false;
+    struct Retired {
+        id object = nil;
+        id<MTLAllocation> evict = nil;
+        std::uint64_t bytes = 0;
+        RetireMarks marks;
+    };
+    std::mutex retire_mutex_;
+    std::vector<MetalQueue*> queues_;
+    std::deque<Retired> retired_;
+    std::uint64_t retired_bytes_ = 0;
     bool table_residency_ = true;
     mutable std::mutex archive_mutex_;
     id<MTLBinaryArchive> archive_ = nil;

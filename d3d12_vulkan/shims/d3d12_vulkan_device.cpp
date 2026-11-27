@@ -3703,16 +3703,24 @@ struct DeviceState {
         if (!heap_textures_enabled()) return false;
         leonida::gfx10::Image image{};
         if (!leonida::gfx10::decode(words, image)) return false;
-        if (image.address < heap.shader_va || image.address >= heap.shader_va + heap.bytes || heap.shader_va == heap.console_va)
-            return false;
         std::lock_guard lock(heap_tsharp_mutex);
         if (const auto it = heap_tsharp_words.find(words); it != heap_tsharp_words.end()) {
             std::memcpy(out, it->second.data(), sizeof(it->second));
             return true;
         }
-        if (heap_tsharp_asked.insert(words).second)
+        if (image.address < heap.shader_va || image.address >= heap.shader_va + heap.bytes || heap.shader_va == heap.console_va)
+            return false;
+        if (heap_tsharp_asked.size() < 4096 && heap_tsharp_asked.insert(words).second)
             heap_tsharp_requests.push_back({words, heap.console_va + (image.address - heap.shader_va)});
         return false;
+    }
+    // The same for a T# naming title memory no texture starts at (no slot-133 placement, no slot-70 view made one):
+    // the title streamed the texture into its own memory and wrote its T# itself (UI sprites on the first-run pages).
+    void title_tsharp(const leonida::gfx10::ImageWords& words, std::uint64_t address) {
+        if (!heap_textures_enabled() || address < arena.size) return;
+        std::lock_guard lock(heap_tsharp_mutex);
+        if (heap_tsharp_asked.size() < 4096 && heap_tsharp_asked.insert(words).second)
+            heap_tsharp_requests.push_back({words, address});
     }
 
     static constexpr VkDeviceSize kHeapIndexReach = VkDeviceSize(1) << 26;  // 2^21 slots of 32 bytes
@@ -3764,6 +3772,10 @@ struct DeviceState {
             } else if (leonida::gfx10::is_image(words)) {
                 const char* why = nullptr;
                 const TitleImage result = bind_title_image(*this, words, &why);
+                if (result == TitleImage::unknown && why && !std::strcmp(why, "no texture at T# address")) {
+                    leonida::gfx10::Image image{};
+                    if (leonida::gfx10::decode(words, image)) title_tsharp(words, image.address);
+                }
                 if (result == TitleImage::unknown || result == TitleImage::refused) {
                     note_refused_tsharp(heap, slot * kDescriptorSize, words, why);
                     if (result == TitleImage::refused)
@@ -12983,11 +12995,20 @@ public:
             if (!g::decode(request.words, image)) continue;
             DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
             switch (image.format) {
-            case 77: format = DXGI_FORMAT_R32G32B32A32_FLOAT; break;
+            case 22: format = DXGI_FORMAT_R32_FLOAT; break;
             case 56: format = DXGI_FORMAT_R8G8B8A8_UNORM; break;
+            case 71: format = DXGI_FORMAT_R16G16B16A16_FLOAT; break;
+            case 77: format = DXGI_FORMAT_R32G32B32A32_FLOAT; break;
+            case 130: format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB; break;
             case 169: format = DXGI_FORMAT_BC1_UNORM; break;
             case 170: format = DXGI_FORMAT_BC1_UNORM_SRGB; break;
+            case 171: format = DXGI_FORMAT_BC2_UNORM; break;
             case 173: format = DXGI_FORMAT_BC3_UNORM; break;
+            case 174: format = DXGI_FORMAT_BC3_UNORM_SRGB; break;
+            case 175: format = DXGI_FORMAT_BC4_UNORM; break;
+            case 177: format = DXGI_FORMAT_BC5_UNORM; break;
+            case 181: format = DXGI_FORMAT_BC7_UNORM; break;
+            case 182: format = DXGI_FORMAT_BC7_UNORM_SRGB; break;
             default: break;
             }
             const std::uint32_t mode = (request.words[3] >> 20) & 0x1f;
@@ -13032,9 +13053,9 @@ public:
                 std::memcpy(served.data(), dest, sizeof(dest));
             }
             static std::atomic<int> logged{0};
-            if (logged.fetch_add(1, std::memory_order_relaxed) < 16)
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 64)
                 std::fprintf(stderr,
-                             "[rt] d3d12: T# into its console heap at 0x%llx (title memory 0x%llx, %ux%u, %u layers, "
+                             "[rt] d3d12: title-written T# at 0x%llx (bytes at 0x%llx, %ux%u, %u layers, "
                              "format %u, swizzle mode %u): %s\n",
                              static_cast<unsigned long long>(image.address), static_cast<unsigned long long>(request.cpu),
                              image.width, image.height, image.layer_count, image.format, mode,

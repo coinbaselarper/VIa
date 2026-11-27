@@ -1348,6 +1348,7 @@ public:
                                     const VkPhysicalDeviceLimits& limits) {
         std::unique_lock lock(resource_mutex_);
         counted_dispatch_ = std::make_unique<IndirectDispatchCounter>(get, device_, memory, limits);
+        if (pool_frees_deferred()) counted_dispatch_->set_release(deferred_buffer_release());
     }
     // Indexed quad lists are drawn from triangle indices a compute pass writes into the copy scratch
     // (quad_index_expand.h). Call only with bufferDeviceAddress enabled and after an enable_copy_scratch whose chunks
@@ -1375,6 +1376,7 @@ public:
             indirect_clamp_.reset();
             return;
         }
+        if (pool_frees_deferred()) indirect_clamp_->set_release(deferred_buffer_release());
         // The preparation callback needs this submission's counter-slot batch, so it is set per ExecuteCommandLists
         // (execute()); recording the pass has no per-submission state.
         replay_.emit_indirect_clamp = [this](VkCommandBuffer command_buffer, const ClampedIndirect& job) {
@@ -1915,6 +1917,24 @@ public:
         scratch_ = std::make_unique<ScratchBuffers>(get, device_, std::move(allocate), extra_usage, std::move(families),
                                                     device_fault_.get());
         if (!scratch_->loaded()) scratch_.reset();
+        else if (pool_frees_deferred()) scratch_->set_release(deferred_buffer_release());
+    }
+
+    // port/: the scratch pools free their device-address buffers through the deferred deletion queue, whose
+    // two-phase drain keeps the memory until every submission made while the buffer lived is done
+    // (ScratchBuffers::Release). LEONIDA_POOL_FREE=now frees them at once, as before.
+    static bool pool_frees_deferred() {
+        static const bool deferred = [] {
+            const char* v = std::getenv("LEONIDA_POOL_FREE");
+            return !v || std::strcmp(v, "now");
+        }();
+        return deferred;
+    }
+    ScratchBuffers::Release deferred_buffer_release() {
+        return [this](VkBuffer buffer, VkDeviceMemory memory) {
+            defer_destroy(DeferredDeletionQueue::Kind::buffer, buffer);
+            defer_destroy(DeferredDeletionQueue::Kind::device_memory, memory);
+        };
     }
 
     // Called after that command buffer's submit: true when it was accepted, false when vkQueueSubmit failed. The

@@ -101,9 +101,14 @@ MetalQueue::MetalQueue(MetalDevice* device, QueueType type, id<MTLCommandQueue> 
     : device_(device), type_(type), queue_(queue) {
     timeline_ = [device->mtl() newSharedEvent];
     for (auto& f : fences_) f = [device->mtl() newFence];
+    device_->add_queue(this);
 }
 
-MetalQueue::~MetalQueue() { wait_idle(5'000'000'000ull); }
+MetalQueue::~MetalQueue() {
+    wait_idle(5'000'000'000ull);
+    device_->remove_queue(this);
+    device_->collect_retired();
+}
 
 EncoderFences MetalQueue::open_encoder(Join mode, std::span<const void* const> untracked_targets) {
     static const bool no_target_join = [] {
@@ -166,6 +171,11 @@ void encode_invalid_resource(id<MTLDevice> device, id<MTLCommandBuffer> cb) {
 }  // namespace
 
 id<MTLCommandBuffer> MetalQueue::begin_command_buffer() {
+    device_->collect_retired();
+    {
+        std::lock_guard lock(mutex_);
+        ++open_;
+    }
     device_->commit_residency();
     const bool fail = inject_failure_.exchange(false);
     if (fail) {
@@ -240,6 +250,7 @@ void MetalQueue::end_command_buffer(id<MTLCommandBuffer> cb, std::span<const Eve
     const double slow_ms = slow_command_buffer_ms();
     std::lock_guard lock(mutex_);
     const std::uint64_t serial = ++serial_;
+    if (open_) --open_;
     [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
       const double gpu = done.GPUStartTime > 0 && done.GPUEndTime > done.GPUStartTime ? done.GPUEndTime - done.GPUStartTime : 0;
       if (gta6rt_hud_active() && gpu > 0) gta6rt_hud_note_gpu_ns(std::uint64_t(gpu * 1e9));

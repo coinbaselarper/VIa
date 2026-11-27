@@ -152,7 +152,7 @@ Held& add_locked(State& s, const std::string& key, const std::string& text, cons
 }
 
 bool should_hold_locked(const State& s, const Held& h) {
-    return int(h.phase) <= int(s.phase) + 2 && s.held_count < s.max_hold;
+    return s.held_count < s.max_hold;
 }
 
 void note_use_locked(State& s, const std::string& key, const std::string& text, const Spec& spec, const char* how) {

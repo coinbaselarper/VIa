@@ -28,6 +28,11 @@ class ScratchBuffers {
 public:
     // A device-local allocation for a chunk; null on failure.
     using Allocate = std::function<VkDeviceMemory(const VkMemoryRequirements&)>;
+    // port/: where a dropped chunk goes instead of being freed at once. MoltenVK names every buffer with a device
+    // address in each command buffer it encodes while the buffer lives (useResources), unretained, so a chunk freed
+    // when its own submission is done can fail a later command buffer that is not scheduled yet (Invalid Resource,
+    // the world-phase device loss: spike/r7-device-loss). The owner passes its deferred deletion queue.
+    using Release = std::function<void(VkBuffer, VkDeviceMemory)>;
     // What the copy staging needs: transfer both ways.
     static constexpr VkBufferUsageFlags transfer_usage =
         VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
@@ -67,6 +72,7 @@ public:
     ScratchBuffers& operator=(const ScratchBuffers&) = delete;
 
     bool loaded() const { return loaded_; }
+    void set_release(Release release) { release_ = std::move(release); }
 
     // `bytes` of scratch for the next submission, at a 256-byte aligned offset (more than any copy needs).
     bool get(std::uint64_t bytes, VkBuffer& buffer, VkDeviceSize& offset) {
@@ -95,7 +101,8 @@ public:
                 ++i;
                 continue;
             }
-            release(retired_[i]);
+            for (auto& chunk : retired_[i].chunks) drop(chunk);
+            retired_[i].chunks.clear();
             retired_.erase(retired_.begin() + std::ptrdiff_t(i));
         }
     }
@@ -117,7 +124,7 @@ public:
             for (auto& chunk : retired_[i].chunks) {
                 chunk.used = 0;
                 if (spare_.size() < 4) spare_.push_back(chunk);
-                else destroy(chunk);
+                else drop(chunk);
             }
             retired_[i].chunks.clear();
             retired_.erase(retired_.begin() + std::ptrdiff_t(i));
@@ -223,6 +230,11 @@ private:
         if (chunk.memory) vk_.vkFreeMemory(device_, chunk.memory, nullptr);
         chunk = {};
     }
+    void drop(Chunk& chunk) {
+        if (!release_) return destroy(chunk);
+        release_(chunk.buffer, chunk.memory);
+        chunk = {};
+    }
     void release(Batch& batch) {
         for (auto& chunk : batch.chunks) destroy(chunk);
         batch.chunks.clear();
@@ -235,6 +247,7 @@ private:
     std::vector<std::uint32_t> families_;
     bool addressable_ = false;
     Functions vk_;
+    Release release_;
     bool loaded_ = false;
     Batch current_;               // handed out, not yet submitted
     std::vector<Batch> retired_;  // submitted, waiting for the GPU

@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <charconv>
+#include <functional>
 #include <string_view>
 #include <limits>
 #include <memory>
@@ -57,6 +58,9 @@ public:
     IndirectDispatchCounter(const IndirectDispatchCounter&) = delete;
     IndirectDispatchCounter& operator=(const IndirectDispatchCounter&) = delete;
 
+    // port/: the batches' buffers have device addresses; as for ScratchBuffers::Release.
+    void set_release(std::function<void(VkBuffer, VkDeviceMemory)> release) { release_ = std::move(release); }
+
     // Retained by the command-buffer slot until its submission's timeline ticket completes.
     struct Batch {
         IndirectDispatchCounter& owner;
@@ -68,6 +72,10 @@ public:
         explicit Batch(IndirectDispatchCounter& value) : owner(value) {}
         ~Batch() {
             for (auto& a : allocations) {
+                if (owner.release_) {
+                    owner.release_(a.buffer, a.memory);
+                    continue;
+                }
                 if (a.buffer) owner.fn<PFN_vkDestroyBuffer>("vkDestroyBuffer")(owner.device_, a.buffer, nullptr);
                 if (a.memory) owner.fn<PFN_vkFreeMemory>("vkFreeMemory")(owner.device_, a.memory, nullptr);
             }
@@ -170,6 +178,7 @@ public:
     }
 
 private:
+    std::function<void(VkBuffer, VkDeviceMemory)> release_;
     template<typename T> T fn(const char* name) const { return reinterpret_cast<T>(get_(device_, name)); }
     bool make_pipeline() {
         if (pipeline_) return true;

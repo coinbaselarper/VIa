@@ -146,6 +146,7 @@ public:
     bool loaded() const { return scratch_.loaded() && limits_.maxComputeWorkGroupCount[0] != 0; }
 
     // The record pool's life cycle, as the copy scratch's (vulkan_scratch.h).
+    void set_release(ScratchBuffers::Release release) { scratch_.set_release(std::move(release)); }
     void collect() { scratch_.collect(); }
     void retire(VkSemaphore timeline, std::uint64_t ticket) { scratch_.retire(timeline, ticket); }
     void forget(VkSemaphore timeline) { scratch_.forget(timeline); }

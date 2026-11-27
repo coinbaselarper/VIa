@@ -17,7 +17,7 @@
 
 namespace gta6rt::gpu {
 
-inline constexpr std::uint32_t api_version = 4;  // 3: texture views; 4: texture copies, 32-bit fills (port/d3d12_metal)
+inline constexpr std::uint32_t api_version = 5;  // 3: texture views; 4: texture copies, 32-bit fills; 5: deferred releases (port/d3d12_metal)
 
 enum class Status : std::int32_t {
     ok = 0,
@@ -192,6 +192,12 @@ struct DeviceStats {
     std::uint64_t command_buffer_errors = 0;     // completed with MTLCommandBufferStatusError (wait_idle: device_lost)
     std::uint64_t command_buffer_victims = 0;    // of those, discarded by Metal's recovery from another GPU error
     std::uint64_t event_signals_repaired = 0;    // event signals a failed command buffer skipped, done by the CPU
+    // v5: releases held until the command buffers that may name them completed (MetalDevice::retire)
+    std::uint64_t releases_deferred = 0;
+    std::uint64_t releases_immediate = 0;        // no command buffer was in flight
+    std::uint64_t releases_waiting = 0;
+    std::uint64_t releases_waiting_bytes = 0;    // allocations among them still in the device residency set
+    std::uint64_t releases_waiting_max = 0;
 };
 
 // ---- memory accounting and pressure (DESIGN.md 8) ----

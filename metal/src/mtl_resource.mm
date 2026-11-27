@@ -56,10 +56,8 @@ MetalBuffer::MetalBuffer(MetalDevice* device, id<MTLBuffer> buffer, std::uint64_
 
 MetalBuffer::~MetalBuffer() {
     if (va_) device_->va_space().remove(va_, this);
-    if (!placed_) {
-        device_->evict(buffer_);
-        device_->ledger().remove(category_, accounted_);
-    }
+    device_->retire(buffer_, placed_ ? nil : buffer_);
+    if (!placed_) device_->ledger().remove(category_, accounted_);
 }
 
 void* MetalBuffer::cpu_pointer() {
@@ -90,10 +88,9 @@ MetalTexture::MetalTexture(MetalDevice* device, id<MTLTexture> texture, const Te
 }
 
 MetalTexture::~MetalTexture() {
-    if (!placed_) {
-        device_->evict(texture_);
-        if (category_ != MemoryCategory::count) device_->ledger().remove(category_, accounted_);
-    }
+    device_->retire(texture_, placed_ ? nil : texture_);
+    if (view_) device_->retire(view_);
+    if (!placed_ && category_ != MemoryCategory::count) device_->ledger().remove(category_, accounted_);
 }
 
 Status MetalTexture::write_region(std::uint32_t mip, std::uint32_t layer, std::uint32_t x, std::uint32_t y,
@@ -128,7 +125,7 @@ MetalHeap::MetalHeap(MetalDevice* device, id<MTLHeap> heap, std::uint64_t va_bas
 
 MetalHeap::~MetalHeap() {
     arena_.reset();
-    device_->evict(heap_);
+    device_->retire(heap_, heap_);
     device_->ledger().remove(MemoryCategory::heap, accounted_);
 }
 
@@ -141,20 +138,28 @@ MetalDescriptorHeap::MetalDescriptorHeap(MetalDevice* device, const DescriptorHe
     device_->ledger().add(MemoryCategory::descriptor_table, accounted_);
 }
 
-MetalDescriptorHeap::~MetalDescriptorHeap() { device_->ledger().remove(MemoryCategory::descriptor_table, accounted_); }
+MetalDescriptorHeap::~MetalDescriptorHeap() {
+    device_->retire(buffer_);
+    if (residency_) device_->retire(residency_);
+    for (id object : kept_)
+        if (object) device_->retire(object);
+    device_->ledger().remove(MemoryCategory::descriptor_table, accounted_);
+}
 
 void MetalDescriptorHeap::set_slot(std::uint32_t slot, std::uint64_t raw, id object, id<MTLAllocation> allocation) {
     std::lock_guard lock(mutex_);
     static_cast<std::uint64_t*>(buffer_.contents)[slot] = raw;
-    kept_[slot] = object;
+    if (kept_[slot] != object) {
+        if (kept_[slot]) device_->retire(kept_[slot]);
+        kept_[slot] = object;
+    }
     id<MTLAllocation> old = slot_allocation_[slot];
     if (old == allocation) return;
     if (old) {
         auto it = allocation_refs_.find((__bridge void*)old);
         if (it != allocation_refs_.end() && --it->second == 0) {
             allocation_refs_.erase(it);
-            if (residency_) [residency_ removeAllocation:old];
-            dirty_ = true;
+            if (residency_) pending_removals_.push_back({old, device_->retire_marks()});
         }
     }
     slot_allocation_[slot] = allocation;
@@ -229,6 +234,14 @@ std::uint64_t MetalDescriptorHeap::read_raw(std::uint32_t slot) const {
 id<MTLResidencySet> MetalDescriptorHeap::residency_for_submit() {
     std::lock_guard lock(mutex_);
     if (!residency_) return nil;
+    while (!pending_removals_.empty() && MetalDevice::marks_reached(pending_removals_.front().marks)) {
+        id<MTLAllocation> a = pending_removals_.front().allocation;
+        pending_removals_.pop_front();
+        if (!allocation_refs_.count((__bridge void*)a)) {
+            [residency_ removeAllocation:a];
+            dirty_ = true;
+        }
+    }
     if (dirty_) {
         [residency_ commit];
         dirty_ = false;
@@ -250,7 +263,8 @@ MetalQueryHeap::MetalQueryHeap(MetalDevice* device, const QueryHeapDesc& desc, i
 }
 
 MetalQueryHeap::~MetalQueryHeap() {
-    if (results_) device_->evict(results_);
+    if (results_) device_->retire(results_, results_);
+    if (samples_) device_->retire(samples_);
     device_->ledger().remove(MemoryCategory::internal, accounted_);
 }
 

@@ -181,6 +181,7 @@ MetalDevice::MetalDevice(id<MTLDevice> device, const DeviceOptions& options) : d
 
 MetalDevice::~MetalDevice() {
     if (pressure_source_) dispatch_source_cancel(pressure_source_);
+    collect_retired(true);
 }
 
 id<MTLComputePipelineState> MetalDevice::builtin_kernel(const char* name) {
@@ -209,7 +210,7 @@ id<MTLBuffer> MetalDevice::quad_pattern(std::uint32_t quads) {
         std::memcpy(p + q * 6, t, sizeof(t));
     }
     if (quad_pattern_) {
-        evict(quad_pattern_);
+        retire(quad_pattern_, quad_pattern_);
         ledger_.remove(MemoryCategory::internal, quad_pattern_.allocatedSize);
     }
     make_resident(b);
@@ -231,6 +232,75 @@ void MetalDevice::evict(id<MTLAllocation> allocation) {
     std::lock_guard lock(residency_mutex_);
     [resident_ removeAllocation:allocation];
     resident_dirty_ = true;
+}
+
+void MetalDevice::add_queue(MetalQueue* queue) {
+    std::lock_guard lock(retire_mutex_);
+    queues_.push_back(queue);
+}
+
+void MetalDevice::remove_queue(MetalQueue* queue) {
+    std::lock_guard lock(retire_mutex_);
+    std::erase(queues_, queue);
+}
+
+RetireMarks MetalDevice::retire_marks() {
+    RetireMarks marks;
+    std::lock_guard lock(retire_mutex_);
+    for (MetalQueue* q : queues_) {
+        const std::uint64_t mark = q->retire_mark();
+        if (q->timeline().signaledValue < mark) marks.emplace_back(q->timeline(), mark);
+    }
+    return marks;
+}
+
+bool MetalDevice::marks_reached(const RetireMarks& marks) {
+    for (const auto& [timeline, value] : marks)
+        if (timeline.signaledValue < value) return false;
+    return true;
+}
+
+void MetalDevice::retire(id object, id<MTLAllocation> evict_allocation) {
+    if (!object && !evict_allocation) return;
+    Retired r;
+    r.object = object;
+    r.evict = evict_allocation;
+    {
+        std::lock_guard lock(retire_mutex_);
+        for (MetalQueue* q : queues_) {
+            const std::uint64_t mark = q->retire_mark();
+            if (q->timeline().signaledValue < mark) r.marks.emplace_back(q->timeline(), mark);
+        }
+        if (!r.marks.empty()) {
+            r.bytes = evict_allocation ? evict_allocation.allocatedSize : 0;
+            retired_bytes_ += r.bytes;
+            retired_.push_back(std::move(r));
+            stats_.releases_deferred++;
+            stats_.releases_waiting = retired_.size();
+            stats_.releases_waiting_bytes = retired_bytes_;
+            if (retired_.size() > stats_.releases_waiting_max) stats_.releases_waiting_max = retired_.size();
+            return;
+        }
+    }
+    stats_.releases_immediate++;
+    if (r.evict) evict(r.evict);
+}
+
+void MetalDevice::collect_retired(bool everything) {
+    std::vector<Retired> done;
+    {
+        std::lock_guard lock(retire_mutex_);
+        while (!retired_.empty() && (everything || marks_reached(retired_.front().marks))) {
+            retired_bytes_ -= retired_.front().bytes;
+            done.push_back(std::move(retired_.front()));
+            retired_.pop_front();
+        }
+        if (done.empty()) return;
+        stats_.releases_waiting = retired_.size();
+        stats_.releases_waiting_bytes = retired_bytes_;
+    }
+    for (Retired& r : done)
+        if (r.evict) evict(r.evict);
 }
 
 void MetalDevice::commit_residency() {
@@ -347,6 +417,11 @@ DeviceStats MetalDevice::stats() const {
     s.command_buffer_errors = stats_.command_buffer_errors;
     s.command_buffer_victims = stats_.command_buffer_victims;
     s.event_signals_repaired = stats_.event_signals_repaired;
+    s.releases_deferred = stats_.releases_deferred;
+    s.releases_immediate = stats_.releases_immediate;
+    s.releases_waiting = stats_.releases_waiting;
+    s.releases_waiting_bytes = stats_.releases_waiting_bytes;
+    s.releases_waiting_max = stats_.releases_waiting_max;
     return s;
 }
 

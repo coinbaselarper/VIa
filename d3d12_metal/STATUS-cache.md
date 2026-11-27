@@ -98,10 +98,14 @@ Tests: `ctest --test-dir port/build/pcache-x86_64` and `-arm64`: 3/3 pass on bot
   threads one is always free for the title's own first uses. Never a title thread.
 - At first use (`ensure_built` / `ensure_rect`) the pipeline with the same key is handed over: ready (no wait), or
   still compiling, then moved to `Priority::demand` (`precompile`) so it jumps the queue. Otherwise created as before.
-- Held (kept for hand-over) are entries up to two phases ahead, at most 4,096 (`GTA6RT_METAL_PCACHE_HOLD`); later
-  phases are built into the archive and released, and queued again (archive hit, about 1 ms) when the title gets
-  within two phases. Governor level 2+ (`GTA6RT_GOV_COMPILE_SHRINK`, `include/gta6rt/governor.h`) pauses the prebuild
-  and releases held pipelines (seen once in pcm-far-b: 4 released).
+- Held (kept for hand-over): every prebuilt entry, at most 4,096 (`GTA6RT_METAL_PCACHE_HOLD`); past that they are
+  built into the archive and released. Holding costs no measurable footprint (below). Until 20:10 the hold covered only
+  entries up to one, then two phases ahead; pcm-world-warm-a shows why that was wrong: its story-load entries were
+  built at boot, released, re-queued at the first-run pages, but the governor paused the prebuild at level 2 during the
+  story load, so 12 of them were created at first use from the archive (47-103 ms each) instead of handed over.
+- Governor (`include/gta6rt/governor.h`, action `GTA6RT_GOV_COMPILE_SHRINK`): level 1 pauses the prebuild, level 2
+  also releases held pipelines (the archive keeps them), level 0 resumes. Seen in pcm-far-b, pcm-big-a and
+  pcm-world-warm-a (story load, footprint 10-12 GiB).
 - `GTA6RT_METAL_PCACHE=0`: no recorder, no prebuild; the hooks call the backend exactly as before.
 
 ### Archive
@@ -112,10 +116,14 @@ Tests: `ctest --test-dir port/build/pcache-x86_64` and `-arm64`: 3/3 pass on bot
   different file; a stale key file under the same name is ignored and overwritten.
 - `open_archive`: a file Metal cannot read (torn, foreign) is moved to `.unreadable` and a new archive started.
   Before, the adapter then ran with no archive at all (Metal: "has an invalid format").
-- Written by the adapter's flusher every 20 s while it grows, and at exit (serialize to `.tmp`, rename). Runs end on
-  the kill timer, so the last 20 s may be lost, never the file. `flush_archive`: after one failed serialize (MDB_MAP_FULL)
-  no further flush in that run, because Metal's in-memory archive is damaged then and would overwrite the good file
-  with a fraction.
+- Written by the adapter's flusher every 20 s while it grows, and at exit (serialize to `.tmp`, rename), through
+  `pcache::flush_archive`: (1) the periodic write waits while the backend's compile queue has work, at most 120 s
+  since the last write, because a serialize holds the lock every compile needs (3.7-7.5 s per write of a 100 MB
+  archive in pcm-big-a; 70 s for 35 MB and 205 s for 58 MB offline next to compiles); (2) after one failed serialize
+  (MDB_MAP_FULL) no further write in that run, because Metal's in-memory archive is damaged then and a later serialize
+  wrote 7.7 MB over the 180 MB file. Runs end on a kill timer or a crash, so what was compiled since the last write can
+  be lost (the manifest, written every 10 s and at each phase change, still names it, so the next run's prebuild
+  compiles it in the background), never the file.
 
 ## Measurements
 
