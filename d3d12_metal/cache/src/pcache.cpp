@@ -2,10 +2,12 @@
 #include "phase.h"
 
 #include <gta6rt/governor.h>
+#include <gta6rt_metal/metal_backend.h>
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdarg>
 #include <cstdio>
@@ -82,12 +84,19 @@ struct State {
     std::unordered_map<std::string, Phase> boot_keys, boot_labels;
     std::unordered_map<std::string, unsigned> label_uses;
     std::unordered_map<std::string, std::unique_ptr<Held>> table;
-    std::set<std::tuple<int, std::uint64_t, std::string>> queue;
+    // (speculative, phase, first-use order, key): every recorded pipeline before any bootstrap guess.
+    std::set<std::tuple<int, int, std::uint64_t, std::string>> queue;
     std::uint64_t seq = 0;
     std::vector<Held*> in_flight;
     std::vector<Watch> watch;
     Phase phase = Phase::boot;
     bool movie = false;
+    double quiet_until = 0, quiet_s = 10;
+    double world_t0 = 0, world_next = 0;
+    std::uint64_t world_skips0 = 0, world_first_uses0 = 0, world_ready0 = 0, world_waits0 = 0;
+    double world_wait_longest = 0;
+    std::string world_wait_label;
+    std::uint64_t flushed_pending = 0;
     std::size_t held_count = 0, max_hold = 4096;
     Stats stats;
     std::thread worker, monitor;
@@ -128,10 +137,21 @@ void log_line(const char* fmt, ...) {
 }
 
 // Called with the lock held.
+std::tuple<int, int, std::uint64_t, std::string> queue_key(const Held& h) {
+    return {h.bootstrap ? 1 : 0, int(h.phase), h.seq, h.key};
+}
+
 void enqueue_locked(State& s, Held& h) {
     h.state = HeldState::queued;
-    s.queue.emplace(int(h.phase), h.seq, h.key);
+    s.queue.emplace(queue_key(h));
     s.cv.notify_all();
+}
+
+// The first seconds of the world (its opening cutscene) and of a movie: only pipelines recorded for the phase so
+// far are prebuilt, no guesses and nothing of a later phase.
+bool startable_locked(const State& s, const Held& h) {
+    if (process_age_s() >= s.quiet_until) return true;
+    return !h.bootstrap && int(h.phase) <= int(s.phase);
 }
 
 Held& add_locked(State& s, const std::string& key, const std::string& text, const Spec& spec, Phase phase, bool bootstrap) {
@@ -218,10 +238,18 @@ std::string report_locked(State& s) {
     if (s.cfg.device) {
         const auto pc = s.cfg.device->pipeline_cache_stats();
         const auto ds = s.cfg.device->stats();
+        const auto q = s.cfg.device->compile_queue_stats();
         std::snprintf(buf, sizeof buf,
-                      "; archive %s: %llu hits, %llu misses, %llu added, %llu bytes on disk; draws skipped not ready %llu",
-                      pc.open ? (pc.loaded ? "loaded" : "new") : "off", (unsigned long long)pc.hits,
-                      (unsigned long long)pc.misses, (unsigned long long)pc.added, (unsigned long long)pc.file_bytes,
+                      "; archive %s: %u shards, %llu hits, %llu misses, %llu added (%llu not written yet), %llu bytes on "
+                      "disk, longest shard write %.2f s, %llu write failures; build time: lookups %.1f s, compiles %.1f "
+                      "s, archive adds %.1f s; compile queue: %llu running (%llu background, limits %u/%u), queued "
+                      "%llu/%llu/%llu; draws skipped not ready %llu",
+                      pc.open ? (pc.loaded ? "loaded" : "new") : "off", pc.shards, (unsigned long long)pc.hits,
+                      (unsigned long long)pc.misses, (unsigned long long)pc.added, (unsigned long long)pc.pending,
+                      (unsigned long long)pc.file_bytes, pc.serialize_longest, (unsigned long long)pc.flush_failures,
+                      pc.lookup_seconds, pc.compile_seconds, pc.add_seconds, (unsigned long long)q.running,
+                      (unsigned long long)q.running_background, q.active_limit, q.background_limit,
+                      (unsigned long long)q.queued[0], (unsigned long long)q.queued[1], (unsigned long long)q.queued[2],
                       (unsigned long long)ds.draws_skipped_not_ready);
         out += buf;
     }
@@ -305,12 +333,20 @@ void worker_main() {
     State& s = st();
     std::unique_lock lock(s.m);
     while (!s.stopping) {
-        s.cv.wait(lock, [&] {
+        s.cv.wait_for(lock, std::chrono::milliseconds(250), [&] {
             return s.stopping || (!s.paused && !s.queue.empty() && s.in_flight.size() < s.cfg.max_in_flight);
         });
         if (s.stopping) break;
-        const auto key = std::get<2>(*s.queue.begin());
-        s.queue.erase(s.queue.begin());
+        if (s.paused || s.queue.empty() || s.in_flight.size() >= s.cfg.max_in_flight) continue;
+        auto qi = s.queue.begin();
+        while (qi != s.queue.end()) {
+            auto t = s.table.find(std::get<3>(*qi));
+            if (t == s.table.end() || startable_locked(s, *t->second)) break;
+            ++qi;
+        }
+        if (qi == s.queue.end()) continue;
+        const auto key = std::get<3>(*qi);
+        s.queue.erase(qi);
         auto it = s.table.find(key);
         if (it == s.table.end() || it->second->state != HeldState::queued) continue;
         Held& h = *it->second;
@@ -392,6 +428,14 @@ void poll_locked(State& s) {
             ++s.stats.waits;
             s.stats.wait_sum += waited;
             if (!w.adopted) ++(w.pipeline->from_archive() ? s.stats.demand_ready_from_archive : s.stats.demand_compiled);
+            if (s.world_t0 > 0 && waited > s.world_wait_longest) {
+                s.world_wait_longest = waited;
+                s.world_wait_label = w.key;
+                if (const Entry* e = s.run.find(w.key)) {
+                    Spec spec;
+                    if (decode(e->text, spec)) s.world_wait_label = label_of(spec);
+                }
+            }
             if (waited > s.stats.wait_longest) {
                 s.stats.wait_longest = waited;
                 auto it = s.table.find(w.key);
@@ -419,7 +463,23 @@ void set_phase_locked(State& s, Phase p) {
     const Phase before = s.phase;
     s.phase = p;
     if (p != Phase::landing) s.movie = false;
+    if (p == Phase::world) {
+        s.quiet_until = process_age_s() + s.quiet_s;
+        s.world_t0 = s.world_next = process_age_s();
+        s.world_skips0 = s.cfg.device ? s.cfg.device->stats().draws_skipped_not_ready : 0;
+        s.world_first_uses0 = s.stats.first_uses;
+        s.world_ready0 = s.stats.adopted_ready;
+        s.world_waits0 = s.stats.waits;
+    }
     log_line("phase %s -> %s at t=%.1fs", phase_name(before), phase_name(p), process_age_s());
+    if (s.cfg.device) {
+        const bool late = p == Phase::story_load || p == Phase::world;
+        const std::uint32_t threads = std::max<std::uint32_t>(1, s.cfg.device->compile_queue_stats().active_limit);
+        const char* v = std::getenv("GTA6RT_METAL_PCACHE_LATE_BACKGROUND");
+        const std::uint32_t bg = late ? (v ? std::uint32_t(std::atoi(v)) : 1) : std::max<std::uint32_t>(1, threads - 1);
+        if (bg) gta6rt::metal::set_compile_limits(s.cfg.device, 0, bg);
+        gta6rt::metal::set_pipeline_cache_tag(s.cfg.device, phase_name(p));
+    }
     for (auto& [k, h] : s.table)
         if (h->state == HeldState::dropped && int(h->phase) <= int(p) + 2) enqueue_locked(s, *h);
     write_locked(s, "phase change");
@@ -452,7 +512,35 @@ void monitor_main() {
         }
         // Every 2 s while there is something new: the world's first seconds are where runs end in a crash.
         if (tick % 200 == 0 && (s.dirty || !s.run_lines.empty())) write_locked(s, "periodic");
+        // The world's first seconds: what was handed over ready, what is still compiling, draws dropped meanwhile.
+        if (s.world_t0 > 0 && s.cfg.device && process_age_s() >= s.world_next) {
+            const double rel = process_age_s() - s.world_t0;
+            s.world_next = s.world_t0 + (rel < 14.5 ? std::floor(rel) + 1 : rel < 118 ? std::floor(rel / 5) * 5 + 5 : 1e30);
+            const auto q = s.cfg.device->compile_queue_stats();
+            const std::uint64_t skips = s.cfg.device->stats().draws_skipped_not_ready;
+            log_line("world+%.0fs: draws skipped not ready %llu since the world began; first uses %llu (handed over ready "
+                     "%llu, compiled or waited for %llu); first-use waits %llu, longest %.0f ms (%s); compiles running "
+                     "%llu, queued %llu",
+                     rel, (unsigned long long)(skips - s.world_skips0),
+                     (unsigned long long)(s.stats.first_uses - s.world_first_uses0),
+                     (unsigned long long)(s.stats.adopted_ready - s.world_ready0),
+                     (unsigned long long)(s.stats.first_uses - s.world_first_uses0 - (s.stats.adopted_ready - s.world_ready0)),
+                     (unsigned long long)(s.stats.waits - s.world_waits0), s.world_wait_longest * 1e3,
+                     s.world_wait_label.empty() ? "-" : s.world_wait_label.c_str(), (unsigned long long)q.running,
+                     (unsigned long long)(q.queued[0] + q.queued[1] + q.queued[2]));
+        }
         if (tick % 3000 == 0) log_line("%s", report_locked(s).c_str());
+        // A burst of new pipelines (the world's first seconds) is written at once, not at the next 20 s flush: runs
+        // have ended there in a crash. The write holds no lock a compile needs.
+        if (tick % 100 == 50 && s.cfg.device) {
+            const auto pc = s.cfg.device->pipeline_cache_stats();
+            if (pc.pending >= 64) {
+                lock.unlock();
+                std::string why;
+                flush_archive(*s.cfg.device, &why, false);
+                lock.lock();
+            }
+        }
     }
 }
 
@@ -548,7 +636,7 @@ std::unique_ptr<P> make_any(gpu::Device& device, const D& desc, const void* owne
                 if (bump) s.watch.push_back({owner, out.get(), key, process_age_s(), true});
             } else if (h.state == HeldState::queued || h.state == HeldState::waiting_lib ||
                        h.state == HeldState::building) {
-                s.queue.erase({int(h.phase), h.seq, h.key});
+                s.queue.erase(queue_key(h));
                 h.state = HeldState::adopted;
                 ++s.stats.demanded_queued;
             }
@@ -588,6 +676,7 @@ void start(const StartConfig& config) {
     s.cfg = config;
     if (const char* v = std::getenv("GTA6RT_METAL_PCACHE_INFLIGHT")) s.cfg.max_in_flight = unsigned(std::atoi(v));
     if (const char* v = std::getenv("GTA6RT_METAL_PCACHE_HOLD")) s.max_hold = std::size_t(std::atol(v));
+    if (const char* v = std::getenv("GTA6RT_METAL_PCACHE_QUIET_S")) s.quiet_s = std::atof(v);
     ::mkdir(config.directory.c_str(), 0755);
     s.manifest_path = config.directory + "/pcache-manifest.txt";
     {
@@ -619,7 +708,7 @@ void start(const StartConfig& config) {
         h.seq = std::uint64_t(e.t * 1000);
     }
     s.queue.clear();
-    for (auto& [k, h] : s.table) s.queue.emplace(int(h->phase), h->seq, h->key);
+    for (auto& [k, h] : s.table) s.queue.emplace(queue_key(*h));
     load_bootstrap(s, config.directory + "/pcache-bootstrap.txt");
     log_line("manifest %s: %zu pipelines%s; prebuilding in phase order, %u at a time, holding up to %zu", s.manifest_path.c_str(),
              s.prior.size(), bad ? (" (" + std::to_string(bad) + " unreadable)").c_str() : "", s.cfg.max_in_flight,
@@ -728,47 +817,35 @@ gpu::Status open_archive(gpu::Device& device, const std::string& directory, cons
     pc.directory = directory.c_str();
     pc.translator_version = version;
     pc.load = load;
+    if (const char* v = std::getenv("GTA6RT_METAL_PCACHE_SHARD_MB")) pc.shard_bytes = std::uint64_t(std::atof(v) * 1e6);
     std::string error;
-    gpu::Status status = device.open_pipeline_cache(pc, &error);
-    std::string note;
-    if (status != gpu::Status::ok && load) {
-        const auto stats = device.pipeline_cache_stats();
-        std::string path = stats.path;
-        if (path.empty()) {
-            pc.load = false;
-            if (device.open_pipeline_cache(pc, nullptr) == gpu::Status::ok) path = device.pipeline_cache_stats().path;
-        }
-        if (!path.empty()) {
-            const std::string aside = path + ".unreadable";
-            std::rename(path.c_str(), aside.c_str());
-            note = "archive could not be read (" + error + "); moved to " + aside + ", started a new one; ";
-        }
-        pc.load = false;
-        status = device.open_pipeline_cache(pc, &error);
-    }
+    const gpu::Status status = device.open_pipeline_cache(pc, &error);
     const auto stats = device.pipeline_cache_stats();
     if (log) {
-        char buf[160];
-        std::snprintf(buf, sizeof buf, " (%llu bytes, %.3f s)", static_cast<unsigned long long>(stats.file_bytes),
-                      stats.load_seconds);
-        *log = note + stats.path + ": " + gpu::status_name(status) + (stats.loaded ? ", loaded" : ", new") + buf;
+        char buf[200];
+        std::snprintf(buf, sizeof buf, " (%u shards, %llu bytes, %.3f s%s)", stats.shards,
+                      static_cast<unsigned long long>(stats.file_bytes), stats.load_seconds,
+                      stats.shards_unreadable ? (", " + std::to_string(stats.shards_unreadable) + " unreadable moved aside").c_str() : "");
+        *log = stats.path + "-*: " + gpu::status_name(status) + (stats.loaded ? ", loaded" : ", new") + buf;
         if (status != gpu::Status::ok) *log += ": " + error;
     }
     return status;
 }
 
+// Each flush writes what was added since the last one as a new shard file; a failed write loses that shard only
+// (port/metal never overwrites a written shard and drops a shard that failed to serialise from its lookups).
+// when_idle is kept for callers; GTA6RT_METAL_PCACHE_FLUSH_WHEN_IDLE=1 restores the old deferral.
 gpu::Status flush_archive(gpu::Device& device, std::string* error, bool when_idle) {
-    static std::atomic<bool> failed{false};
     static std::mutex m;
     static double last = 0;
-    static std::uint64_t deferred = 0;
+    static std::uint64_t deferred = 0, failures = 0;
     std::lock_guard lock(m);
-    if (failed.load()) {
-        if (error) *error = "an earlier flush failed this run; the file keeps the last good archive";
-        return gpu::Status::unsupported;
-    }
     const double now = process_age_s();
-    if (when_idle && now - last < 120) {
+    static const bool defer = [] {
+        const char* v = std::getenv("GTA6RT_METAL_PCACHE_FLUSH_WHEN_IDLE");
+        return v && v[0] == '1';
+    }();
+    if (when_idle && defer && now - last < 120) {
         const auto q = device.compile_queue_stats();
         if (q.running || q.queued[0] || q.queued[1] || q.queued[2]) {
             if (++deferred <= 3 || deferred % 20 == 0)
@@ -779,12 +856,20 @@ gpu::Status flush_archive(gpu::Device& device, std::string* error, bool when_idl
         }
     }
     last = now;
+    const auto before = device.pipeline_cache_stats();
     std::string why;
     const gpu::Status st = device.flush_pipeline_cache(&why);
+    const auto after = device.pipeline_cache_stats();
     if (st != gpu::Status::ok && st != gpu::Status::not_ready) {
-        failed.store(true);
-        log_line("archive flush failed (%s); no further flushes this run, the file keeps the last good archive",
-                 why.substr(0, 300).c_str());
+        if (++failures <= 5)
+            log_line("archive shard not written (%s); %llu pipelines lost from this run's archive, the files on disk "
+                     "are unchanged", why.substr(0, 300).c_str(), (unsigned long long)before.pending);
+    } else if (after.shards > before.shards) {
+        log_line("archive shard written at t=%.0fs: %llu pipelines, %llu bytes in %.2f s with no compile lock held; %u "
+                 "shards, %llu bytes on disk",
+                 now, (unsigned long long)(after.written - before.written),
+                 (unsigned long long)(after.file_bytes - before.file_bytes), after.serialize_seconds, after.shards,
+                 (unsigned long long)after.file_bytes);
     }
     if (error) *error = why;
     return st;

@@ -12612,6 +12612,36 @@ public:
                 state_.bindless_logged_table_bytes = set.table_buffer_bytes();
                 std::fprintf(stderr, "[rt] d3d12: bindless table: %s\n", table_state().c_str());
             }
+            {
+                static const double stats_s = [] {
+                    const char* v = std::getenv("LEONIDA_BINDLESS_STATS_S");
+                    return v ? std::atof(v) : 0.0;
+                }();
+                static auto next_stats = std::chrono::steady_clock::now();
+                const auto now = std::chrono::steady_clock::now();
+                if (stats_s > 0.0 && now >= next_stats) {
+                    next_stats = now + std::chrono::milliseconds(static_cast<long>(stats_s * 1000.0));
+                    const auto st = set.table().probe_stats();
+                    std::string hist;
+                    for (std::size_t d = 0; d < st.by_displacement.size(); ++d)
+                        hist += (d ? " " : "") + std::to_string(st.by_displacement[d]);
+                    std::fprintf(stderr,
+                                 "[rt] d3d12: bindless table stats: hash %s, %zu of %zu slots (load %.3f %%), %.1f MiB "
+                                 "host entries, hit probes mean %.3f, entries by displacement 0..8 [%s], %zu entries "
+                                 "share a home slot\n",
+                                 leonida::descriptor_hash_kind_name(set.table().hash_kind()), st.occupied, st.capacity,
+                                 100.0 * double(st.occupied) / double(st.capacity),
+                                 double(st.capacity * sizeof(leonida::DescriptorEntry)) / 1048576.0, st.mean_hit_probes,
+                                 hist.c_str(), st.homes_shared);
+                    if (const char* dump = std::getenv("LEONIDA_BINDLESS_KEY_DUMP"); dump && *dump) {
+                        const auto keys = set.table().export_keys();
+                        if (FILE* f = std::fopen(dump, "wb")) {
+                            std::fwrite(keys.data(), sizeof(std::uint32_t), keys.size(), f);
+                            std::fclose(f);
+                        }
+                    }
+                }
+            }
             if (set.table_host_fallbacks() != host_fallbacks && !state_.bindless_host_logged) {
                 state_.bindless_host_logged = true;
                 std::fprintf(stderr, "[rt] d3d12: bindless table buffer placed in host memory: device-local memory "

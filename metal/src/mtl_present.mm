@@ -4,6 +4,8 @@
 #import <QuartzCore/QuartzCore.h>
 
 #include <chrono>
+#include <map>
+#include <mutex>
 
 #include <gta6rt_hud/stats.h>
 
@@ -60,6 +62,51 @@ private:
 @end
 
 namespace gta6rt::metal {
+
+namespace {
+const char* kToneSource = R"MSL(
+#include <metal_stdlib>
+using namespace metal;
+struct ToneOut { float4 position [[position]]; float2 uv; };
+struct ToneParams { float4 dst; float4 src; };
+vertex ToneOut tone_vs(uint vid [[vertex_id]], constant ToneParams& p [[buffer(0)]]) {
+    const float2 c = float2(float(vid & 1u), float((vid >> 1) & 1u));
+    ToneOut o;
+    o.position = float4(mix(p.dst.xy, p.dst.zw, c), 0.0, 1.0);
+    o.uv = mix(p.src.xy, p.src.zw, c);
+    return o;
+}
+fragment float4 tone_ps(ToneOut in [[stage_in]], texture2d<float> src [[texture(0)]], sampler s [[sampler(0)]],
+                        constant float& exposure [[buffer(0)]]) {
+    float3 c = src.sample(s, in.uv).rgb;
+    c = max(select(float3(0.0), c, isfinite(c)), 0.0);
+    c = 1.0 - exp(-c * exposure);
+    const float3 lo = c * 12.92, hi = 1.055 * pow(c, 1.0 / 2.4) - 0.055;
+    return float4(select(hi, lo, c <= 0.0031308), 1.0);
+}
+)MSL";
+
+id<MTLRenderPipelineState> tone_pipeline(id<MTLDevice> device, MTLPixelFormat format) {
+    static std::mutex mutex;
+    static std::map<std::pair<void*, NSUInteger>, id<MTLRenderPipelineState>> cache;
+    std::lock_guard lock(mutex);
+    const auto key = std::make_pair((__bridge void*)device, NSUInteger(format));
+    if (auto it = cache.find(key); it != cache.end()) return it->second;
+    NSError* error = nil;
+    id<MTLLibrary> lib = [device newLibraryWithSource:@(kToneSource) options:nil error:&error];
+    id<MTLRenderPipelineState> pso = nil;
+    if (lib) {
+        MTLRenderPipelineDescriptor* pd = [MTLRenderPipelineDescriptor new];
+        pd.vertexFunction = [lib newFunctionWithName:@"tone_vs"];
+        pd.fragmentFunction = [lib newFunctionWithName:@"tone_ps"];
+        pd.colorAttachments[0].pixelFormat = format;
+        pso = [device newRenderPipelineStateWithDescriptor:pd error:&error];
+    }
+    if (!pso) log("tone-mapped compose pipeline: %s", error ? error.localizedDescription.UTF8String : "no library");
+    cache[key] = pso;
+    return pso;
+}
+}  // namespace
 
 void FramePacer::start() {
     std::mutex m;
@@ -174,7 +221,9 @@ Status MetalSwapchain::encode_present(MetalQueue* queue, const PresentDesc& desc
             const PresentPlane& pl = desc.planes[i];
             auto* t = static_cast<MetalTexture*>(pl.source);
             const PlaneBlend blend = i == 0 ? PlaneBlend::opaque : pl.blend;
-            id<MTLRenderPipelineState> pso = device_->compose_pipeline(target.pixelFormat, blend);
+            const bool tone = pl.tone_exposure > 0;
+            id<MTLRenderPipelineState> pso = tone ? tone_pipeline(device_->mtl(), target.pixelFormat)
+                                                  : device_->compose_pipeline(target.pixelFormat, blend);
             if (!pso) {
                 [enc endEncoding];
                 return Status::pipeline_failed;
@@ -192,6 +241,7 @@ Status MetalSwapchain::encode_present(MetalQueue* queue, const PresentDesc& desc
             [enc setVertexBytes:params length:sizeof(params) atIndex:0];
             [enc setFragmentTexture:t->mtl() atIndex:0];
             [enc setFragmentSamplerState:device_->compose_sampler(pl.filter) atIndex:0];
+            if (tone) [enc setFragmentBytes:&pl.tone_exposure length:sizeof(float) atIndex:0];
             [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
             [kept addObject:t->mtl()];
         }

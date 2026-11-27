@@ -1,7 +1,11 @@
 #include "mtl_internal.h"
 
+#include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <map>
+#include <thread>
 #include <unordered_set>
 
 #include <gta6rt_hud/stats.h>
@@ -229,6 +233,86 @@ static double slow_command_buffer_ms() {
     return ms;
 }
 
+// GTA6RT_METAL_CB_BUDGET_MS (default 1500, 0: off): a command buffer still running this long after it could start (its
+// commit, or the completion of the one before it on its queue) is named with its encoders while it runs, so a hang
+// that ends in a GPU timeout has its culprit in the log even when the process does not survive the timeout. A command
+// buffer that waits on another queue's event counts as running too (the line says so).
+namespace {
+class InFlight {
+public:
+    static InFlight& get() {
+        static InFlight* self = new InFlight;
+        return *self;
+    }
+    bool on() const { return budget_ms_ > 0; }
+    void committed(const void* queue, std::uint64_t serial, const std::string& summary) {
+        std::lock_guard lock(mutex_);
+        live_[{queue, serial}] = Entry{now_ns(), summary, false};
+        if (!started_) {
+            started_ = true;
+            std::thread([this] { watch(); }).detach();
+        }
+    }
+    void completed(const void* queue, std::uint64_t serial, double gpu_ms) {
+        std::lock_guard lock(mutex_);
+        const std::uint64_t now = now_ns();
+        last_done_ns_[queue] = now;
+        auto it = live_.find({queue, serial});
+        if (it == live_.end()) return;
+        if (it->second.told)
+            log("command buffer %llu completed %.0f ms after it could start (GPU time %.0f ms); it was over the budget",
+                (unsigned long long)serial, double(now - it->second.start_ns) / 1e6, gpu_ms);
+        live_.erase(it);
+    }
+
+private:
+    struct Entry {
+        std::uint64_t committed_ns = 0;
+        std::string summary;
+        bool told = false;
+        std::uint64_t start_ns = 0;
+    };
+    InFlight() {
+        const char* v = std::getenv("GTA6RT_METAL_CB_BUDGET_MS");
+        budget_ms_ = v && *v ? std::strtod(v, nullptr) : 1500.0;
+    }
+    static std::uint64_t now_ns() {
+        return std::uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                 std::chrono::steady_clock::now().time_since_epoch())
+                                 .count());
+    }
+    void watch() {
+        for (;;) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            std::lock_guard lock(mutex_);
+            const std::uint64_t now = now_ns();
+            const void* queue = nullptr;
+            for (auto& [key, e] : live_) {
+                if (key.first == queue) continue;
+                queue = key.first;
+                const auto done = last_done_ns_.find(queue);
+                e.start_ns = std::max(e.committed_ns, done == last_done_ns_.end() ? 0 : done->second);
+                const double ms = double(now - e.start_ns) / 1e6;
+                if (e.told || ms < budget_ms_ || e.summary.empty()) continue;
+                e.told = true;
+                if (++over_ <= 64)
+                    log("command buffer %llu has run %.0f ms without completing (budget %.0f ms; or it waits on another "
+                        "queue), %zu behind it: %s",
+                        (unsigned long long)key.second, ms, budget_ms_, std::size_t(std::count_if(
+                            live_.begin(), live_.end(), [&](const auto& x) { return x.first.first == queue; })) - 1,
+                        e.summary.empty() ? "(no encoder summary)" : e.summary.c_str());
+            }
+        }
+    }
+    std::mutex mutex_;
+    std::map<std::pair<const void*, std::uint64_t>, Entry> live_;
+    std::map<const void*, std::uint64_t> last_done_ns_;
+    bool started_ = false;
+    double budget_ms_ = 0;
+    std::uint64_t over_ = 0;
+};
+}  // namespace
+
 static const char* encoder_state_name(MTLCommandEncoderErrorState s) {
     switch (s) {
     case MTLCommandEncoderErrorStateCompleted: return "completed";
@@ -251,8 +335,12 @@ void MetalQueue::end_command_buffer(id<MTLCommandBuffer> cb, std::span<const Eve
     std::lock_guard lock(mutex_);
     const std::uint64_t serial = ++serial_;
     if (open_) --open_;
+    const void* queue_key = this;
+    InFlight* in_flight = &InFlight::get();
+    if (in_flight->on()) in_flight->committed(queue_key, serial, summary);
     [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
       const double gpu = done.GPUStartTime > 0 && done.GPUEndTime > done.GPUStartTime ? done.GPUEndTime - done.GPUStartTime : 0;
+      if (in_flight->on()) in_flight->completed(queue_key, serial, gpu * 1000.0);
       if (gta6rt_hud_active() && gpu > 0) gta6rt_hud_note_gpu_ns(std::uint64_t(gpu * 1e9));
       if (slow_ms > 0 && gpu * 1000.0 >= slow_ms) {
           std::lock_guard l(errors->mutex);
@@ -526,6 +614,8 @@ private:
         label_kind_ = kind;
         label_work_ = 0;
         label_first_ = label_last_ = nil;
+        label_first_name_.clear();
+        label_last_name_.clear();
     }
     void note_work(id pso = nil) {
         ++label_work_;
@@ -533,13 +623,23 @@ private:
         if (!label_first_) label_first_ = pso;
         label_last_ = pso;
     }
+    void note_work(const PipelineCore* p, id pso) {
+        note_work(pso);
+        if (!p || p->label_text.empty()) return;
+        if (label_first_name_.empty()) label_first_name_ = p->label_text;
+        label_last_name_ = p->label_text;
+    }
     void finish_label(id<MTLCommandEncoder> enc) {
         if (!labels_on() || !label_kind_) return;
-        NSString* first = label_first_ ? [(id)label_first_ label] : nil;
-        NSString* last = label_last_ && label_last_ != label_first_ ? [(id)label_last_ label] : nil;
+        NSString* first_l = label_first_ ? [(id)label_first_ label] : nil;
+        NSString* last_l = label_last_ && label_last_ != label_first_ ? [(id)label_last_ label] : nil;
+        const std::string first = !label_first_name_.empty() ? label_first_name_.substr(0, 120)
+                                  : first_l ? std::string(first_l.UTF8String) : std::string();
+        const std::string last = !label_last_name_.empty() ? (label_last_name_ != label_first_name_ ? label_last_name_.substr(0, 120) : "")
+                                 : last_l ? std::string(last_l.UTF8String) : std::string();
         char text[512];
         std::snprintf(text, sizeof text, "e%u %s x%u%s%s%s%s", label_index_, label_kind_, label_work_,
-                      first ? " " : "", first ? first.UTF8String : "", last ? " .. " : "", last ? last.UTF8String : "");
+                      first.empty() ? "" : " ", first.c_str(), last.empty() ? "" : " .. ", last.c_str());
         enc.label = @(text);
         if (summary_.size() < 1800) {
             summary_ += summary_.empty() ? "" : "; ";
@@ -553,6 +653,9 @@ private:
     const char* label_kind_ = nullptr;
     std::uint32_t label_work_ = 0, label_index_ = 0;
     id label_first_ = nil, label_last_ = nil;
+    std::string label_first_name_, label_last_name_;
+    std::uint64_t scratch_total_ = 0, prepass_records_ = 0;
+    std::uint32_t prepass_largest_ = 0;
     std::string summary_;
     MetalDevice* d_;
     id<MTLCommandBuffer> cb_ = nil;
@@ -680,6 +783,14 @@ void Encoder::close_command_buffer() {
         }];
         kept_ = [NSMutableArray new];
     }
+    if (labels_on() && (scratch_total_ || prepass_records_)) {
+        char text[160];
+        std::snprintf(text, sizeof text, "; scratch %.1f MiB, pre-pass records %llu (largest call %u)",
+                      double(scratch_total_) / 1048576.0, (unsigned long long)prepass_records_, prepass_largest_);
+        summary_ += text;
+    }
+    scratch_total_ = prepass_records_ = 0;
+    prepass_largest_ = 0;
     q_->end_command_buffer(cb_, {}, std::move(summary_));
     summary_.clear();
     label_index_ = 0;
@@ -688,6 +799,7 @@ void Encoder::close_command_buffer() {
 
 id<MTLBuffer> Encoder::scratch(std::uint64_t bytes, std::uint64_t* offset) {
     bytes = (bytes + 255) & ~std::uint64_t(255);
+    scratch_total_ += bytes;
     if (!scratch_ || scratch_used_ + bytes > scratch_bytes_) {
         if (scratch_) {
             const std::uint64_t old = scratch_.allocatedSize;
@@ -1296,7 +1408,7 @@ void Encoder::set_fixed_state(const DrawState& s, const RasterDesc& r, id<MTLDep
 bool Encoder::bind_common(const DrawState& s, MetalRenderPipeline* p, bool rect) {
     const bool d24 = p->d24_mode() == D24Mode::fragment;
     [render_ setRenderPipelineState:rect ? p->rect_pso() : p->pso()];
-    note_work(p->pso());
+    note_work(p, p->pso());
     set_fixed_state(s, p->desc().raster, p->depth_state(), d24);
     if (d24) {
         const RasterDesc& r = p->desc().raster;
@@ -1421,6 +1533,8 @@ Prepared Encoder::groups_prepass(const IndirectDesc& d) {
     if (!indirect_limits()) return d.count_buffer ? count_prepass(d) : Prepared{};
     Prepared out;
     id<MTLComputePipelineState> k = d_->builtin_kernel("gta6rt_indirect_groups");
+    prepass_records_ += d.max_count;
+    prepass_largest_ = std::max(prepass_largest_, d.max_count);
     if (!k || !d.max_count) return out;
     out.buffer = scratch(std::uint64_t(d.max_count) * 12, &out.offset);
     struct {
@@ -1448,6 +1562,8 @@ constexpr std::uint32_t kRectParamsStride = 256;
 Prepared Encoder::rect_indirect_prepass(const IndirectDesc& d, const DrawState& s) {
     Prepared out;
     id<MTLComputePipelineState> k = d_->builtin_kernel("gta6rt_rect_indirect");
+    prepass_records_ += d.max_count;
+    prepass_largest_ = std::max(prepass_largest_, d.max_count);
     if (!k || !d.max_count) return out;
     const std::uint64_t params_at = (std::uint64_t(d.max_count) * 16 + kRectParamsStride - 1) / kRectParamsStride * kRectParamsStride;
     out.buffer = scratch(params_at + std::uint64_t(d.max_count) * kRectParamsStride, &out.offset);
@@ -1525,6 +1641,8 @@ void Encoder::indirect_rect(const CmdIndirect& c, MetalRenderPipeline* p) {
 Prepared Encoder::count_prepass(const IndirectDesc& d) {
     Prepared out;
     id<MTLComputePipelineState> k = d_->builtin_kernel("gta6rt_indirect_count");
+    prepass_records_ += d.max_count;
+    prepass_largest_ = std::max(prepass_largest_, d.max_count);
     if (!k) return out;
     const std::uint32_t words = kPacked[std::uint32_t(d.kind) & 3] / 4;
     out.buffer = scratch(std::uint64_t(d.max_count) * words * 4, &out.offset);
@@ -1804,7 +1922,7 @@ void Encoder::draw_rect(const CmdDraw& d, const DrawState& s, MetalRenderPipelin
 
 bool Encoder::bind_compute(const DrawState& s, MetalComputePipeline* p) {
     [compute_ setComputePipelineState:p->pso()];
-    note_work(p->pso());
+    note_work(p, p->pso());
     const std::vector<std::uint8_t> block = push_block(s, p->root());
     if (!block.empty() && p->plan().push_index >= 0)
         [compute_ setBytes:block.data() length:block.size() atIndex:p->plan().push_index];
@@ -1846,7 +1964,7 @@ void Encoder::dispatch(const CmdDispatch& c) {
 
 bool Encoder::bind_mesh(const DrawState& s, MetalMeshPipeline* p) {
     [render_ setRenderPipelineState:p->pso()];
-    note_work(p->pso());
+    note_work(p, p->pso());
     set_fixed_state(s, p->desc().raster, p->depth_state(), false);
     const std::vector<std::uint8_t> block = push_block(s, p->desc().root);
     if (!block.empty()) {

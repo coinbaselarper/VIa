@@ -18,6 +18,13 @@ struct DeviceOptions {
 
 std::unique_ptr<gpu::Device> create_device(const DeviceOptions& options = {});
 
+// Compile workers allowed to run at once (<= compile_threads) and of those how many may run Priority::background
+// work, so demanded pipelines always find a free worker. 0 keeps a value. GTA6RT_METAL_COMPILE_THREADS and
+// GTA6RT_METAL_COMPILE_BACKGROUND set the start values. Returns false for a device of another backend.
+bool set_compile_limits(gpu::Device* device, std::uint32_t active, std::uint32_t background);
+// Name part of the shards the next flushes write (for example a title phase).
+bool set_pipeline_cache_tag(gpu::Device* device, const std::string& tag);
+
 // A window whose content view is a CAMetalLayer, for tests and for hosts without their own window layer.
 // Created on the main thread; visible=false gives a layer without a window.
 class Window {

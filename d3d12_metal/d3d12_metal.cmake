@@ -70,6 +70,7 @@ add_dependencies(gta6rt_d3d12_metal_objs gta6rt_d3d12_vulkan_generated)
 target_include_directories(gta6rt_d3d12_metal_objs BEFORE PRIVATE
   "${D3D12MTL_DIR}/include" "${D3D12MTL_DIR}/shims" "${D3D12MTL_DIR}/src" "${GTA6RT_ROOT}/shaderc_msl/include")
 include("${D3D12MTL_DIR}/cache/cache.cmake")
+include("${D3D12MTL_DIR}/upscale/upscale.cmake")
 target_link_libraries(gta6rt_d3d12_metal_objs PRIVATE
   gta6rt_interfaces gta6rt_d3d12_vulkan_headers gta6rt_dxguids gta6rt_shims_core gta6rt_os gta6rt_metal)
 if(TARGET gta6rt_isa)

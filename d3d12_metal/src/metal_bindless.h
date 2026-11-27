@@ -111,6 +111,7 @@ private:
     };
     std::vector<std::uint32_t> journal_;  // changed slots, journal_base_ .. journal_seq_
     std::uint64_t journal_base_ = 0, journal_seq_ = 0, table_epoch_ = 0, full_writes_ = 0, slot_writes_ = 0;
+    std::uint64_t throttled_flushes_ = 0, throttled_us_ = 0;
     bool generation_free(Generation& g, std::chrono::steady_clock::time_point now);
     std::vector<Generation> generations_;
     std::uint64_t generations_freed_ = 0, generations_made_ = 0, generation_bytes_ = 0;

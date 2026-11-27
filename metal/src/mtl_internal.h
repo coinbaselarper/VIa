@@ -286,6 +286,7 @@ public:
     void detach_from_queue();  // destructors of derived classes call this first
     Priority priority() const { return priority_; }
     std::atomic<bool> queued{false};
+    std::string label_text;  // the description's label (Metal pipeline states carry none): encoder labels name it
 
 protected:
     virtual void build() = 0;
@@ -725,17 +726,21 @@ private:
 class CompileQueue {
 public:
     ~CompileQueue();
-    void init(std::uint32_t threads) { threads_n_ = threads ? threads : 1; }
+    void init(std::uint32_t threads);
     void enqueue(PipelineCore* p, Priority priority);
     bool steal(PipelineCore* p);   // a caller claimed it: drop it from the queue
     void forget(PipelineCore* p);  // destruction: drop it, or wait while a worker builds it
     CompileQueueStats stats() const;
+    void set_limits(std::uint32_t active, std::uint32_t background);
 
 private:
     void run();
+    bool runnable_locked(std::size_t* priority) const;
     void erase_locked(PipelineCore* p);
     void publish_pending_locked() const;
-    std::uint32_t threads_n_ = 3;
+    std::uint32_t threads_n_ = 3, active_limit_ = 3, background_limit_ = 2;
+    std::uint32_t running_background_ = 0;
+    int qos_[3] = {0, 0, 0};
     mutable std::mutex mutex_;
     std::condition_variable cv_, done_cv_;
     std::array<std::deque<PipelineCore*>, 3> queues_;
@@ -879,10 +884,29 @@ private:
     std::deque<Retired> retired_;
     std::uint64_t retired_bytes_ = 0;
     bool table_residency_ = true;
+    // Shards (open_pipeline_cache): archive_mutex_ guards the lists and stats, archive_add_mutex_ the adds into the
+    // writable archive_ (a seal takes both, briefly), archive_flush_mutex_ one flush at a time.
+    NSArray* archive_lookup_locked() const;
+    std::string next_shard_path_locked();
+    template <class P, class Make, class Add>
+    P archive_build(id descriptor, bool* hit, NSError** error, Make&& make, Add&& add);
     mutable std::mutex archive_mutex_;
+    std::mutex archive_add_mutex_, archive_flush_mutex_;
     id<MTLBinaryArchive> archive_ = nil;
+    std::vector<id<MTLBinaryArchive>> archive_shards_;
+    std::vector<std::string> archive_files_;
+    std::string archive_dir_, archive_prefix_, archive_tag_ = "run";
+    std::uint64_t archive_shard_cap_ = 150'000'000;
+    std::uint64_t archive_bytes_per_pipeline_ = 512 * 1024;
+    std::uint32_t archive_seq_ = 0;
     PipelineCacheStats archive_stats_;
-    bool archive_dirty_ = false;
+    bool archive_add_first_ = false;
+
+public:
+    void set_archive_tag(const std::string& tag);
+    void set_compile_limits(std::uint32_t active, std::uint32_t background) { compiler_.set_limits(active, background); }
+
+private:
     mutable std::mutex pressure_mutex_;
     std::map<std::uint64_t, std::function<void(MemoryPressure)>> pressure_handlers_;
     std::uint64_t next_pressure_token_ = 1;

@@ -2,11 +2,13 @@
 // pcache manifests (what the title used, port/d3d12_metal/cache) and spec lists (cache/tools/boot_set.py: the boot
 // PSO set from the package's pipeline-library records and the PSO census logs). Same archive key and file as the
 // title's (same backend, translator version, GPU, OS build, process arch), so build it for the arch the title runs
-// as (x86_64 under Rosetta). Resumable: a rerun finds what the last flush wrote as archive hits.
+// as (x86_64 under Rosetta). Resumable: a rerun finds what the earlier shards hold as archive hits.
+// Shards: one per phase at least (tag = phase name), and a new one before a shard would pass --shard-mb (150).
+// While a gta6rt runs, at most --title-jobs compiles start (default 0: it waits; STATUS-cache.md has the measurement).
 //
 //   prepare_shaders [--manifest F]... [--specs F]... [--archive-dir D] [--catalog M] [--phases a,b] [--limit N]
 //                   [--sample N --seed S] [--jobs J<=3] [--flush-every S] [--report F] [--fresh] [--hold]
-//                   [--dry-run]
+//                   [--shard-mb M] [--title-jobs N] [--order manifest|file] [--dry-run]
 
 #include "pcache.h"
 
@@ -110,6 +112,8 @@ int main(int argc, char** argv) {
     unsigned seed = 1, jobs = 3;
     double flush_every = 120;
     bool fresh = false, hold = false, dry = false;
+    double shard_mb = 150;
+    unsigned title_jobs = 0;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         const auto next = [&]() -> std::string {
@@ -132,6 +136,8 @@ int main(int argc, char** argv) {
         else if (a == "--fresh") fresh = true;
         else if (a == "--hold") hold = true;
         else if (a == "--dry-run") dry = true;
+        else if (a == "--shard-mb") shard_mb = std::atof(next().c_str());
+        else if (a == "--title-jobs") title_jobs = unsigned(std::atoi(next().c_str()));
         else if (a == "--phases") {
             std::stringstream ss(next());
             for (std::string p; std::getline(ss, p, ',');) {
@@ -227,6 +233,7 @@ int main(int argc, char** argv) {
     }
     const std::uint64_t fp0 = footprint();
     std::string open_log;
+    if (shard_mb > 0) ::setenv("GTA6RT_METAL_PCACHE_SHARD_MB", std::to_string(shard_mb).c_str(), 1);
     if (pc::open_archive(*device, archive_dir, pc::archive_version(port, catalog_path), !fresh, &open_log) !=
         gpu::Status::ok) {
         std::fprintf(stderr, "archive: %s\n", open_log.c_str());
@@ -235,9 +242,9 @@ int main(int argc, char** argv) {
     std::printf("%s\n", open_log.c_str());
     const auto st0 = device->pipeline_cache_stats();
     const std::uint64_t fp_loaded = footprint();
-    std::printf("archive %s: %s, %llu bytes, %.3f s to open; footprint %.1f -> %.1f MiB\nkey: %s\n", st0.path.c_str(),
-                st0.loaded ? "loaded" : "new", (unsigned long long)st0.file_bytes, st0.load_seconds, fp0 / 1048576.0,
-                fp_loaded / 1048576.0, st0.key.c_str());
+    std::printf("archive %s-*: %s, %u shards, %llu bytes, %.3f s to open; footprint %.1f -> %.1f MiB\nkey: %s\n",
+                st0.path.c_str(), st0.loaded ? "loaded" : "new", st0.shards, (unsigned long long)st0.file_bytes,
+                st0.load_seconds, fp0 / 1048576.0, fp_loaded / 1048576.0, st0.key.c_str());
 
     std::printf("%zu pipelines to build (%zu undecodable), %u compile threads; a pipeline the loaded archive holds is "
                 "a hit (about 1 ms), so a rerun resumes where the last flushed archive ended\n",
@@ -285,7 +292,7 @@ int main(int argc, char** argv) {
     };
 
     FILE* report = report_path.empty() ? nullptr : std::fopen(report_path.c_str(), "w");
-    if (report) std::fprintf(report, "key\tphase\tstatus\tseconds\tfrom_archive\tlabel\terror\n");
+    if (report) std::fprintf(report, "key\tphase\tstatus\tseconds\tfrom_archive\tlabel\terror\tbuild_seconds\n");
 
     struct Flight {
         const Item* item;
@@ -304,24 +311,48 @@ int main(int argc, char** argv) {
     std::uint64_t max_fp = 0;
     const std::size_t window = std::size_t(jobs) * 2;
 
-    bool flush_failed = false;
+    std::size_t flush_failures = 0;
     const auto flush = [&](const char* why) {
         const double t0 = now_s();
         std::string e;
-        if (flush_failed) return;
+        const auto before = device->pipeline_cache_stats();
+        if (!before.pending) {
+            last_flush = now_s();
+            return;
+        }
         if (device->flush_pipeline_cache(&e) != gpu::Status::ok) {
-            // Metal leaves the in-memory archive damaged after a failed serialize (a later serialize writes a fraction
-            // of it): no further flush may replace the file the last good one wrote.
-            flush_failed = true;
-            std::fprintf(stderr, "flush (%s) failed, no further flushes this run (the file keeps the last good "
-                                 "archive): %s\n", why, e.c_str());
+            ++flush_failures;
+            std::fprintf(stderr, "flush (%s) failed: %llu pipelines of this shard lost, the shards on disk are unchanged: "
+                                 "%s\n", why, (unsigned long long)before.pending, e.c_str());
+            last_flush = now_s();
             return;
         }
         const auto s = device->pipeline_cache_stats();
-        std::printf("  flush (%s): %llu bytes in %.2f s\n", why, (unsigned long long)s.file_bytes, now_s() - t0);
+        std::printf("  flush (%s): shard %u, %llu pipelines, %llu bytes in %.2f s (compiles went on); %llu bytes on disk\n",
+                    why, s.shards, (unsigned long long)(s.written - before.written),
+                    (unsigned long long)(s.file_bytes - before.file_bytes), now_s() - t0, (unsigned long long)s.file_bytes);
         std::fflush(stdout);
         last_flush = now_s();
     };
+    const auto title_running = [] {
+        FILE* p = ::popen("/bin/ps -axo comm=", "r");
+        if (!p) return false;
+        char line[1024];
+        bool found = false;
+        while (std::fgets(line, sizeof line, p)) {
+            std::string n = line;
+            while (!n.empty() && (n.back() == '\n' || n.back() == ' ')) n.pop_back();
+            const auto slash = n.rfind('/');
+            if (slash != std::string::npos) n = n.substr(slash + 1);
+            if (n == "gta6rt" || n.rfind("gta6rt_", 0) == 0) found = true;
+        }
+        ::pclose(p);
+        return found;
+    };
+    double title_checked = 0, title_wait = 0;
+    bool title_up = false;
+    pc::Phase shard_phase = items.empty() ? pc::Phase::boot : items.front().phase;
+    gta6rt::metal::set_pipeline_cache_tag(device.get(), pc::phase_name(shard_phase));
     const auto finish = [&](Flight& f) {
         gpu::Pipeline* p = f.pipeline.get();
         const double dt = now_s() - f.t0;
@@ -335,10 +366,10 @@ int main(int argc, char** argv) {
             ++failures[p->error().substr(0, 90)];
         }
         if (report)
-            std::fprintf(report, "%s\t%s\t%s\t%.4f\t%d\t%s\t%s\n", f.item->key.c_str(), pc::phase_name(f.item->phase),
+            std::fprintf(report, "%s\t%s\t%s\t%.4f\t%d\t%s\t%s\t%.4f\n", f.item->key.c_str(), pc::phase_name(f.item->phase),
                          good ? "ok" : "failed", dt, good && p->from_archive() ? 1 : 0,
                          (f.item->spec.names[0] + (f.item->spec.names[1].empty() ? "" : "," + f.item->spec.names[1])).c_str(),
-                         good ? "" : p->error().substr(0, 200).c_str());
+                         good ? "" : p->error().substr(0, 200).c_str(), p->compile_seconds());
         if (hold) kept.push_back(std::move(f.pipeline));
     };
     const auto progress = [&](bool final) {
@@ -367,7 +398,56 @@ int main(int argc, char** argv) {
         last_progress = now_s();
     };
 
+    const auto drain = [&] {
+        while (!flight.empty()) {
+            for (auto it = flight.begin(); it != flight.end();) {
+                const auto s = it->pipeline->state();
+                if (s == gpu::PipelineState::ready || s == gpu::PipelineState::failed) {
+                    finish(*it);
+                    it = flight.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    };
     for (const Item& item : items) {
+        if (item.phase != shard_phase) {
+            drain();
+            flush("phase");
+            shard_phase = item.phase;
+            gta6rt::metal::set_pipeline_cache_tag(device.get(), pc::phase_name(shard_phase));
+        }
+        for (;;) {
+            if (now_s() - title_checked > 5) {
+                title_checked = now_s();
+                const bool up = title_running();
+                if (up != title_up) {
+                    std::printf("  a gta6rt is %s: %u compile%s may start\n", up ? "running" : "gone",
+                                up ? title_jobs : jobs, (up ? title_jobs : jobs) == 1 ? "" : "s");
+                    std::fflush(stdout);
+                }
+                title_up = up;
+            }
+            if (!title_up || flight.size() < title_jobs) break;
+            const double t0 = now_s();
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            for (auto it = flight.begin(); it != flight.end();) {
+                const auto s = it->pipeline->state();
+                if (s == gpu::PipelineState::ready || s == gpu::PipelineState::failed) {
+                    finish(*it);
+                    it = flight.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+            title_wait += now_s() - t0;
+        }
+        if (shard_mb > 0 && device->pipeline_cache_stats().pending_bytes >= std::uint64_t(shard_mb * 1e6 * 0.85)) {
+            drain();
+            flush("shard size");
+        }
         while (flight.size() >= window) {
             bool any = false;
             for (auto it = flight.begin(); it != flight.end();) {
@@ -449,18 +529,7 @@ int main(int argc, char** argv) {
         }
         flight.push_back(std::move(f));
     }
-    while (!flight.empty()) {
-        for (auto it = flight.begin(); it != flight.end();) {
-            const auto s = it->pipeline->state();
-            if (s == gpu::PipelineState::ready || s == gpu::PipelineState::failed) {
-                finish(*it);
-                it = flight.erase(it);
-            } else {
-                ++it;
-            }
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
+    drain();
     const double build_s = now_s() - start;
     const std::uint64_t fp_built = footprint();
     flush("end");
@@ -469,10 +538,13 @@ int main(int argc, char** argv) {
     std::printf("built %zu pipelines in %s wall (%.1f s summed in flight, %.1f s loading %zu metallibs): %zu ok (%zu "
                 "already in the archive), %zu failed, %zu without a library\n",
                 ok + failed, fmt_s(build_s).c_str(), busy, lib_seconds, libs.size(), ok, hits, failed, missing);
-    std::printf("archive %s: %llu bytes (%.1f MiB), %llu added this run, serialize %.2f s; %.1f KiB per added pipeline\n",
-                st1.path.c_str(), (unsigned long long)file_size(st1.path), file_size(st1.path) / 1048576.0,
-                (unsigned long long)st1.added, st1.serialize_seconds,
-                st1.added ? (double(file_size(st1.path)) - double(st0.file_bytes)) / 1024.0 / double(st1.added) : 0.0);
+    std::printf("archive %s-*: %u shards, %llu bytes (%.1f MiB) on disk, %llu added this run (%llu written), longest "
+                "shard write %.2f s, %zu write failures; %.1f KiB per added pipeline; build time: lookups %.1f s, "
+                "compiles %.1f s, archive adds %.1f s; waited %.0f s for a running gta6rt\n",
+                st1.path.c_str(), st1.shards, (unsigned long long)st1.file_bytes, st1.file_bytes / 1048576.0,
+                (unsigned long long)st1.added, (unsigned long long)st1.written, st1.serialize_longest, flush_failures,
+                st1.written ? (double(st1.file_bytes) - double(st0.file_bytes)) / 1024.0 / double(st1.written) : 0.0,
+                st1.lookup_seconds, st1.compile_seconds, st1.add_seconds, title_wait);
     std::printf("footprint: start %.0f MiB, archive open %.0f MiB, after builds %.0f MiB (peak sampled %.0f MiB), %s; "
                 "own MTLCompilerService processes at most %u, their RSS at most %.0f MiB\n",
                 fp0 / 1048576.0, fp_loaded / 1048576.0, fp_built / 1048576.0, std::max(max_fp, fp_built) / 1048576.0,
@@ -480,5 +552,5 @@ int main(int argc, char** argv) {
     for (const auto& [why, n] : failures) std::printf("  failure x%zu: %s\n", n, why.c_str());
     if (report) std::fclose(report);
     kept.clear();
-    return failed + missing ? 3 : 0;
+    return failed + missing + flush_failures ? 3 : 0;
 }

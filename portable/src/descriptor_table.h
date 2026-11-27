@@ -252,6 +252,54 @@ public:
         return changes;
     }
 
+    // Where the occupied entries sit relative to their home slot (the first probe): by_displacement[d] counts the
+    // entries d slots past home, [kDescriptorProbes] those placed beyond the shader's probe window (never, by
+    // construction). A shader's hit costs displacement + 1 probes, a miss kDescriptorProbes.
+    struct ProbeStats {
+        std::size_t occupied = 0;
+        std::size_t capacity = 0;
+        std::array<std::size_t, kDescriptorProbes + 1> by_displacement{};
+        std::size_t homes_shared = 0;  // entries whose home slot is also the home of another entry
+        double mean_hit_probes = 0.0;
+    };
+
+    ProbeStats probe_stats() const {
+        std::lock_guard lock(mutex_);
+        ProbeStats st;
+        st.capacity = entries_.size();
+        std::vector<std::uint32_t> homes;
+        homes.reserve(occupied_count_);
+        double probes = 0.0;
+        for (std::size_t s = 0; s < entries_.size(); ++s) {
+            const auto& e = entries_[s];
+            if (e.pad != kSlotOccupiedMarker) continue;
+            ++st.occupied;
+            const std::uint32_t home = hash_descriptor_key(e.key, hash_kind_) & mask_;
+            const std::uint32_t d = (static_cast<std::uint32_t>(s) - home) & mask_;
+            ++st.by_displacement[std::min<std::uint32_t>(d, kDescriptorProbes)];
+            probes += d + 1;
+            homes.push_back(home);
+        }
+        std::sort(homes.begin(), homes.end());
+        for (std::size_t i = 0; i < homes.size(); ++i)
+            if ((i > 0 && homes[i] == homes[i - 1]) || (i + 1 < homes.size() && homes[i] == homes[i + 1])) ++st.homes_shared;
+        if (st.occupied) st.mean_hit_probes = probes / double(st.occupied);
+        return st;
+    }
+
+    // Every occupied key (8 dwords each, back to back) and its bindless index (diagnostic dump).
+    std::vector<std::uint32_t> export_keys() const {
+        std::lock_guard lock(mutex_);
+        std::vector<std::uint32_t> out;
+        out.reserve(occupied_count_ * 9);
+        for (const auto& e : entries_) {
+            if (e.pad != kSlotOccupiedMarker) continue;
+            out.insert(out.end(), e.key, e.key + 8);
+            out.push_back(e.index);
+        }
+        return out;
+    }
+
     // One slot's 10 dwords (key[8], index, pad) to `dest`; false when the slot is out of range.
     bool read_slot(std::uint32_t slot, std::uint32_t* dest) const { return read_slots(slot, 1, dest); }
 

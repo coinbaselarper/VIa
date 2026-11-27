@@ -6,7 +6,7 @@
 // by a canonical text of everything the backend pipeline is made from (codec below). Manifests merge across runs.
 // Prebuild: at start-up the manifest's pipelines are created on background compile slots (never a title thread) into
 // the backend's MTLBinaryArchive; a pipeline the title then asks for is handed over (adopted) instead of compiled.
-// prepare_shaders builds the same archive offline from the manifest (tools/prepare_shaders.mm).
+// prepare_shaders builds the same archive offline from the manifest (d3d12_metal/tools/prepare_shaders.cpp).
 //
 // GTA6RT_METAL_PCACHE=0: no recorder, no prebuild; the make_* calls create exactly what they are given.
 
@@ -82,18 +82,14 @@ private:
 // GPU name, OS version and build, and process arch (port/metal open_pipeline_cache).
 std::string archive_version(const std::string& port_root, const std::string& catalog_manifest);
 
-// Opens (or creates) the archive in `directory`. An archive file that exists with this key but that Metal cannot
-// read (torn, from another OS build under the same name, edited) is moved aside to <file>.unreadable and a new one is
-// started, so a bad file is never used and never stops caching. `log` gets one line saying what happened.
+// Opens the archive shards with this key in `directory` (all of them, read-only) and starts an in-memory shard for
+// new pipelines. A shard Metal cannot read is moved aside to <file>.unreadable by the backend. `log` gets one line.
 gpu::Status open_archive(gpu::Device& device, const std::string& directory, const std::string& version, bool load,
                          std::string* log);
 
-// device.flush_pipeline_cache, once more only while no flush of this process has failed: after a failed serialize
-// (MDB_MAP_FULL past about 180-250 MB, STATUS-cache.md) Metal's in-memory archive is damaged and a later serialize
-// writes a fraction of it over the last good file.
-// when_idle: skip (Status::not_ready) while the backend's compile queue has work, for at most 120 s since the last
-// flush: a serialize holds the backend's archive lock for its whole duration (3.7-7.5 s for 100 MB in the title,
-// up to 205 s for 58 MB offline next to running compiles), and every compile needs that lock.
+// Writes what was added since the last flush as a new shard (port/metal: serialised with no compile lock held, to
+// .tmp, re-opened, then linked under a new name, so a file on disk is never overwritten). A failed write loses only
+// that shard. when_idle: ignored unless GTA6RT_METAL_PCACHE_FLUSH_WHEN_IDLE=1 (the old deferral while compiles run).
 gpu::Status flush_archive(gpu::Device& device, std::string* error, bool when_idle = false);
 
 // ---- in-process recorder and prebuild (the D3D12 layer's hooks) ----
@@ -113,7 +109,7 @@ struct StartConfig {
     LibraryFn libraries;
     ContentKeyFn content_key;
     std::string directory;        // beside the archive: pcache-manifest.txt, pcache-bootstrap.txt
-    unsigned max_in_flight = 2;   // background compiles at once (the backend has 3 compile threads)
+    unsigned max_in_flight = 4;   // prebuilt pipelines queued or compiling at once (port/metal runs at most its background limit)
 };
 
 bool enabled();

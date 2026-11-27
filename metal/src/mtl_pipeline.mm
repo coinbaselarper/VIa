@@ -2,10 +2,16 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
 #include <fstream>
+#include <pthread.h>
 #include <regex>
 #include <set>
 #include <sstream>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include <gta6rt_hud/stats.h>
 
@@ -456,6 +462,59 @@ void PipelineCore::detach_from_queue() { device_->compiler().forget(this); }
 
 // ---- compile queue ----
 
+namespace {
+
+std::uint32_t env_u32(const char* name, std::uint32_t fallback) {
+    const char* v = std::getenv(name);
+    return v && *v ? std::uint32_t(std::strtoul(v, nullptr, 10)) : fallback;
+}
+
+int qos_named(const char* name, qos_class_t fallback) {
+    const char* v = std::getenv(name);
+    if (!v || !*v) return int(fallback);
+    const std::string s = v;
+    if (s == "user_interactive") return int(QOS_CLASS_USER_INTERACTIVE);
+    if (s == "user_initiated") return int(QOS_CLASS_USER_INITIATED);
+    if (s == "default") return int(QOS_CLASS_DEFAULT);
+    if (s == "utility") return int(QOS_CLASS_UTILITY);
+    if (s == "background") return int(QOS_CLASS_BACKGROUND);
+    return int(fallback);
+}
+
+}  // namespace
+
+// Compile work runs in MTLCompilerService at the QoS of the thread that asks (XPC carries it), so background
+// builds ask at utility and leave the CPU to the title's own threads first.
+void CompileQueue::init(std::uint32_t threads) {
+    threads_n_ = env_u32("GTA6RT_METAL_COMPILE_THREADS", threads ? threads : 1);
+    if (!threads_n_) threads_n_ = 1;
+    active_limit_ = threads_n_;
+    background_limit_ = std::min(env_u32("GTA6RT_METAL_COMPILE_BACKGROUND", threads_n_ > 1 ? threads_n_ - 1 : 1), threads_n_);
+    qos_[0] = qos_named("GTA6RT_METAL_COMPILE_QOS_DEMAND", QOS_CLASS_USER_INITIATED);
+    qos_[1] = qos_named("GTA6RT_METAL_COMPILE_QOS_DEMAND", QOS_CLASS_USER_INITIATED);
+    qos_[2] = qos_named("GTA6RT_METAL_COMPILE_QOS_BACKGROUND", QOS_CLASS_UTILITY);
+}
+
+void CompileQueue::set_limits(std::uint32_t active, std::uint32_t background) {
+    {
+        std::lock_guard lock(mutex_);
+        if (active) active_limit_ = std::min(active, threads_n_);
+        if (background) background_limit_ = std::min(background, threads_n_);
+    }
+    cv_.notify_all();
+}
+
+bool CompileQueue::runnable_locked(std::size_t* priority) const {
+    if (running_.size() >= active_limit_) return false;
+    for (std::size_t pr = 0; pr < queues_.size(); ++pr) {
+        if (queues_[pr].empty()) continue;
+        if (pr == std::size_t(Priority::background) && running_background_ >= background_limit_) return false;
+        *priority = pr;
+        return true;
+    }
+    return false;
+}
+
 CompileQueue::~CompileQueue() {
     {
         std::lock_guard lock(mutex_);
@@ -522,30 +581,34 @@ void CompileQueue::forget(PipelineCore* p) {
 }
 
 void CompileQueue::run() {
+    pthread_setname_np("gta6rt pipeline compile");
     std::unique_lock lock(mutex_);
+    int qos_now = -1;
     while (true) {
-        cv_.wait(lock, [&] {
-            if (stop_) return true;
-            for (const auto& q : queues_)
-                if (!q.empty()) return true;
-            return false;
-        });
-        if (stop_) return;
         std::size_t pr = 0;
-        while (queues_[pr].empty()) ++pr;
+        cv_.wait(lock, [&] { return stop_ || runnable_locked(&pr); });
+        if (stop_) return;
         PipelineCore* p = queues_[pr].front();
         queues_[pr].pop_front();
         p->queued = false;
         if (!p->claim()) continue;
         running_.insert(p);
+        const bool bg = pr == std::size_t(Priority::background);
+        if (bg) ++running_background_;
         publish_pending_locked();
         lock.unlock();
+        if (qos_[pr] != qos_now) {
+            qos_now = qos_[pr];
+            pthread_set_qos_class_self_np(qos_class_t(qos_now), 0);
+        }
         p->run_build();
         lock.lock();
         running_.erase(p);
+        if (bg) --running_background_;
         publish_pending_locked();
         completed_[pr]++;
         done_cv_.notify_all();
+        cv_.notify_all();
     }
 }
 
@@ -559,6 +622,9 @@ CompileQueueStats CompileQueue::stats() const {
     }
     s.running = running_.size();
     s.stolen = stolen_;
+    s.running_background = running_background_;
+    s.active_limit = active_limit_;
+    s.background_limit = background_limit_;
     return s;
 }
 
@@ -566,6 +632,7 @@ CompileQueueStats CompileQueue::stats() const {
 
 MetalRenderPipeline::MetalRenderPipeline(MetalDevice* device, const RenderPipelineDesc& desc)
     : PipelineCore(device, desc.mode, desc.not_ready, desc.priority), desc_(desc) {
+    if (desc.label) label_text = desc.label;
     desc_.label = nullptr;
 }
 
@@ -774,6 +841,7 @@ void MetalRenderPipeline::build_plan(MTLRenderPipelineReflection* refl) {
 
 MetalComputePipeline::MetalComputePipeline(MetalDevice* device, const ComputePipelineDesc& desc)
     : PipelineCore(device, desc.mode, desc.not_ready, desc.priority), desc_(desc) {
+    if (desc.label) label_text = desc.label;
     desc_.label = nullptr;
     threads_ = desc.threads;
     if (!threads_[0] || !threads_[1] || !threads_[2]) {
@@ -837,6 +905,7 @@ void MetalComputePipeline::build() {
 
 MetalMeshPipeline::MetalMeshPipeline(MetalDevice* device, const MeshPipelineDesc& desc)
     : PipelineCore(device, desc.mode, desc.not_ready, desc.priority), desc_(desc) {
+    if (desc.label) label_text = desc.label;
     desc_.label = nullptr;
 }
 
@@ -969,127 +1038,194 @@ std::uint64_t fnv1a(const std::string& s) {
 }
 
 constexpr MTLPipelineOption kReflect = MTLPipelineOptionBindingInfo | MTLPipelineOptionBufferTypeInfo;
+constexpr const char* kShardSuffix = ".metalarchive";
+
+std::string read_text(const std::string& path) {
+    std::ifstream k(path);
+    std::stringstream s;
+    s << k.rdbuf();
+    return s.str();
+}
+
+std::uint64_t size_of(const std::string& path) {
+    struct stat sb {};
+    return ::stat(path.c_str(), &sb) == 0 ? std::uint64_t(sb.st_size) : 0;
+}
+
+bool exists(const std::string& path) {
+    struct stat sb {};
+    return ::stat(path.c_str(), &sb) == 0;
+}
+
+bool write_text_atomic(const std::string& path, const std::string& text) {
+    const std::string tmp = path + "." + std::to_string(::getpid()) + ".tmp";
+    {
+        std::ofstream o(tmp, std::ios::trunc);
+        o << text;
+        o.flush();
+        if (!o) {
+            ::unlink(tmp.c_str());
+            return false;
+        }
+    }
+    return std::rename(tmp.c_str(), path.c_str()) == 0;
+}
+
+// "gta6rt-<hash>-<tag>-<n>.metalarchive" -> n; the single file of earlier versions ("gta6rt-<hash>.metalarchive") -> 0.
+std::uint32_t shard_seq(const std::string& name, std::size_t base_len) {
+    const std::size_t end = name.size() - std::strlen(kShardSuffix);
+    if (end <= base_len) return 0;
+    const std::size_t dash = name.rfind('-', end);
+    if (dash == std::string::npos || dash < base_len) return 0;
+    return std::uint32_t(std::strtoul(name.substr(dash + 1, end - dash - 1).c_str(), nullptr, 10));
+}
+
+std::string clean_tag(const std::string& tag) {
+    std::string out;
+    for (char c : tag)
+        if (std::isalnum(static_cast<unsigned char>(c)) || c == '_') out += c;
+    return out.empty() ? "run" : out;
+}
+
+// Metal's archive reader crashes on some damaged files (SIGSEGV in deserializeBinaryArchiveHeader on a truncated one,
+// measured), so a shard is handed to Metal only when its size and content hash match what its .key file recorded.
+std::string content_line(const std::string& path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return {};
+    std::uint64_t h = 0x9e3779b97f4a7c15ull, n = 0;
+    std::vector<char> buf(1 << 20);
+    while (in) {
+        in.read(buf.data(), std::streamsize(buf.size()));
+        const std::size_t got = std::size_t(in.gcount());
+        std::size_t i = 0;
+        for (; i + 8 <= got; i += 8) {
+            std::uint64_t w;
+            std::memcpy(&w, buf.data() + i, 8);
+            h = (h ^ w) * 0x100000001b3ull;
+            h ^= h >> 29;
+        }
+        for (; i < got; ++i) h = (h ^ static_cast<unsigned char>(buf[i])) * 0x100000001b3ull;
+        n += got;
+    }
+    char line[64];
+    std::snprintf(line, sizeof line, "\ncontent %llu %016llx", (unsigned long long)n, (unsigned long long)h);
+    return line;
+}
+
+id<MTLBinaryArchive> open_file(id<MTLDevice> device, const std::string& path, NSError** error) {
+    MTLBinaryArchiveDescriptor* ad = [MTLBinaryArchiveDescriptor new];
+    ad.url = [NSURL fileURLWithPath:@(path.c_str())];
+    return [device newBinaryArchiveWithDescriptor:ad error:error];
+}
 
 }  // namespace
 
-id<MTLRenderPipelineState> MetalDevice::build_render(MTLRenderPipelineDescriptor* pd, MTLRenderPipelineReflection** refl,
-                                                     NSError** error, bool* hit) {
-    id<MTLBinaryArchive> archive = nil;
+NSArray* MetalDevice::archive_lookup_locked() const {
+    NSMutableArray* a = [NSMutableArray arrayWithCapacity:archive_shards_.size() + 1];
+    for (id<MTLBinaryArchive> s : archive_shards_) [a addObject:s];
+    if (archive_) [a addObject:archive_];
+    return a;
+}
+
+std::string MetalDevice::next_shard_path_locked() {
+    char seq[16];
+    std::snprintf(seq, sizeof seq, "%04u", ++archive_seq_);
+    return archive_prefix_ + "-" + archive_tag_ + "-" + seq + kShardSuffix;
+}
+
+void MetalDevice::set_archive_tag(const std::string& tag) {
+    std::lock_guard lock(archive_mutex_);
+    archive_tag_ = clean_tag(tag);
+}
+
+// Lookup in every shard (a hit costs no compile), else compile and add to the writable shard. The add holds only
+// archive_add_mutex_, which a flush takes just long enough to swap in a new writable shard.
+template <class P, class Make, class Add>
+P MetalDevice::archive_build(id descriptor, bool* hit, NSError** error, Make&& make, Add&& add) {
+    NSArray* lookup = nil;
     {
         std::lock_guard lock(archive_mutex_);
-        archive = archive_;
+        if (archive_) lookup = archive_lookup_locked();
     }
     *hit = false;
-    if (archive) {
-        pd.binaryArchives = @[ archive ];
+    if (lookup) {
+        [descriptor setBinaryArchives:lookup];
         NSError* miss = nil;
-        id<MTLRenderPipelineState> p = [device_ newRenderPipelineStateWithDescriptor:pd
-                                                                             options:kReflect | MTLPipelineOptionFailOnBinaryArchiveMiss
-                                                                          reflection:refl
-                                                                               error:&miss];
+        const double t0 = now_seconds();
+        P p = make(kReflect | MTLPipelineOptionFailOnBinaryArchiveMiss, &miss);
+        const double dt = now_seconds() - t0;
+        std::lock_guard lock(archive_mutex_);
+        archive_stats_.lookup_seconds += dt;
         if (p) {
             *hit = true;
             stats_.archive_hits++;
-            std::lock_guard lock(archive_mutex_);
             archive_stats_.hits++;
             return p;
         }
         stats_.archive_misses++;
-        std::lock_guard lock(archive_mutex_);
         archive_stats_.misses++;
     }
-    id<MTLRenderPipelineState> p = [device_ newRenderPipelineStateWithDescriptor:pd options:kReflect reflection:refl error:error];
-    if (p && archive) {
+    [descriptor setBinaryArchives:nil];
+    const double t1 = now_seconds();
+    P p = make(kReflect, error);
+    const double compile_dt = now_seconds() - t1;
+    if (!lookup) return p;
+    {
         std::lock_guard lock(archive_mutex_);
-        NSError* ae = nil;
-        if ([archive addRenderPipelineFunctionsWithDescriptor:pd error:&ae]) {
-            archive_stats_.added++;
-            archive_dirty_ = true;
-        } else {
-            archive_stats_.add_failures++;
-        }
+        archive_stats_.compile_seconds += compile_dt;
+    }
+    if (!p) return p;
+    std::lock_guard add_lock(archive_add_mutex_);
+    id<MTLBinaryArchive> writable = nil;
+    {
+        std::lock_guard lock(archive_mutex_);
+        writable = archive_;
+    }
+    if (!writable) return p;
+    NSError* ae = nil;
+    const double t2 = now_seconds();
+    const BOOL added = add(writable, &ae);
+    const double add_dt = now_seconds() - t2;
+    std::lock_guard lock(archive_mutex_);
+    archive_stats_.add_seconds += add_dt;
+    if (added) {
+        archive_stats_.added++;
+        archive_stats_.pending++;
+    } else {
+        archive_stats_.add_failures++;
+        archive_stats_.last_error = ns_error(ae, "add to archive failed");
     }
     return p;
+}
+
+id<MTLRenderPipelineState> MetalDevice::build_render(MTLRenderPipelineDescriptor* pd, MTLRenderPipelineReflection** refl,
+                                                     NSError** error, bool* hit) {
+    return archive_build<id<MTLRenderPipelineState>>(
+        pd, hit, error,
+        [&](MTLPipelineOption o, NSError** e) {
+            return [device_ newRenderPipelineStateWithDescriptor:pd options:o reflection:refl error:e];
+        },
+        [&](id<MTLBinaryArchive> a, NSError** e) { return [a addRenderPipelineFunctionsWithDescriptor:pd error:e]; });
 }
 
 id<MTLRenderPipelineState> MetalDevice::build_mesh(MTLMeshRenderPipelineDescriptor* pd, MTLRenderPipelineReflection** refl,
                                                    NSError** error, bool* hit) {
-    id<MTLBinaryArchive> archive = nil;
-    {
-        std::lock_guard lock(archive_mutex_);
-        archive = archive_;
-    }
-    *hit = false;
-    if (archive) {
-        pd.binaryArchives = @[ archive ];
-        NSError* miss = nil;
-        id<MTLRenderPipelineState> p = [device_ newRenderPipelineStateWithMeshDescriptor:pd
-                                                                                 options:kReflect | MTLPipelineOptionFailOnBinaryArchiveMiss
-                                                                              reflection:refl
-                                                                                   error:&miss];
-        if (p) {
-            *hit = true;
-            stats_.archive_hits++;
-            std::lock_guard lock(archive_mutex_);
-            archive_stats_.hits++;
-            return p;
-        }
-        stats_.archive_misses++;
-        std::lock_guard lock(archive_mutex_);
-        archive_stats_.misses++;
-    }
-    id<MTLRenderPipelineState> p = [device_ newRenderPipelineStateWithMeshDescriptor:pd options:kReflect reflection:refl error:error];
-    if (p && archive) {
-        std::lock_guard lock(archive_mutex_);
-        NSError* ae = nil;
-        if ([archive addMeshRenderPipelineFunctionsWithDescriptor:pd error:&ae]) {
-            archive_stats_.added++;
-            archive_dirty_ = true;
-        } else {
-            archive_stats_.add_failures++;
-        }
-    }
-    return p;
+    return archive_build<id<MTLRenderPipelineState>>(
+        pd, hit, error,
+        [&](MTLPipelineOption o, NSError** e) {
+            return [device_ newRenderPipelineStateWithMeshDescriptor:pd options:o reflection:refl error:e];
+        },
+        [&](id<MTLBinaryArchive> a, NSError** e) { return [a addMeshRenderPipelineFunctionsWithDescriptor:pd error:e]; });
 }
 
 id<MTLComputePipelineState> MetalDevice::build_compute(MTLComputePipelineDescriptor* pd, MTLComputePipelineReflection** refl,
                                                        NSError** error, bool* hit) {
-    id<MTLBinaryArchive> archive = nil;
-    {
-        std::lock_guard lock(archive_mutex_);
-        archive = archive_;
-    }
-    *hit = false;
-    if (archive) {
-        pd.binaryArchives = @[ archive ];
-        NSError* miss = nil;
-        id<MTLComputePipelineState> p = [device_ newComputePipelineStateWithDescriptor:pd
-                                                                               options:kReflect | MTLPipelineOptionFailOnBinaryArchiveMiss
-                                                                            reflection:refl
-                                                                                 error:&miss];
-        if (p) {
-            *hit = true;
-            stats_.archive_hits++;
-            std::lock_guard lock(archive_mutex_);
-            archive_stats_.hits++;
-            return p;
-        }
-        stats_.archive_misses++;
-        std::lock_guard lock(archive_mutex_);
-        archive_stats_.misses++;
-    }
-    id<MTLComputePipelineState> p = [device_ newComputePipelineStateWithDescriptor:pd options:kReflect reflection:refl error:error];
-    if (p && archive) {
-        std::lock_guard lock(archive_mutex_);
-        NSError* ae = nil;
-        if ([archive addComputePipelineFunctionsWithDescriptor:pd error:&ae]) {
-            archive_stats_.added++;
-            archive_dirty_ = true;
-        } else {
-            archive_stats_.add_failures++;
-        }
-    }
-    return p;
+    return archive_build<id<MTLComputePipelineState>>(
+        pd, hit, error,
+        [&](MTLPipelineOption o, NSError** e) {
+            return [device_ newComputePipelineStateWithDescriptor:pd options:o reflection:refl error:e];
+        },
+        [&](id<MTLBinaryArchive> a, NSError** e) { return [a addComputePipelineFunctionsWithDescriptor:pd error:e]; });
 }
 
 Status MetalDevice::open_pipeline_cache(const PipelineCacheDesc& desc, std::string* error) {
@@ -1097,9 +1233,9 @@ Status MetalDevice::open_pipeline_cache(const PipelineCacheDesc& desc, std::stri
         if (error) *error = "no directory";
         return Status::invalid_argument;
     }
-    NSString* dir = @(desc.directory);
+    NSString* ns_dir = @(desc.directory);
     NSError* e = nil;
-    if (![[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:&e]) {
+    if (![[NSFileManager defaultManager] createDirectoryAtPath:ns_dir withIntermediateDirectories:YES attributes:nil error:&e]) {
         if (error) *error = ns_error(e, "cannot create the cache directory");
         return Status::invalid_argument;
     }
@@ -1108,65 +1244,161 @@ Status MetalDevice::open_pipeline_cache(const PipelineCacheDesc& desc, std::stri
                             "; process " + caps_.process_arch;
     char hex[17];
     std::snprintf(hex, sizeof(hex), "%016llx", (unsigned long long)fnv1a(key));
-    const std::string path = std::string(desc.directory) + "/gta6rt-" + hex + ".metalarchive";
-    const std::string key_path = path + ".key";
-    std::string stored;
-    {
-        std::ifstream k(key_path);
-        std::stringstream s;
-        s << k.rdbuf();
-        stored = s.str();
+    const std::string dir = desc.directory;
+    const std::string base = std::string("gta6rt-") + hex;
+    std::vector<std::string> names;
+    std::error_code ec;
+    for (const auto& de : std::filesystem::directory_iterator(dir, ec)) {
+        const std::string name = de.path().filename().string();
+        const std::size_t sl = std::strlen(kShardSuffix);
+        if (name.rfind(base, 0) != 0 || name.size() <= base.size() + sl) continue;
+        if (name.compare(name.size() - sl, sl, kShardSuffix) != 0) continue;
+        names.push_back(name);
     }
-    MTLBinaryArchiveDescriptor* ad = [MTLBinaryArchiveDescriptor new];
-    const bool exists = [[NSFileManager defaultManager] fileExistsAtPath:@(path.c_str())];
-    const bool load = desc.load && exists && stored == key;
-    if (load) ad.url = [NSURL fileURLWithPath:@(path.c_str())];
+    std::sort(names.begin(), names.end());
+    std::vector<id<MTLBinaryArchive>> shards;
+    std::vector<std::string> files;
+    std::uint64_t bytes = 0;
+    std::uint32_t unreadable = 0, seq = 0;
     const double t0 = now_seconds();
-    id<MTLBinaryArchive> archive = [device_ newBinaryArchiveWithDescriptor:ad error:&e];
+    for (const std::string& name : names) {
+        seq = std::max(seq, shard_seq(name, base.size()));
+        if (!desc.load) continue;
+        const std::string path = dir + "/" + name;
+        const std::string recorded = read_text(path + ".key");
+        if (recorded.rfind(key, 0) != 0 || recorded.find('\n') != key.size()) continue;
+        NSError* le = nil;
+        const bool intact = recorded.substr(key.size()) == content_line(path);
+        id<MTLBinaryArchive> a = intact ? open_file(device_, path, &le) : nil;
+        if (!intact) le = [NSError errorWithDomain:@"gta6rt" code:1 userInfo:@{NSLocalizedDescriptionKey : @"size or content hash differs from its .key file (or none recorded)"}];
+        if (!a) {
+            const std::string aside = path + ".unreadable";
+            std::rename(path.c_str(), aside.c_str());
+            log("pipeline archive shard %s does not load (%s): moved to %s", path.c_str(),
+                ns_error(le, "unknown").c_str(), aside.c_str());
+            ++unreadable;
+            continue;
+        }
+        shards.push_back(a);
+        files.push_back(path);
+        bytes += size_of(path);
+    }
     const double t1 = now_seconds();
-    if (!archive) {
+    id<MTLBinaryArchive> writable = [device_ newBinaryArchiveWithDescriptor:[MTLBinaryArchiveDescriptor new] error:&e];
+    if (!writable) {
         if (error) *error = ns_error(e, "binary archive creation failed");
         return Status::unsupported;
     }
+    std::lock_guard add_lock(archive_add_mutex_);
     std::lock_guard lock(archive_mutex_);
-    archive_ = archive;
+    archive_ = writable;
+    archive_shards_ = std::move(shards);
+    archive_files_ = std::move(files);
+    archive_dir_ = dir;
+    archive_prefix_ = dir + "/" + base;
+    archive_seq_ = seq;
+    archive_shard_cap_ = desc.shard_bytes ? desc.shard_bytes : 150'000'000;
+    archive_tag_ = clean_tag(desc.tag);
     archive_stats_ = {};
     archive_stats_.open = true;
-    archive_stats_.loaded = load;
-    archive_stats_.path = path;
+    archive_stats_.loaded = !archive_shards_.empty();
+    archive_stats_.path = archive_prefix_;
     archive_stats_.key = key;
     archive_stats_.load_seconds = t1 - t0;
-    if (load) {
-        NSDictionary* attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:@(path.c_str()) error:nil];
-        archive_stats_.file_bytes = [attrs fileSize];
-    }
-    archive_dirty_ = false;
+    archive_stats_.file_bytes = bytes;
+    archive_stats_.shards = std::uint32_t(archive_shards_.size());
+    archive_stats_.shards_unreadable = unreadable;
     return Status::ok;
 }
 
 Status MetalDevice::flush_pipeline_cache(std::string* error) {
-    std::lock_guard lock(archive_mutex_);
-    if (!archive_) return Status::not_ready;
-    if (!archive_dirty_) return Status::ok;
-    const std::string tmp = archive_stats_.path + ".tmp";
-    NSError* e = nil;
+    std::lock_guard flush_lock(archive_flush_mutex_);
+    id<MTLBinaryArchive> sealed = nil;
+    std::uint64_t n = 0;
+    std::string path, key;
+    {
+        std::lock_guard add_lock(archive_add_mutex_);
+        std::lock_guard lock(archive_mutex_);
+        if (!archive_) return Status::not_ready;
+        if (!archive_stats_.pending) return Status::ok;
+        NSError* e = nil;
+        id<MTLBinaryArchive> fresh = [device_ newBinaryArchiveWithDescriptor:[MTLBinaryArchiveDescriptor new] error:&e];
+        if (!fresh) {
+            if (error) *error = ns_error(e, "binary archive creation failed");
+            return Status::unsupported;
+        }
+        sealed = archive_;
+        n = archive_stats_.pending;
+        archive_shards_.push_back(sealed);
+        archive_ = fresh;
+        archive_stats_.pending = 0;
+        path = next_shard_path_locked();
+        key = archive_stats_.key;
+    }
     const double t0 = now_seconds();
-    if (![archive_ serializeToURL:[NSURL fileURLWithPath:@(tmp.c_str())] error:&e]) {
-        if (error) *error = ns_error(e, "serialize failed");
+    const std::string tmp = path + "." + std::to_string(::getpid()) + ".tmp";
+    NSError* e = nil;
+    std::string why;
+    bool ok = [sealed serializeToURL:[NSURL fileURLWithPath:@(tmp.c_str())] error:&e];
+    if (!ok) why = ns_error(e, "serialize failed");
+    if (ok) {
+        NSError* ve = nil;
+        if (!open_file(device_, tmp, &ve)) {
+            ok = false;
+            why = ns_error(ve, "the written shard does not load");
+        }
+    }
+    std::string final_path;
+    const std::string content = ok ? content_line(tmp) : std::string();
+    if (ok) {
+        for (int attempt = 0; attempt < 64 && final_path.empty(); ++attempt) {
+            if (!exists(path) && write_text_atomic(path + ".key", key + content) && ::link(tmp.c_str(), path.c_str()) == 0) {
+                final_path = path;
+                break;
+            }
+            std::lock_guard lock(archive_mutex_);
+            path = next_shard_path_locked();
+        }
+        if (final_path.empty()) {
+            ok = false;
+            why = "no free shard name";
+        }
+    }
+    ::unlink(tmp.c_str());
+    id<MTLBinaryArchive> on_disk = nil;
+    if (ok) {
+        NSError* oe = nil;
+        on_disk = open_file(device_, final_path, &oe);
+    }
+    const double dt = now_seconds() - t0;
+    const std::uint64_t bytes = ok ? size_of(final_path) : 0;
+    std::lock_guard lock(archive_mutex_);
+    std::erase_if(archive_shards_, [&](id<MTLBinaryArchive> a) { return a == sealed; });
+    if (!ok) {
+        // After a failed serialize Metal's in-memory archive can be damaged (STATUS-cache.md): it is not looked up
+        // again; its pipelines are compiled again at their next creation.
+        archive_stats_.flush_failures++;
+        archive_stats_.last_error = why;
+        if (error) *error = why;
         return Status::unsupported;
     }
-    std::rename(tmp.c_str(), archive_stats_.path.c_str());
-    std::ofstream(archive_stats_.path + ".key") << archive_stats_.key;
-    archive_stats_.serialize_seconds = now_seconds() - t0;
-    NSDictionary* attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:@(archive_stats_.path.c_str()) error:nil];
-    archive_stats_.file_bytes = [attrs fileSize];
-    archive_dirty_ = false;
+    archive_shards_.push_back(on_disk ? on_disk : sealed);
+    archive_files_.push_back(final_path);
+    archive_stats_.shards++;
+    archive_stats_.written += n;
+    archive_stats_.flushes++;
+    archive_stats_.file_bytes += bytes;
+    archive_stats_.serialize_seconds = dt;
+    archive_stats_.serialize_longest = std::max(archive_stats_.serialize_longest, dt);
+    if (n) archive_bytes_per_pipeline_ = std::max<std::uint64_t>(4096, (archive_bytes_per_pipeline_ + bytes / n) / 2);
     return Status::ok;
 }
 
 PipelineCacheStats MetalDevice::pipeline_cache_stats() const {
     std::lock_guard lock(archive_mutex_);
-    return archive_stats_;
+    PipelineCacheStats s = archive_stats_;
+    s.pending_bytes = s.pending * archive_bytes_per_pipeline_;
+    return s;
 }
 
 void MetalDevice::precompile(std::span<gpu::Pipeline* const> pipelines, Priority priority) {
@@ -1209,6 +1441,20 @@ std::unique_ptr<gpu::MeshPipeline> MetalDevice::create_mesh_pipeline(const MeshP
     p->prepare();
     p->start();
     return p;
+}
+
+bool set_compile_limits(gpu::Device* device, std::uint32_t active, std::uint32_t background) {
+    auto* d = dynamic_cast<MetalDevice*>(device);
+    if (!d) return false;
+    d->set_compile_limits(active, background);
+    return true;
+}
+
+bool set_pipeline_cache_tag(gpu::Device* device, const std::string& tag) {
+    auto* d = dynamic_cast<MetalDevice*>(device);
+    if (!d) return false;
+    d->set_archive_tag(tag);
+    return true;
 }
 
 }  // namespace gta6rt::metal

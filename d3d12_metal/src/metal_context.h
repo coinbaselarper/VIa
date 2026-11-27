@@ -118,6 +118,7 @@ struct QueryHeapEntry {
 };
 
 class MetalQueue;
+class SceneProbe;
 
 class MetalContext {
 public:
@@ -255,6 +256,9 @@ public:
     // Every queue of `marks` that still exists has completed its value (a queue that went counts as done).
     bool reached(const std::vector<std::pair<gpu::Fence*, std::uint64_t>>& marks) const;
 
+    // Null unless a scene switch is set (SceneProbe).
+    SceneProbe* scene() const { return scene_.get(); }
+
 private:
     friend class MetalQueue;
     struct VaRange {
@@ -301,6 +305,81 @@ private:
     std::atomic<std::int64_t> last_compute_skip_ns_{0};
     mutable std::mutex submitted_mutex_;
     std::map<gpu::Fence*, std::uint64_t> submitted_;
+    std::unique_ptr<SceneProbe> scene_;
+};
+
+// The frame's render-resolution targets, seen by replay (GTA6RT_METAL_SCENE_SIZE, default 1280x720): the HDR colour
+// target written last before the frame's first upscaler dispatch (an fspx/ pipeline, refused or not), the G-buffer (the
+// widest multi-target set at that size) and its depth.
+// GTA6RT_METAL_PRESENT_SCENE=1: that colour, tone-mapped and scaled to the window, replaces the game plane under the
+// title's UI plane; 2: it alone. GTA6RT_METAL_SCENE_EXPOSURE: a fixed exposure (default: from periodic readbacks).
+// GTA6RT_METAL_SCENE_DUMP=<dir>[,<first>[,<every>[,<count>]]]: at the first-th frame with an upscaler dispatch (default
+// 60), then every every-th (default 600), count times (default 3): colour, G-buffer targets and depth as PNGs with
+// value statistics, and the frame's render-target passes in the log. GTA6RT_METAL_SCENE_LOG=1 logs the passes of the
+// dump frames without the PNGs.
+class SceneProbe {
+public:
+    struct Target {
+        ResourceId id = 0;
+        std::uint32_t format = 0, width = 0, height = 0, mip = 0, layer = 0;
+        bool depth = false;
+    };
+    using Resolve = std::function<gpu::Texture*(ResourceId)>;
+    static std::unique_ptr<SceneProbe> create(MetalContext& context);
+    explicit SceneProbe(MetalContext& context);
+    ~SceneProbe();
+
+    void draw(const Target* rts, std::uint32_t count, const Target& depth, const char* pipeline, const char* kind,
+              bool recorded);
+    // True when copies were recorded into `out` (the caller binds its render targets again).
+    bool dispatch(const char* pipeline, bool recorded, gpu::CommandList& out, const Resolve& resolve);
+    void end_frame();
+    // The colour to show this present (null: none) and its exposure; the mode (0 off, 1 under the UI, 2 alone).
+    gpu::Texture* present_source(float& exposure);
+    int present_mode() const { return present_mode_; }
+
+private:
+    struct Pass {
+        bool dispatch = false;
+        std::array<Target, 8> rts{};
+        std::uint32_t count = 0;
+        Target depth;
+        std::string first, last, kind;
+        std::uint64_t calls = 0, recorded = 0;
+    };
+    struct Readback {
+        std::string name, path;
+        std::unique_ptr<gpu::Buffer> buffer;
+        Target target;
+        std::uint32_t pitch = 0, texel = 0;
+        std::uint64_t frame = 0;
+        bool exposure_only = false;
+    };
+    bool render_size(const Target& t) const { return t.width == width_ && t.height == height_; }
+    static bool hdr_format(std::uint32_t f);
+    bool queue_readback(gpu::CommandList& out, gpu::Texture* texture, const Target& t, const std::string& name,
+                        bool exposure_only);
+    void finish_readbacks(bool all);
+    void write_readback(Readback& r);
+
+    MetalContext& context_;
+    std::mutex mutex_;
+    std::uint32_t width_ = 1280, height_ = 720;
+    int present_mode_ = 0;
+    std::string dump_dir_;
+    bool log_only_ = false;
+    std::uint64_t dump_first_ = 60, dump_every_ = 600, dump_count_ = 3, dumps_done_ = 0;
+    float fixed_exposure_ = 0, exposure_ = 1.0f;
+    std::uint64_t frame_ = 0, upscaled_frames_ = 0;
+    bool latched_ = false, logging_ = false;
+    Target hdr_, gbuffer_[8], gbuffer_depth_;
+    std::uint32_t gbuffer_count_ = 0;
+    std::string hdr_by_, gbuffer_by_;
+    std::vector<Pass> passes_;
+    std::unique_ptr<gpu::Texture> copy_;
+    bool copy_valid_ = false;
+    std::uint64_t copy_frame_ = 0;
+    std::vector<Readback> readbacks_;
 };
 
 // Replays one closed IR list into `out` (ADAPTER.md section 4). Commands the backend cannot do yet are counted and

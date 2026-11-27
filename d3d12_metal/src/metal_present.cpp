@@ -79,6 +79,7 @@ std::int32_t MetalPresenter::submit(const gpu::PresentDesc& desc) {
         return kFail;
     }
     ++presented_;
+    if (SceneProbe* scene = context_.scene()) scene->end_frame();
     context_.stats().presents.fetch_add(1, std::memory_order_relaxed);
     submit_phases::totals().presents.fetch_add(1, std::memory_order_relaxed);
     submit_phases::totals().present_serial.fetch_add(1, std::memory_order_relaxed);
@@ -141,6 +142,21 @@ std::int32_t MetalPresenter::present_planes(const PresentPlanes& planes, std::ui
         out.blend = i == 0 ? gpu::PlaneBlend::opaque
                     : p.straight_alpha ? gpu::PlaneBlend::straight
                                        : gpu::PlaneBlend::premultiplied;
+    }
+    if (SceneProbe* scene = context_.scene(); scene && scene->present_mode()) {
+        float exposure = 1.0f;
+        if (gpu::Texture* colour = scene->present_source(exposure)) {
+            gpu::PresentPlane under;
+            under.source = colour;
+            under.blend = gpu::PlaneBlend::opaque;
+            under.tone_exposure = exposure;
+            if (scene->present_mode() == 2 || d.plane_count < 2) {
+                d.planes[0] = under;
+                d.plane_count = 1;
+            } else {
+                d.planes[0] = under;
+            }
+        }
     }
     if (d.plane_count > 1) {
         ++composed_;

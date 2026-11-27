@@ -10,12 +10,15 @@
 #include "title_texture_memory.h"
 #include "title_va_alias.h"
 #include "vulkan_gpu_labels.h"
+#include "upscale.h"
 
 #include <algorithm>
+#include <chrono>
 #include <bit>
 #include <cstdio>
 #include <cstring>
 #include <memory>
+#include <set>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -179,10 +182,29 @@ private:
         if (!b || !b->texture) return unsupported("ClearRenderTargetView of an unknown texture");
         if (!c.rects.empty()) return unsupported("ClearRenderTargetView with rectangles");
         const std::uint32_t layers = std::max(1u, c.target.layer_count);
+        trace_clear(c, *b);
         for (std::uint32_t l = 0; l < layers; ++l)
             out_.clear_render_target(target(c.target, *b, c.target.first_layer + l), c.color);
         rt_dirty_ = true;
         context_.stats().clears.fetch_add(1, std::memory_order_relaxed);
+    }
+    // GTA6RT_METAL_CLEAR_TRACE=1: each distinct (colour, texture format, view format, size) of ClearRenderTargetView,
+    // once, 64 at most.
+    void trace_clear(const ClearRenderTarget& c, const MetalBinding& b) {
+        static const bool on = [] {
+            const char* v = std::getenv("GTA6RT_METAL_CLEAR_TRACE");
+            return v && *v == '1';
+        }();
+        if (!on || !b.texture) return;
+        static std::mutex mutex;
+        static std::set<std::string> seen;
+        const gpu::TextureDesc& td = b.texture->desc();
+        char line[200];
+        std::snprintf(line, sizeof line, "colour %g %g %g %g texture DXGI %u %ux%u view format %u", c.color[0], c.color[1],
+                      c.color[2], c.color[3], td.format, td.width, td.height, unsigned(c.target.format));
+        std::lock_guard lock(mutex);
+        if (seen.size() >= 64 || !seen.insert(line).second) return;
+        std::fprintf(stderr, "[rt] d3d12-metal: clear trace: %s\n", line);
     }
     void record(const ClearDepthStencil& c) {
         const MetalBinding* b = binding(c.target.resource);
@@ -458,6 +480,10 @@ private:
     void record(const DebugMarker& c) {
         switch (c.kind) {
         case DebugMarker::Kind::set:
+            if (gta6rt::upscale::is_marker(c.label)) {
+                upscale_stage(c.label);
+                break;
+            }
             out_.begin_event(c.label.c_str());
             out_.end_event();
             break;
@@ -473,12 +499,57 @@ private:
             break;
         }
     }
+    void upscale_stage(const std::string& label) {
+        const bool ok = gta6rt::upscale::record_metal(label, out_, [this](std::uintptr_t id) -> gpu::Texture* {
+            const MetalBinding* b = binding(ResourceId(id));
+            return b ? b->texture : nullptr;
+        });
+        if (!ok) unsupported("upscale stage (marker without a usable frame)");
+    }
     void record(const BuildAccelerationStructure&) { unsupported("BuildRaytracingAccelerationStructure"); }
     void record(const CopyAccelerationStructure&) { unsupported("CopyRaytracingAccelerationStructure"); }
     void record(const AccelerationStructurePostbuild&) { unsupported("EmitRaytracingAccelerationStructurePostbuildInfo"); }
 
     using Work = MetalContext::Work;
     using Fate = MetalContext::Fate;
+    void scene_dispatch(const char* name, bool recorded) {
+        SceneProbe* s = context_.scene();
+        if (!s) return;
+        if (s->dispatch(name, recorded, out_, [this](ResourceId id) -> gpu::Texture* {
+                const MetalBinding* b = binding(id, false);
+                return b ? b->texture : nullptr;
+            })) {
+            rt_dirty_ = true;
+            bound_compute_ = nullptr;
+        }
+    }
+    void scene_draw(const Draw& draw, const char* name, Work work, bool recorded) {
+        SceneProbe* s = context_.scene();
+        if (!s) return;
+        const auto of = [this](const TargetView& v, bool depth) {
+            SceneProbe::Target t;
+            const MetalBinding* b = v.resource ? binding(v.resource, false) : nullptr;
+            if (!b || !b->texture) return t;
+            const gpu::TextureDesc& d = b->texture->desc();
+            const std::uint32_t view = v.format == ColorViewFormat::resource ? 0 : metal_format(static_cast<VkFormat>(v.format));
+            t.id = v.resource;
+            t.format = !depth && view ? view : d.format;
+            t.width = std::max(1u, d.width >> v.mip);
+            t.height = std::max(1u, d.height >> v.mip);
+            t.mip = v.mip;
+            t.layer = v.first_layer;
+            t.depth = depth;
+            return t;
+        };
+        SceneProbe::Target rts[8];
+        std::uint32_t n = 0;
+        if (draw.views) {
+            n = std::min<std::uint32_t>(draw.views->render_target_count, 8);
+            for (std::uint32_t i = 0; i < n; ++i) rts[i] = of(draw.views->render_targets[i], false);
+        }
+        const SceneProbe::Target depth = draw.depth.resource ? of(draw.depth, true) : SceneProbe::Target{};
+        s->draw(rts, n, depth, name, MetalContext::work_name(work), recorded);
+    }
     static Fate pipeline_fate(const gpu::Pipeline* pl, const char*& why) {
         if (!pl) return Fate::library_pending;
         switch (pl->state()) {
@@ -516,7 +587,9 @@ private:
         auto& st = context_.stats();
         MetalComputePipeline p;
         const char* why = nullptr;
-        if (const Fate f = compute(c.pipeline, p, why); f != Fate::recorded) {
+        const Fate fate = compute(c.pipeline, p, why);
+        scene_dispatch(p.name, fate == Fate::recorded);
+        if (const Fate f = fate; f != Fate::recorded) {
             st.dispatches_skipped.fetch_add(1, std::memory_order_relaxed);
             if (f == Fate::compiling || f == Fate::library_pending) context_.note_compute_not_ready();
             context_.note_work(Work::dispatch, f, why);
@@ -539,6 +612,7 @@ private:
         MetalComputePipeline p;
         const char* why = nullptr;
         Fate f = c.pipeline ? compute(c.pipeline, p, why) : Fate::pso_unknown;
+        scene_dispatch(p.name, f == Fate::recorded);
         if (f == Fate::compiling || f == Fate::library_pending) context_.note_compute_not_ready();
         else if (f == Fate::recorded && context_.producers_settling()) f = Fate::producer_not_ready;
         if (f != Fate::recorded) {
@@ -721,6 +795,7 @@ private:
         Fate f = graphics(draw, p, why);
         if (f == Fate::recorded) f = bind_draw_state(draw, p, why);
         context_.note_work(work_of(draw, p, false), f, why);
+        scene_draw(draw, p.name, work_of(draw, p, false), f == Fate::recorded);
         if (f != Fate::recorded) {
             st.draws_skipped.fetch_add(1, std::memory_order_relaxed);
             if (MetalContext::census_on()) context_.note_census(p.name, "draw-skipped");
@@ -729,10 +804,15 @@ private:
         if (MetalContext::census_on())
             context_.note_census(p.name, draw.topology == gpu::topology::rect_list ? "draw-rect" : "draw");
         const bool traced = trace_draw(draw, p);
+        static const bool dump_before = [] {
+            const char* v = std::getenv("GTA6RT_METAL_DRAW_DUMP_RT_BEFORE");
+            return v && *v == '1';
+        }();
+        if (traced && dump_before) dump_target(draw, p);
         if (p.mesh) out_.draw_mesh(draw.count, draw.instances, draw.first);
         else if (draw.indexed) out_.draw_indexed(draw.count, draw.instances, draw.first, draw.base_vertex, draw.first_instance);
         else out_.draw(draw.count, draw.instances, draw.first, draw.first_instance);
-        if (traced) dump_target(draw, p);
+        if (traced && !dump_before) dump_target(draw, p);
         st.draws.fetch_add(1, std::memory_order_relaxed);
     }
     void record(const IndirectRasterDraw& payload) {
@@ -761,6 +841,7 @@ private:
             f = Fate::arguments_unknown;
         }
         context_.note_work(work, f, why);
+        scene_draw(draw, p.name, work, f == Fate::recorded);
         if (f != Fate::recorded) {
             st.draws_skipped.fetch_add(1, std::memory_order_relaxed);
             if (MetalContext::census_on()) context_.note_census(p.name, "indirect-draw-skipped");
@@ -773,6 +854,7 @@ private:
 
     // GTA6RT_METAL_DRAW_TRACE=<part of a pipeline name>: the first 8 draws of such pipelines, with their vertex
     // buffers and the first two vertices' first 32 bytes as floats (read at the buffer's CPU address).
+    // GTA6RT_METAL_DRAW_TRACE_AFTER_S=S: only from S seconds after the first draw replayed.
     // GTA6RT_METAL_DRAW_TRACE_EVERY=N: then every Nth such draw too, 64 lines at most. GTA6RT_METAL_DRAW_TRACE_TABLE=
     // <hex offsets>: the descriptor table at s8 (as the shader reads it, heap_base + s8) and, for each listed offset
     // holding a V#, the V# and the first 32 words of the memory it names.
@@ -793,12 +875,19 @@ private:
         }();
         static std::atomic<unsigned> seen[4]{}, printed{0};
         if (wants.empty() || !p.name) return false;
+        static const auto start = std::chrono::steady_clock::now();
+        static const double after_s = [] {
+            const char* v = std::getenv("GTA6RT_METAL_DRAW_TRACE_AFTER_S");
+            return v ? std::strtod(v, nullptr) : 0.0;
+        }();
+        if (after_s > 0 && std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count() < after_s)
+            return false;
         std::size_t which = 0;
         while (which < wants.size() && (wants[which].empty() || !std::strstr(p.name, wants[which].c_str()))) ++which;
         if (which == wants.size()) return false;
         const unsigned n = seen[std::min<std::size_t>(which, 3)].fetch_add(1);
         if (n >= 8 && (!every || n % every)) return false;
-        if (printed.fetch_add(1) >= 96) return false;
+        if (printed.fetch_add(1) >= 96) return true;
         std::string text;
         char line[256];
         std::snprintf(line, sizeof line, "%s: count %u instances %u first %u indexed %d topology %u viewport %.0f,%.0f %.0fx%.0f",
@@ -829,8 +918,8 @@ private:
         trace_table(draw);
         return true;
     }
-    // GTA6RT_METAL_DRAW_DUMP_RT=<dir>: after a traced draw, its first render target (4-byte texels) is copied to a
-    // shared buffer; the next traced draw writes the previous copy, halved, as <dir>/rt_<n>_<pipeline>.png.
+    // GTA6RT_METAL_DRAW_DUMP_RT=<dir>: after a traced draw (before it with GTA6RT_METAL_DRAW_DUMP_RT_BEFORE=1), its first render target (4-byte texels) is copied to a
+    // shared buffer; the next traced draw at least 0.5 s later (the copy has run by then) writes it, halved, as <dir>/rt_<n>_<pipeline>.png.
     void dump_target(const Draw& draw, const MetalGraphicsPipeline& p) {
         static const char* dir = std::getenv("GTA6RT_METAL_DRAW_DUMP_RT");
         if (!dir || !*dir) return;
@@ -860,7 +949,9 @@ private:
         static std::uint32_t pending_w = 0, pending_h = 0, dumps = 0, pending_format = 0;
         static bool pending_bgra = false;
         static std::string pending_name;
+        static std::chrono::steady_clock::time_point copied_at{};
         std::lock_guard lock(mutex);
+        if (pending_w && std::chrono::steady_clock::now() - copied_at < std::chrono::milliseconds(500)) return;
         if (pending_w && buffer && buffer->cpu_pointer()) {
             const auto* src = static_cast<const std::uint8_t*>(buffer->cpu_pointer());
             const std::uint32_t w = pending_w / 2, h = pending_h / 2;
@@ -913,6 +1004,7 @@ private:
         out_.copy_texture_to_buffer(k);
         rt_dirty_ = true;
         pending_w = k.width, pending_h = k.height, pending_bgra = bgra, pending_format = td.format;
+        copied_at = std::chrono::steady_clock::now();
         std::string name = p.name ? p.name : "draw";
         name = name.substr(0, name.find(','));
         pending_name = "rt_" + std::to_string(dumps++) + "_" + name;

@@ -3,7 +3,9 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <thread>
 
 namespace leonida {
 
@@ -215,30 +217,56 @@ bool MetalBindless::generation_free(Generation& g, std::chrono::steady_clock::ti
 }
 
 bool MetalBindless::flush() {
-    std::lock_guard lock(mutex_);
+    std::unique_lock lock(mutex_);
     if (!table_dirty_ && current_ != SIZE_MAX) return true;
     const std::size_t bytes = table_.size_bytes();
-    const auto now = std::chrono::steady_clock::now();
+    auto now = std::chrono::steady_clock::now();
     std::size_t pick = SIZE_MAX;
-    for (std::size_t i = 0; i < generations_.size();) {
-        Generation& g = generations_[i];
-        if (i == current_ || !generation_free(g, now)) {
-            ++i;
-            continue;
+    // GTA6RT_METAL_TABLE_GENERATIONS (default 8, 0: no cap): at that many live generations a flush waits (up to 2 s)
+    // for one the queues have passed instead of making another: while command buffers take a second each on the GPU
+    // a generation per dirty submission piled up to 48 (1.9 GiB, d3m-s7-b) and ended the run at the footprint cap.
+    static const std::size_t cap = [] {
+        const char* v = std::getenv("GTA6RT_METAL_TABLE_GENERATIONS");
+        return std::size_t(v && *v ? std::strtoul(v, nullptr, 10) : 8);
+    }();
+    const auto wait_start = now;
+    for (;;) {
+        for (std::size_t i = 0; i < generations_.size();) {
+            Generation& g = generations_[i];
+            if (i == current_ || !generation_free(g, now)) {
+                ++i;
+                continue;
+            }
+            if (g.buffer && g.buffer->size() >= bytes) {
+                if (pick == SIZE_MAX) pick = i;
+                ++i;
+                continue;
+            }
+            if (g.buffer) {
+                generation_bytes_ -= g.buffer->size();
+                metal_ledger::remove(metal_ledger::descriptor, g.buffer->size());
+            }
+            generations_.erase(generations_.begin() + std::ptrdiff_t(i));
+            ++generations_freed_;
+            if (current_ != SIZE_MAX && current_ > i) --current_;
+            if (pick != SIZE_MAX && pick > i) --pick;
         }
-        if (g.buffer && g.buffer->size() >= bytes) {
-            if (pick == SIZE_MAX) pick = i;
-            ++i;
-            continue;
-        }
-        if (g.buffer) {
-            generation_bytes_ -= g.buffer->size();
-            metal_ledger::remove(metal_ledger::descriptor, g.buffer->size());
-        }
-        generations_.erase(generations_.begin() + std::ptrdiff_t(i));
-        ++generations_freed_;
-        if (current_ != SIZE_MAX && current_ > i) --current_;
-        if (pick != SIZE_MAX && pick > i) --pick;
+        if (pick != SIZE_MAX || !cap || generations_.size() < cap || now - wait_start > std::chrono::seconds(2)) break;
+        lock.unlock();
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        lock.lock();
+        if (!table_dirty_ && current_ != SIZE_MAX) return true;
+        now = std::chrono::steady_clock::now();
+    }
+    if (now != wait_start) {
+        ++throttled_flushes_;
+        throttled_us_ += std::uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(now - wait_start).count());
+        if (throttled_flushes_ <= 4 || !(throttled_flushes_ & (throttled_flushes_ - 1)))
+            std::fprintf(stderr, "[rt] d3d12-metal: descriptor hash table: %zu live generations, a flush waited %.1f ms for one "
+                                 "the GPU passed%s (%llu waits, %.1f s in all)\n",
+                         generations_.size(), double(std::chrono::duration_cast<std::chrono::microseconds>(now - wait_start).count()) / 1000.0,
+                         pick == SIZE_MAX ? " and made another" : "",
+                         static_cast<unsigned long long>(throttled_flushes_), double(throttled_us_) / 1e6);
     }
     if (current_ != SIZE_MAX && pick != current_) {
         Generation& old = generations_[current_];

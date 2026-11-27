@@ -44,3 +44,8 @@ target_link_libraries(pcache_archive_test PRIVATE gta6rt_pcache gta6rt_pcache_ca
 target_compile_definitions(pcache_archive_test PRIVATE GTA6RT_PORT_ROOT="${_port}")
 add_test(NAME pcache_archive COMMAND pcache_archive_test "${CMAKE_BINARY_DIR}/test-tmp/archive")
 set_tests_properties(pcache_archive PROPERTIES TIMEOUT 300)
+
+add_executable(pso_probe tools/pso_probe.mm)
+target_link_libraries(pso_probe PRIVATE gta6rt_pcache_catalog "-framework Metal" "-framework Foundation")
+target_compile_definitions(pso_probe PRIVATE GTA6RT_PORT_ROOT="${_port}")
+set_target_properties(pso_probe PROPERTIES COMPILE_FLAGS "-fobjc-arc")

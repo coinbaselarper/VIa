@@ -43,6 +43,7 @@
 #include "../src/title_va_alias.h"
 #include "../src/console_heap_vsharp_slots.h"
 #include "../src/copy_pool.h"
+#include "../../shims_core/src/xbox_bvh_hooks.h"
 #include "../src/title_window_plan.h"
 #include "../src/image_memory.h"
 #include "../src/quad_index_expand.h"
@@ -59,6 +60,7 @@
 #include "../src/metal_formats.h"
 #include "../src/metal_shaders.h"
 #include "pcache.h"
+#include "upscale.h"
 #include <gta6rt_metal/metal_backend.h>
 #ifdef _MSC_VER
 #pragma comment(lib, "advapi32.lib")
@@ -96,6 +98,7 @@
 #include <vector>
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
+#include <malloc/malloc.h>
 #include <gta6rt/os.h>
 
 namespace d3m {
@@ -2011,6 +2014,8 @@ struct DeviceState {
     };
     std::vector<ExternalBlock> external_blocks;
     std::uint64_t external_bytes = 0, external_live = 0, external_reused = 0;
+    std::uint64_t external_reserved_bytes = 0, external_va_taken = 0;
+    std::vector<std::unique_ptr<leonida::gpu::Buffer>> external_set_aside;
     std::mutex external_mutex;
     void external_release(const leonida::gpu::Buffer* buffer, std::uint64_t in_block, std::uint64_t bytes) {
         std::lock_guard lock(external_mutex);
@@ -2051,10 +2056,40 @@ struct DeviceState {
         d.memory = leonida::gpu::MemoryKind::shared;
         d.usage = leonida::gpu::usage::copy | leonida::gpu::usage::shader_read | leonida::gpu::usage::unordered_access;
         d.label = "title windows outside the arena";
-        b.buffer = gpu->create_buffer(d);
-        if (!b.buffer || !b.buffer->cpu_pointer() || !b.buffer->host_gpu_address()) return false;
+        // The block's console VA is its Metal address less the arena's: a number the title may allocate memory at.
+        // Its range is reserved in the process (no access, no memory) so the title never gets memory there; a block
+        // whose range is not free is set aside (kept, so Metal does not hand out its address again) and another made.
+        static const bool reserve = [] {
+            const char* v = std::getenv("GTA6RT_METAL_EXTERNAL_RESERVE_VA");
+            return !v || std::strcmp(v, "0") != 0;
+        }();
+        for (int attempt = 0;; ++attempt) {
+            b.buffer = gpu->create_buffer(d);
+            if (!b.buffer || !b.buffer->cpu_pointer() || !b.buffer->host_gpu_address()) return false;
+            b.shader_va = b.buffer->host_gpu_address() - arena.address;
+            if (!reserve) break;
+            mach_vm_address_t at = b.shader_va;
+            if (b.buffer->host_gpu_address() > arena.address &&
+                mach_vm_map(mach_task_self(), &at, b.capacity, 0, VM_FLAGS_FIXED, MEMORY_OBJECT_NULL, 0, FALSE,
+                            VM_PROT_NONE, VM_PROT_NONE, VM_INHERIT_NONE) == KERN_SUCCESS) {
+                external_reserved_bytes += b.capacity;
+                break;
+            }
+            ++external_va_taken;
+            if (external_va_taken <= 8 || !(external_va_taken & (external_va_taken - 1)))
+                std::fprintf(stderr, "[rt] d3d12-metal: a block outside the arena at shader VA 0x%llx (%llu KiB) overlaps "
+                                     "memory of this process; set aside (%llu so far)\n",
+                             static_cast<unsigned long long>(b.shader_va),
+                             static_cast<unsigned long long>(b.capacity >> 10),
+                             static_cast<unsigned long long>(external_va_taken));
+            external_set_aside.push_back(std::move(b.buffer));
+            if (attempt >= 15) {
+                std::fprintf(stderr, "[rt] d3d12-metal: no block outside the arena with a free shader-VA range after %d "
+                                     "tries; the buffer is refused\n", attempt + 1);
+                return false;
+            }
+        }
         b.mapped = static_cast<std::uint8_t*>(b.buffer->cpu_pointer());
-        b.shader_va = b.buffer->host_gpu_address() - arena.address;
         context->add_va_range(b.shader_va, b.capacity, b.buffer.get(), 0);
         external_bytes += b.capacity;
         leonida::metal_ledger::add(category, b.capacity);
@@ -2498,9 +2533,65 @@ struct DeviceState {
     // would land in whatever this process has there, the malloc heap included (the silent SIGABRTs at the world
     // phase: a tiny free list corrupted, d3m-s4-c; ASAN r8-asan-a: guarded::store64 from Pump::land into the heap).
     // Dropped and counted instead.
+    // gta6rt_vm_query answers any host mapping through mach_vm_region, the malloc heap included, so the test below
+    // let round 6's stray writes through: a region malloc tagged is either the title's HeapAlloc (host malloc) or the
+    // host's own objects. Counted and named; GTA6RT_METAL_DROP_HEAP_WRITES=1 drops them.
+    static bool malloc_region(std::uint64_t va) {
+        mach_vm_address_t addr = va;
+        mach_vm_size_t bytes = 0;
+        natural_t depth = 0;
+        vm_region_submap_info_data_64_t info{};
+        for (int i = 0; i < 8; ++i) {
+            mach_msg_type_number_t count = VM_REGION_SUBMAP_INFO_COUNT_64;
+            if (mach_vm_region_recurse(mach_task_self(), &addr, &bytes, &depth,
+                                       reinterpret_cast<vm_region_recurse_info_t>(&info), &count) != KERN_SUCCESS ||
+                addr > va)
+                return false;
+            if (!info.is_submap) break;
+            ++depth;
+        }
+        switch (info.user_tag) {
+        case VM_MEMORY_MALLOC: case VM_MEMORY_MALLOC_SMALL: case VM_MEMORY_MALLOC_LARGE: case VM_MEMORY_MALLOC_HUGE:
+        case VM_MEMORY_MALLOC_TINY: case VM_MEMORY_MALLOC_LARGE_REUSABLE: case VM_MEMORY_MALLOC_LARGE_REUSED:
+        case VM_MEMORY_MALLOC_NANO: case VM_MEMORY_MALLOC_MEDIUM:
+            return true;
+        default:
+            return false;
+        }
+    }
+    std::atomic<std::uint64_t> heap_value_writes{0};
+
     leonida::value_sink::Landing land_outside_arena(std::uint64_t va, const void* bytes, unsigned size) {
         using leonida::value_sink::Landing;
         if (!bytes || !size) return Landing::refused;
+        {
+            std::lock_guard lock(external_mutex);
+            for (ExternalBlock& b : external_blocks) {
+                const std::uint64_t off = va - b.shader_va;
+                if (off >= b.capacity || size > b.capacity - off) continue;
+                std::memcpy(b.mapped + off, bytes, size);
+                return Landing::landed;
+            }
+        }
+        if (malloc_region(va)) {
+            static const bool drop = [] {
+                const char* e = std::getenv("GTA6RT_METAL_DROP_HEAP_WRITES");
+                return e && *e == '1';
+            }();
+            const std::uint64_t n = heap_value_writes.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (n <= 8 || !(n & (n - 1))) {
+                const void* p = reinterpret_cast<const void*>(static_cast<std::uintptr_t>(va));
+                std::uint64_t value = 0;
+                std::memcpy(&value, bytes, std::min<unsigned>(size, 8));
+                std::fprintf(stderr, "[rt] d3d12-metal: a %u-byte list value write of 0x%llx to 0x%llx lands in a malloc "
+                                     "region (%s; title HeapAlloc or the host's own heap): %s (%llu so far)\n",
+                             size, static_cast<unsigned long long>(value), static_cast<unsigned long long>(va),
+                             malloc_zone_from_ptr(p) ? "a live block starts there" : "inside a block or free",
+                             drop ? "dropped" : "stored", static_cast<unsigned long long>(n));
+            }
+            if (drop) return Landing::refused;
+            return Landing::elsewhere;
+        }
         // A guest allocation the os layer holds now (not the title-memory cache: the probe behind it also accepts any
         // private host mapping, the malloc heap's included, and keeps ranges the title has freed).
         gta6rt_vm_region region{};
@@ -8394,6 +8485,7 @@ public:
                     });
             }
         }
+        gta6rt::upscale::install(*state_.gpu);
         state_.context->set_on_device_lost([this](const char* where) { end_run("the Metal device was lost", where, 3); });
         state_.guard = std::thread([this] { run_guard(); });
     }
@@ -11186,8 +11278,22 @@ public:
             // An RGBA8 or BGRA8 texture whose castable list names the RTV's format in the other channel order, or
             // across B8G8R8X8 and B8G8R8A8, gets an RTV in that format.
             const DXGI_FORMAT asked = desc && desc->Format != DXGI_FORMAT_UNKNOWN ? desc->Format : rd.Format;
+            // The console also lets a typed RGBA8/BGRA8 render target take an RTV in its UNORM/sRGB twin without a
+            // castable list: the launch movie is drawn through an R8G8B8A8_UNORM view of an R8G8B8A8_UNORM_SRGB target
+            // (upstream create_texture's console_format_stand_ins twin, 16:05+; every Metal texture has view usage).
+            const auto srgb_twin = [](DXGI_FORMAT f) {
+                switch (f) {
+                case DXGI_FORMAT_R8G8B8A8_UNORM: return DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+                case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: return DXGI_FORMAT_R8G8B8A8_UNORM;
+                case DXGI_FORMAT_B8G8R8A8_UNORM: return DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+                case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: return DXGI_FORMAT_B8G8R8A8_UNORM;
+                default: return DXGI_FORMAT_UNKNOWN;
+                }
+            };
+            const bool console_twin = r && !r->has_castable_formats() && asked != rd.Format &&
+                                      (rd.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) && srgb_twin(rd.Format) == asked;
             const bool cast_listed = r && asked != rd.Format && rgba8_any_order(rd.Format) && rgba8_any_order(asked) &&
-                                     r->lists_castable_format(asked);
+                                     (r->lists_castable_format(asked) || console_twin);
             // A typed BGRA8 or B8G8R8X8 texture with a castable list refuses an RTV in another format the list
             // doesn't name, as a typed RGBA8 texture does. Without a list it keeps the image's format, as before.
             const bool typed_bgra8_listed = r && !typed_rgba8 && rgba8_any_order(rd.Format) &&
@@ -14261,6 +14367,12 @@ void set_device_outer(ID3D12Device* device, IUnknown* outer) {
     if (void* proxy = rt::d3d12_xs::device_proxy_primary(outer)) outer = static_cast<IUnknown*>(proxy);
     d->set_outer(outer);
     if (!rt::d3d12_xs::is_device_proxy(outer)) return;
+    // create_device_proxy has just installed the XboxBvhBuilder hooks; GTA6RT_METAL_BVH_HOOKS=0 takes them out again
+    // (negative control for the world phase's stray list writes, spike/r8-world).
+    if (const char* e = std::getenv("GTA6RT_METAL_BVH_HOOKS"); e && *e == '0') {
+        rt::xbox_bvh::set_hooks({});
+        std::fprintf(stderr, "[rt] d3d12-metal: XboxBvhBuilder proxy hooks removed (GTA6RT_METAL_BVH_HOOKS=0)\n");
+    }
     rt::d3d12_xs::set_device_resource_provider(
         outer, [](ID3D12Device* real, std::uint64_t va, std::uint64_t bytes, std::uint64_t* start,
                   std::uint64_t* size) -> ID3D12Resource* {

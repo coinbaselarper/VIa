@@ -130,6 +130,8 @@ def main():
     ap.add_argument("--seed", help="older corpus to hard-link into an empty --out first")
     ap.add_argument("--jobs", type=int, default=3)
     ap.add_argument("--no-apple", action="store_true", help="translate with make_game's flags only")
+    ap.add_argument("--descriptor-hash", choices=("fnv1a", "fnv1a_fmix32"), default="fnv1a",
+                    help="bindless descriptor table hash the modules probe with (the runtime reads it from the index)")
     a = ap.parse_args()
     if a.jobs > 3:
         ap.error("at most 3 jobs on this machine")
@@ -143,7 +145,8 @@ def main():
         logf.write(line + "\n")
         logf.flush()
 
-    flags_extra = [] if a.no_apple else APPLE_FLAGS
+    flags_extra = ([] if a.no_apple else list(APPLE_FLAGS)) + \
+        ([] if a.descriptor_hash == "fnv1a" else ["--descriptor-hash", a.descriptor_hash])
     digest = translator_digest()
     manifest_path = os.path.join(out, "shaders_vk.json")
     try:

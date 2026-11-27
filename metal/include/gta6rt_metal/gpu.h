@@ -860,6 +860,9 @@ struct PresentPlane {
     Rect dst{};  // drawable pixels; all zero = the whole drawable
     Filter filter = Filter::linear;
     PlaneBlend blend = PlaneBlend::premultiplied;
+    // > 0: the source is HDR linear colour, shown as 1 - exp(-c * tone_exposure), sRGB encoded, alpha 1 (a
+    // diagnostic view of a render target that is not a display image).
+    float tone_exposure = 0.0f;
 };
 
 struct PresentDesc {
@@ -924,19 +927,33 @@ public:
 
 // ---- pipeline cache (MTLBinaryArchive) and compile queue ----
 
+// The cache is a set of archive files (shards) per key: <directory>/gta6rt-<key hash>[-<tag>-<n>].metalarchive, each
+// with a .key file. Every shard with this key is loaded (read-only) at open; new pipelines go into an in-memory
+// archive that a flush seals and writes as a new shard (to .tmp, re-opened to verify, then linked under a new name:
+// a written shard is never overwritten). Serialising holds no lock a compile needs.
 struct PipelineCacheDesc {
-    const char* directory = nullptr;      // the archive and its key file live here
+    const char* directory = nullptr;      // the shards and their key files live here
     std::string translator_version;       // part of the key: a new translator never reads an old archive
-    bool load = true;                     // read an existing archive with the same key
+    bool load = true;                     // read the existing shards with the same key
+    std::uint64_t shard_bytes = 150'000'000;  // a writer flushes before the in-memory shard would pass this (estimate)
+    std::string tag = "run";              // name part of the shards this process writes (set_pipeline_cache_tag)
 };
 
 struct PipelineCacheStats {
     bool open = false;
-    bool loaded = false;                  // an archive with this key existed and was read
-    std::string path, key;
+    bool loaded = false;                  // at least one shard with this key existed and was read
+    std::string path, key;                // path: the shard name prefix
     std::uint64_t hits = 0, misses = 0, added = 0, add_failures = 0;
     double load_seconds = 0, serialize_seconds = 0;
-    std::uint64_t file_bytes = 0;
+    std::uint64_t file_bytes = 0;         // all shards of this key on disk
+    std::uint32_t shards = 0;             // loaded at open + written since
+    std::uint32_t shards_unreadable = 0;  // moved aside to .unreadable at open
+    std::uint64_t pending = 0;            // added since the last write (in memory only)
+    std::uint64_t pending_bytes = 0;      // estimate of what the next shard would take
+    std::uint64_t written = 0, flushes = 0, flush_failures = 0;
+    double serialize_longest = 0;
+    double lookup_seconds = 0, compile_seconds = 0, add_seconds = 0;  // sums over builds
+    std::string last_error;
 };
 
 struct CompileQueueStats {
@@ -945,6 +962,8 @@ struct CompileQueueStats {
     std::array<std::uint64_t, 3> completed{};  // since creation, per Priority they ran at
     std::uint64_t running = 0;
     std::uint64_t stolen = 0;                  // taken off the queue by a wait() on the caller's thread
+    std::uint64_t running_background = 0;
+    std::uint32_t active_limit = 0, background_limit = 0;  // set_compile_limits
 };
 
 // ---- device ----

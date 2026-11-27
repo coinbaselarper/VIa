@@ -229,7 +229,12 @@ id<MTLComputePipelineState> MetalDevice::builtin_kernel(const char* name) {
     id<MTLComputePipelineState> p = nil;
     if (builtin_library_) {
         NSError* error = nil;
-        p = [device_ newComputePipelineStateWithFunction:[builtin_library_ newFunctionWithName:@(name)] error:&error];
+        MTLComputePipelineDescriptor* d = [MTLComputePipelineDescriptor new];
+        d.computeFunction = [builtin_library_ newFunctionWithName:@(name)];
+        d.label = @(name);
+        p = d.computeFunction ? [device_ newComputePipelineStateWithDescriptor:d options:MTLPipelineOptionNone
+                                                                    reflection:nil error:&error]
+                              : nil;
         if (!p) log("builtin kernel %s: %s", name, error.localizedDescription.UTF8String);
     }
     kernels_[name] = p;
