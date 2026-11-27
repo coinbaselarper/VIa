@@ -211,6 +211,21 @@ HRESULT XboxPresentation::present_x(UINT plane_count, const XboxPresentPlanePara
             return present_diag(__LINE__, DXGI_ERROR_UNSUPPORTED);
         }
     }
+    // port/: the size of each plane, for the 4K-target question (r7 memory): logged for the first presents and when
+    // a plane's size changes.
+    {
+        static std::atomic<std::uint64_t> last[2]{};
+        for (UINT i = 0; i < plane_count && i < 2; ++i) {
+            const D3D12_RESOURCE_DESC d = planes[i].ppResources[0]->GetDesc();
+            const std::uint64_t key = (d.Width << 32) ^ (std::uint64_t(d.Height) << 8) ^ std::uint64_t(d.Format);
+            if (last[i].exchange(key) == key) continue;
+            const D3D12_RECT* r = planes[i].pSrcViewRects;
+            std::fprintf(stderr, "[rt] present: plane %u is %llux%u DXGI %d, source rect %s%ld,%ld-%ld,%ld, placement %s\n",
+                         i, static_cast<unsigned long long>(d.Width), d.Height, int(d.Format), r ? "" : "(none) ",
+                         r ? long(r->left) : 0l, r ? long(r->top) : 0l, r ? long(r->right) : 0l,
+                         r ? long(r->bottom) : 0l, planes[i].pDestPlacementBase ? "set" : "whole output");
+        }
+    }
     // Only a token that was never handed out is refused. Null, stale and repeated tokens are presented anyway (what the
     // console does with them is unmeasured, and a title that does it must not freeze); each kind is logged once.
     FramePacer::TokenIssue issue{};

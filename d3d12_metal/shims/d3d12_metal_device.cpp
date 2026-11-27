@@ -2667,8 +2667,9 @@ struct DeviceState {
 
     // On Metal every allocation made after the arena has a shader VA (GPU address - heap_base) from 0x10000000 up,
     // which is also where the title's own low memory lies, so "heap_base + base is backed" cannot tell a V# the layer
-    // already rewrote from a raw title address. The V# records the layer wrote itself (Create*View) are remembered;
-    // a title-memory base in any other record is the title's (GTA6RT_METAL_VSHARP_TITLE_FIRST=0: the old rule).
+    // already rewrote from a raw title address. Off by default (no run has shown a raw title base taken for a
+    // rewritten one yet; ambiguous_vsharps counts the cases): GTA6RT_METAL_VSHARP_TITLE_FIRST=1 remembers the V#
+    // records the layer wrote itself (Create*View) and takes a title-memory base in any other record as the title's.
     struct VsharpRecordHash {
         std::size_t operator()(const std::array<uint32_t, 4>& w) const {
             return std::size_t((uint64_t(w[0]) | (uint64_t(w[1]) << 32)) * 0x9E3779B97F4A7C15ull ^ w[2] ^ (uint64_t(w[3]) << 17));
@@ -2676,11 +2677,11 @@ struct DeviceState {
     };
     std::mutex layer_vsharp_mutex;
     std::unordered_set<std::array<uint32_t, 4>, VsharpRecordHash> layer_vsharps;
-    std::atomic<uint64_t> title_first_rebased{0}, title_first_empty{0};
+    std::atomic<uint64_t> title_first_rebased{0}, title_first_empty{0}, ambiguous_vsharps{0};
     static bool vsharp_title_first() {
         static const bool on = [] {
             const char* v = std::getenv("GTA6RT_METAL_VSHARP_TITLE_FIRST");
-            return !v || std::strcmp(v, "0") != 0;
+            return v && std::strcmp(v, "1") == 0;
         }();
         return on;
     }
@@ -2752,7 +2753,16 @@ struct DeviceState {
         // An already rewritten descriptor carries only the low 48 bits.
         uint64_t offset = base;
         if (signed_vsharp_offsets() && base <= mask && (base & (1ull << 47))) offset |= ~mask;
-        if (backed(offset)) return offset;
+        if (backed(offset)) {
+            if (offset == base && base >= arena.size && title) {
+                const uint64_t n = ambiguous_vsharps.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (!(n & (n - 1)) && n <= (1u << 20))
+                    std::fprintf(stderr, "[rt] d3d12-metal: V# base 0x%llx is title memory and a backed shader VA; taken "
+                                         "as already rewritten (%llu so far)\n",
+                                 (unsigned long long)base, (unsigned long long)n);
+            }
+            return offset;
+        }
         // Read the other way: bit 47 as a sign, for a below-arena buffer's V# the layer wrote itself.
         if (offset == base && base <= mask && (base & (1ull << 47)) && backed(base | ~mask)) return base | ~mask;
         if (try_geometry) {
@@ -6779,6 +6789,17 @@ public:
             std::fprintf(stderr, "[rt] d3d12: %s declares %u bytes of workgroup memory, over Metal's %u\n",
                          entry->name.c_str(), unsigned(entry->lds_bytes), device_.gpu->caps().max_threadgroup_memory);
             return stream_unsupported("compute shader exceeds shared memory limit");
+        }
+        // GTA6RT_METAL_REFUSE_CS=<prefix>[,<prefix>...]: compute PSOs whose shader name starts so are refused
+        // (diagnostic bisection of GPU timeouts; their dispatches are skipped and counted).
+        if (const char* refuse = std::getenv("GTA6RT_METAL_REFUSE_CS"); refuse && *refuse) {
+            for (const char* at = refuse; *at;) {
+                const char* end = std::strchr(at, ',');
+                const std::size_t n = end ? std::size_t(end - at) : std::strlen(at);
+                if (n && entry->name.compare(0, n, at, n) == 0)
+                    return stream_unsupported("refused by GTA6RT_METAL_REFUSE_CS");
+                at += n + (end ? 1 : 0);
+            }
         }
         compute_.threads = entry->local_size;
         stage_names_[0] = entry->name;
@@ -11261,6 +11282,15 @@ public:
             }
         } else if (resource) {
             stub("ID3D12Device::CreateRenderTargetView(resource from another device)");
+        }
+        if (resource && !view.resource) {
+            static std::atomic<int> told{0};
+            if (told.fetch_add(1, std::memory_order_relaxed) < 16)
+                std::fprintf(stderr, "[rt] d3d12-metal: null RTV for %s resource %p (DXGI %d %llux%u, flags 0x%x; view "
+                                     "DXGI %d dimension %d)\n",
+                             rid ? "a known" : "an unknown", static_cast<void*>(resource), int(rd.Format),
+                             static_cast<unsigned long long>(rd.Width), rd.Height, unsigned(rd.Flags),
+                             desc ? int(desc->Format) : -1, desc ? int(desc->ViewDimension) : -1);
         }
         std::memcpy(reinterpret_cast<void*>(destination.ptr), &view, sizeof(view));
     }

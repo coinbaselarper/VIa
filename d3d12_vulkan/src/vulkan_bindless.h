@@ -69,6 +69,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <functional>
@@ -375,7 +376,14 @@ public:
                 std::vector<std::uint32_t> families = {})
         : device_(device), memory_(memory), features_(features), families_(std::move(families)),
           table_(64, descriptor_hash) {
-        ok_ = vk_.load(get, device) && create_layout() && create_fallbacks() && create_table_buffers() && fill();
+        ok_ = vk_.load(get, device);
+        // port/: the table, its staging copy and the fallback images were invisible to the layer's GPU ledger, which
+        // wraps the runtime's function table, not this one.
+        if (ok_ && gpu_ledger::state().installed) {
+            vk_.vkAllocateMemory = gpu_ledger::allocate_memory;
+            vk_.vkFreeMemory = gpu_ledger::free_memory;
+        }
+        ok_ = ok_ && create_layout() && create_fallbacks() && create_table_buffers() && fill();
     }
 
     ~BindlessSet() {
@@ -681,6 +689,8 @@ public:
     VkResult last_failure_result() const { return last_failure_result_; }
     // Bytes of the current table buffer (the table grows by doubling its slots: size_bytes() of table()).
     std::size_t table_buffer_bytes() const { return table_buffers_.table.size; }
+    // Device memory of the current table, its staging copy, retired generations and spares.
+    std::uint64_t table_memory_bytes() const { return table_memory_.load(std::memory_order_relaxed); }
 
 private:
     struct Functions {
@@ -719,6 +729,7 @@ private:
         void* mapped = nullptr;
         std::size_t size = 0;
         bool device_local = false;  // the memory is DEVICE_LOCAL
+        VkDeviceSize allocated = 0;
     };
 
     // The table and the mapped staging copy the CPU writes before vkCmdCopyBuffer moves the changes.
@@ -984,6 +995,10 @@ private:
         }
         if (result == VK_SUCCESS && !device_local)
             result = vk_.vkMapMemory(device_, made.memory, 0, VK_WHOLE_SIZE, 0, &made.mapped);
+        if (made.memory) {
+            made.allocated = allocation.allocationSize;
+            table_memory_.fetch_add(made.allocated, std::memory_order_relaxed);
+        }
         if (result != VK_SUCCESS) {
             note_failure(what, result);
             destroy(made);
@@ -995,7 +1010,10 @@ private:
 
     void destroy(TableBuffer& buffer) const {
         if (buffer.buffer) vk_.vkDestroyBuffer(device_, buffer.buffer, nullptr);
-        if (buffer.memory) vk_.vkFreeMemory(device_, buffer.memory, nullptr);  // unmaps it
+        if (buffer.memory) {
+            vk_.vkFreeMemory(device_, buffer.memory, nullptr);  // unmaps it
+            table_memory_.fetch_sub(buffer.allocated, std::memory_order_relaxed);
+        }
         buffer = {};
     }
 
@@ -1292,6 +1310,7 @@ private:
     std::unordered_map<std::uint64_t, std::size_t> pending_slots_;  // binding and index -> place in pending_
     DescriptorTable table_;  // 64 slots, and the device's hash kind, from the constructor
     TableBuffers table_buffers_;
+    mutable std::atomic<std::uint64_t> table_memory_{0};
     bool table_uploaded_ = false;  // the table's current contents are in table_buffers_.table
     bool table_on_gpu_ = false;    // an upload into the current table buffers reached the queue (degrading is safe)
     bool table_device_local_ = false;

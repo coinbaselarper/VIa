@@ -117,6 +117,8 @@ struct ClampedIndirect {
     std::uint32_t kind = 0;
     std::uint32_t stride_words = 0;
     std::uint32_t max_records = 0;
+    bool rect = false;  // port/: draw records of a rectangle list, rewritten to the vertex-stage expansion's shape
+    std::uint32_t index_limit = UINT32_MAX;  // port/: indexed draws: the indices the bound view holds
 };
 
 // One device's clamp: the pass's pipeline (made on the first call), the per-submission record pool, and the counter
@@ -277,8 +279,9 @@ struct IndirectClampPush {
     std::uint32_t first_record;
     std::uint32_t max_records;
     std::uint32_t flags;
+    std::uint32_t index_limit;  // port/: indexed draws: the indices the bound view holds (UINT32_MAX: unbounded)
 };
-static_assert(sizeof(IndirectClampPush) == 72);
+static_assert(sizeof(IndirectClampPush) == 80);
 
 inline constexpr VkBufferUsageFlags indirect_clamp_scratch_usage =
     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT |
@@ -590,7 +593,8 @@ inline void IndirectArgumentClamp::emit(VkCommandBuffer cb, const ClampedIndirec
                                                   std::uint32_t(first),
                                                   job.max_records,
                                                   (job.kind == indirect_clamp_dispatch ? indirect_group_budget() << 1 : 0u) |
-                                                      (job.counted ? 1u : 0u)};
+                                                      (job.counted ? 1u : 0u) | (job.rect ? 0x80000000u : 0u),
+                                                  job.index_limit};
         push(cb, layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(constants), &constants);
         dispatch(cb, (records - 1u) / 64u + 1u, 1, 1);
         first += records;

@@ -57,6 +57,7 @@ set(D3D12VK_PLATFORM_SOURCES
   platform/rts0_serializer.cpp
   platform/rts0_deserializer.cpp
   platform/title_memory_probe.cpp
+  platform/title_pages.cpp
   platform/fault_guard.cpp)
 
 add_library(gta6rt_d3d12_vulkan STATIC ${D3D12VK_LEONIDA_SOURCES} ${D3D12VK_PLATFORM_SOURCES}

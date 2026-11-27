@@ -235,8 +235,13 @@ public:
     };
     enum class Fate : std::uint8_t {
         recorded, pso_refused, pso_unknown, library_pending, compiling, metal_refused, target_unknown,
-        vertex_unknown, index_unknown, arguments_unknown, not_implemented, count
+        vertex_unknown, index_unknown, arguments_unknown, not_implemented, producer_not_ready, count
     };
+    // A dispatch skipped because its pipeline or library is not ready yet: GPU-driven indirect work in the next
+    // GTA6RT_METAL_INDIRECT_GUARD_MS (default 2000, 0: off) is skipped too, since its records may come from that
+    // dispatch and were never written (garbage grids: GPU timeouts, d3m-s4-g/-h).
+    void note_compute_not_ready();
+    bool producers_settling() const;
     static const char* work_name(Work w);
     static const char* fate_name(Fate f);
     void note_work(Work w, Fate f, const char* why = nullptr);
@@ -293,6 +298,7 @@ private:
     std::array<std::uint64_t, kWork> work_seen_{};
     std::mutex work_mutex_;
     std::map<std::string, std::uint64_t> work_why_;
+    std::atomic<std::int64_t> last_compute_skip_ns_{0};
     mutable std::mutex submitted_mutex_;
     std::map<gpu::Fence*, std::uint64_t> submitted_;
 };

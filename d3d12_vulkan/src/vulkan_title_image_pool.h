@@ -6,6 +6,7 @@
 #include <bit>
 #include <cstdlib>
 #include <cstdint>
+#include <cstring>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -22,12 +23,18 @@ struct TitleImagePage {
     std::uint32_t type = 0, capacity = 0, allocated = 0;
     std::mutex mutex;
     std::vector<std::uint32_t> returned;
+    std::uint64_t requested = 0;  // port/: bytes the live images asked for (their stride is the slot)
+
+    std::uint32_t live() {
+        std::lock_guard lock(mutex);
+        return allocated - std::uint32_t(returned.size());
+    }
 
     ~TitleImagePage() {
         if (memory) free_memory(device, memory, nullptr);
     }
 
-    bool take(std::uint32_t& slot) {
+    bool take(std::uint32_t& slot, std::uint64_t bytes) {
         std::lock_guard lock(mutex);
         if (!returned.empty()) {
             slot = returned.back();
@@ -37,12 +44,14 @@ struct TitleImagePage {
         } else {
             return false;
         }
+        requested += bytes;
         return true;
     }
 
-    void release(std::uint32_t slot) {
+    void release(std::uint32_t slot, std::uint64_t bytes) {
         std::lock_guard lock(mutex);
         returned.push_back(slot);  // the page reserves capacity at creation
+        requested -= bytes;
     }
 };
 
@@ -53,12 +62,16 @@ struct PooledTitleImage {
 
     std::shared_ptr<TitleImagePage> page;
     std::uint32_t slot = 0;
+    std::uint64_t bytes = 0;
     VkImage image{};
     PFN_vkDestroyImage destroy_image{};
+    // port/: an image bound into memory it does not own a slot of (a render-target alias extent, rt_alias.h).
+    VkDevice device{};
+    std::shared_ptr<void> keep;
 
     ~PooledTitleImage() {
-        if (image) destroy_image(page->device, image, nullptr);
-        if (page) page->release(slot);
+        if (image) destroy_image(page ? page->device : device, image, nullptr);
+        if (page) page->release(slot, bytes);
     }
 };
 
@@ -85,19 +98,42 @@ public:
             const unsigned long long kb = v && *v ? std::strtoull(v, nullptr, 10) : 2048ull;
             return VkDeviceSize(std::clamp<unsigned long long>(kb, 64, 65536)) << 10;
         }();
-        const VkDeviceSize page_size = std::max(stride, std::min(page_cap, 64 * stride));
+        // port/: the fullest page with room takes the image, so the emptiest pages drain and are freed, and a new page
+        // holds a quarter of what its class has live (4 to 64 slots): a class with few images keeps a small tail of
+        // empty slots instead of a 2 MiB page (LEONIDA_TITLE_POOL_FIT=0: first page with room, 64 slots).
+        static const bool fit = [] {
+            const char* v = std::getenv("LEONIDA_TITLE_POOL_FIT");
+            return !v || std::strcmp(v, "0");
+        }();
         auto allocation = std::make_unique<PooledTitleImage>();
+        allocation->bytes = req.size;
         std::lock_guard lock(mutex_);
         auto& pages = classes_[stride];
         std::erase_if(pages, [](const auto& page) { return page.expired(); });
-        for (const auto& weak : pages) {
-            auto page = weak.lock();
-            if (page && (req.memoryTypeBits & (1u << page->type)) && page->take(allocation->slot)) {
-                allocation->page = std::move(page);
+        std::uint64_t class_live = 0;
+        for (;;) {
+            std::shared_ptr<TitleImagePage> best;
+            std::uint32_t best_live = 0;
+            class_live = 0;
+            for (const auto& weak : pages) {
+                auto page = weak.lock();
+                if (!page) continue;
+                const std::uint32_t live = page->live();
+                class_live += live;
+                if (!(req.memoryTypeBits & (1u << page->type)) || live >= page->capacity) continue;
+                if (!best || (fit && live > best_live)) best = std::move(page), best_live = live;
+                if (!fit && best) break;
+            }
+            if (!best) break;
+            if (best->take(allocation->slot, allocation->bytes)) {
+                allocation->page = std::move(best);
                 break;
             }
         }
         if (!allocation->page) {
+            const std::uint64_t slots =
+                fit ? std::clamp<std::uint64_t>(std::bit_ceil(std::max<std::uint64_t>(1, class_live / 4)), 4, 64) : 64;
+            const VkDeviceSize page_size = std::max(stride, std::min<VkDeviceSize>(page_cap, slots * stride));
             auto page = std::make_shared<TitleImagePage>();
             page->device = device;
             page->free_memory = free_memory;
@@ -106,7 +142,7 @@ public:
             page->memory = allocate(page_size, page->type);
             if (!page->memory) return {};
             pages.push_back(page);
-            page->take(allocation->slot);
+            page->take(allocation->slot, allocation->bytes);
             allocation->page = std::move(page);
         }
         if (bind_image(device, image, allocation->page->memory, stride * allocation->slot) != VK_SUCCESS) return {};
@@ -116,7 +152,7 @@ public:
     }
 
     struct Stats {
-        std::uint64_t pages = 0, page_bytes = 0, live_slots = 0, live_bytes = 0;
+        std::uint64_t pages = 0, page_bytes = 0, live_slots = 0, live_bytes = 0, requested_bytes = 0, empty_pages = 0;
     };
     Stats stats() {
         Stats s;
@@ -130,6 +166,8 @@ public:
                     const std::uint64_t live = page->allocated - page->returned.size();
                     s.live_slots += live;
                     s.live_bytes += live * stride;
+                    s.requested_bytes += page->requested;
+                    s.empty_pages += live == 0;
                 }
         return s;
     }

@@ -80,8 +80,10 @@
 #include "../src/local_diagnostics.h"
 #include "../src/mem_probe.h"  // LOCAL DIAGNOSTIC
 #include "../src/gpu_ledger.h"
+#include "../src/rt_alias.h"
 #include <gta6rt/gpu_memory.h>
 #include "metal_memory.h"
+#include "title_pages.h"
 #include "../src/vulkan_aftermath.h"
 
 #include <vulkan/vulkan_metal.h>
@@ -2200,6 +2202,7 @@ struct DeviceState {
     std::unique_ptr<leonida::ImageMemory> image_memory;
     VkPhysicalDeviceMemoryProperties memory{};
     leonida::TitleImagePool title_image_pool;
+    leonida::rt_alias::Pool rt_alias;
     PFN_vkGetImageMemoryRequirements2 bound_image_requirements = nullptr;
     // D3D-96: upload-heap buffers prefer DEVICE_LOCAL | HOST_VISIBLE memory, so the GPU reads them from VRAM. Only
     // with Resizable BAR (leonida::resizable_bar); LEONIDA_UPLOAD_SYSMEM=1 keeps them in system memory to compare.
@@ -2290,6 +2293,14 @@ struct DeviceState {
     static bool env_is(const char* name, char value) {
         const char* v = std::getenv(name);
         return v && v[0] == value && !v[1];
+    }
+    // port/: MoltenVK never places a depth/stencil image in its memory's MTLHeap (MVKImagePlane::getMTLTexture makes
+    // it a texture of its own), so a non-dedicated allocation costs the heap and the texture. A dedicated one makes
+    // no heap. LEONIDA_DEPTH_DEDICATED=0: as before, =1: on every driver.
+    bool depth_dedicated() const {
+        static const int forced = std::getenv("LEONIDA_DEPTH_DEDICATED") ? (env_is("LEONIDA_DEPTH_DEDICATED", '1') ? 1 : 0) : -1;
+        static const bool moltenvk = driver_is_moltenvk();
+        return forced == 1 || (forced == -1 && moltenvk);
     }
     bool session_cache_loadable() const {
         if (env_is("LEONIDA_SESSION_CACHE_LOAD", '1')) return true;
@@ -6149,6 +6160,7 @@ public:
         }
         if (image_address_ && device_.image_owner(image_address_) == this) device_.forget_image(image_address_);
         device_.context->remove_resource(id());
+        if (alias_watch_) device_.rt_alias.remove(this);
         // Before the memory goes to the deferred queue: no submission copies into it after this.
         if (shadow_) device_.remove_shadow(shadow_);
         if (host_import_) {
@@ -7020,6 +7032,16 @@ public:
             vk.vkGetImageMemoryRequirements(device_.info.device, image_, &requirements);
             deferred_bytes_ = requirements.size;
             deferred_types_ = allowed;
+            if (origin == TitleImageOrigin::placed && deferrable && !cpu_visible() && samples == 1 &&
+                format.aspects == VK_IMAGE_ASPECT_COLOR_BIT && leonida::rt_alias::Pool::enabled()) {
+                static std::once_flag hook;
+                std::call_once(hook, [] { leonida::alias_use_hook.store(&leonida::rt_alias::note_use); });
+                alias_watch_ = std::make_unique<leonida::rt_alias::Watch>();
+                std::snprintf(alias_watch_->shape, sizeof alias_watch_->shape, "%llux%u DXGI %d mips %u",
+                              static_cast<unsigned long long>(desc_.Width), desc_.Height, int(desc_.Format),
+                              unsigned(desc_.MipLevels));
+                alias_requirements_ = requirements;
+            }
             if (shared_zero_) {
                 deferred_stream_ = true;
                 std::lock_guard lock(device_.descriptor_mutex);
@@ -7074,7 +7096,8 @@ public:
                     return E_OUTOFMEMORY;
                 }
                 if (!retry) {
-                    memory_ = device_.allocate(requirements, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &memory_flags_);
+                    memory_ = device_.allocate(requirements, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &memory_flags_,
+                                               false, nullptr, dedicated_depth() ? image_ : VK_NULL_HANDLE);
                     if (memory_ && vk.vkBindImageMemory(device_.info.device, image_, memory_, 0) == VK_SUCCESS) break;
                     if (memory_) { vk.vkFreeMemory(device_.info.device, memory_, nullptr); memory_ = VK_NULL_HANDLE; }
                     retry = host_transfer_;  // a failed allocation/bind retries on the staging path too
@@ -7159,6 +7182,7 @@ public:
         image_address_ = device_.next_image_address.fetch_add(256);
         device_.note_image_address(image_address_, this);
         binding.deferred_memory = deferred_attachment_.get();
+        binding.alias_watch = alias_watch_.get();
         if (origin == TitleImageOrigin::placed && leonida::mem_probe::interval_seconds())
             binding.replay_seen = &replay_seen_;
         binding_ = binding;
@@ -7201,12 +7225,71 @@ public:
 
     VkDeviceSize unbound_bytes() const { return image_backing_bytes() ? 0 : deferred_bytes_; }
 
+    // port/: where the title placed this render target: what rt_alias groups it by. Called when it is registered.
+    void note_title_pages(std::uint64_t cpu, std::uint64_t span) {
+        if (!alias_watch_) return;
+        alias_cpu_ = cpu;
+        alias_span_ = span;
+        leonida::rt_alias::Runs runs;
+        if (title_runs(runs))
+            device_.rt_alias.add(this, cpu, span, std::move(runs), alias_requirements_, alias_watch_.get());
+    }
+
+    bool title_runs(leonida::rt_alias::Runs& out) const {
+        std::vector<gta6rt::title_pages::Range> ranges;
+        if (!alias_span_ || !gta6rt::title_pages::physical(alias_cpu_, alias_span_, ranges)) return false;
+        out.clear();
+        for (const auto& r : ranges) out.push_back({r.object, r.begin, r.end});
+        return true;
+    }
+
 private:
+    bool dedicated_depth() const {
+        return (desc_.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) && device_.depth_dedicated();
+    }
+
+    bool bind_alias_memory() {
+        auto& vk = device_.context->vk;
+        leonida::rt_alias::Runs runs;
+        if (!title_runs(runs)) {
+            device_.rt_alias.refuse(0, alias_requirements_.size);
+            return false;
+        }
+        device_.rt_alias.add_if_missing(this, alias_cpu_, alias_span_, runs, alias_requirements_, alias_watch_.get());
+        VkDeviceSize offset = 0;
+        int why = 0;
+        auto extent = device_.rt_alias.place(
+            this, runs,
+            [&](VkDeviceSize size, VkDeviceSize alignment, std::uint32_t bits, std::uint32_t& type, VkDevice& device,
+                PFN_vkFreeMemory& free_memory) {
+                const VkMemoryRequirements r{size, alignment, bits};
+                device = device_.info.device;
+                free_memory = vk.vkFreeMemory;
+                return device_.allocate(r, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, nullptr, false, &type);
+            },
+            offset, why);
+        if (!extent) return false;
+        if (vk.vkBindImageMemory(device_.info.device, image_, extent->memory, offset) != VK_SUCCESS) {
+            device_.rt_alias.unplace(this);
+            return false;
+        }
+        auto held = std::make_unique<leonida::PooledTitleImage>();
+        held->device = device_.info.device;
+        held->image = image_;
+        held->destroy_image = vk.vkDestroyImage;
+        held->keep = extent;
+        pooled_image_ = std::move(held);
+        memory_flags_ = device_.memory.memoryTypes[extent->type].propertyFlags;
+        image_backing_bytes_ = alias_requirements_.size;
+        return true;
+    }
+
     bool bind_placed_memory() {
         const leonida::gpu_ledger::Scope ledger(ledger_);
         VkMemoryRequirements requirements{};
         std::uint32_t type = UINT32_MAX;
-        if (!image_backing_bytes_ && !bind_texture_memory(false, deferred_types_, requirements, type)) {
+        if (!image_backing_bytes_ && !(alias_watch_ && bind_alias_memory()) &&
+            !bind_texture_memory(false, deferred_types_, requirements, type)) {
             if (!(requirements.memoryTypeBits & ~deferred_types_) ||
                 !bind_texture_memory(false, ~deferred_types_, requirements, type)) return false;
         }
@@ -7251,8 +7334,8 @@ private:
         if (!pooled_image_) {
             auto selected = requirements;
             selected.memoryTypeBits &= allowed_types;
-            memory_ = device_.allocate(selected, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &memory_flags_, false,
-                                       &type, dedicated.requiresDedicatedAllocation ? image_ : VK_NULL_HANDLE);
+            memory_ = device_.allocate(selected, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &memory_flags_, false, &type,
+                                       dedicated.requiresDedicatedAllocation || dedicated_depth() ? image_ : VK_NULL_HANDLE);
         }
         if (!pooled_image_ && (!memory_ || vk.vkBindImageMemory(device_.info.device, image_, memory_, 0) != VK_SUCCESS)) {
             if (memory_) vk.vkFreeMemory(device_.info.device, memory_, nullptr);
@@ -7897,6 +7980,9 @@ private:
     VkMemoryPropertyFlags memory_flags_ = 0;
     VkDeviceSize image_backing_bytes_ = 0;  // Vulkan image memory requirement; excludes pool alignment/padding.
     std::unique_ptr<leonida::PooledTitleImage> pooled_image_;
+    std::unique_ptr<leonida::rt_alias::Watch> alias_watch_;  // port/: a slot-133 colour target rt_alias may share
+    VkMemoryRequirements alias_requirements_{};
+    std::uint64_t alias_cpu_ = 0, alias_span_ = 0;
     VkAccelerationStructureKHR accel_ = VK_NULL_HANDLE;
     void* mapped_ = nullptr;
     VkFormat format_ = VK_FORMAT_UNDEFINED;
@@ -13212,6 +13298,7 @@ public:
             const char* why = nullptr;
             if (title_layout(d, layout, why)) entry->span = layout.layout.size;
         }
+        if (entry->gpu_written) texture->note_title_pages(entry->cpu, entry->span);
         {
             std::lock_guard lock(state_.title_texture_mutex);
             if (entry->gpu_written && !(address & 0xff) && texture->image_address() != address) {
@@ -14159,7 +14246,8 @@ public:
                      "[rt] gpu-memory t=%.0fs (%s): layer %.0f MiB in %llu allocations: %s; imported title pages %.0f "
                      "MiB in %llu (read in place, no copy); failed allocations: %s; driver budget: used %.0f of %.0f "
                      "MiB; Metal allocated %.0f MiB (working set %.0f MiB); pipelines live %llu; title image pool %llu "
-                     "pages %.0f MiB, %llu images %.0f MiB; GPU address arena %.0f MiB, in use %.0f (peak %.0f); "
+                     "pages %.0f MiB, %llu images %.0f MiB (asked %.0f MiB, %llu pages empty); GPU address arena %.0f "
+                     "MiB, in use %.0f (peak %.0f); "
                      "deferred deletions queued twice %llu, drains postponed while busy %llu\n",
                      seconds, why, L::mib(t.driver_bytes()), static_cast<unsigned long long>(t.driver_count()),
                      split.c_str(), L::mib(t.imported_bytes), static_cast<unsigned long long>(t.imported_count),
@@ -14167,10 +14255,53 @@ public:
                      L::mib(metal.current_allocated), L::mib(metal.recommended_working_set),
                      static_cast<unsigned long long>(t.pipelines), static_cast<unsigned long long>(pool.pages),
                      L::mib(pool.page_bytes), static_cast<unsigned long long>(pool.live_slots), L::mib(pool.live_bytes),
+                     L::mib(pool.requested_bytes), static_cast<unsigned long long>(pool.empty_pages),
                      L::mib(state_.arena.size), L::mib(arena_in_use), L::mib(arena_peak),
                      static_cast<unsigned long long>(state_.context ? state_.context->deferred_requeued() : 0),
                      static_cast<unsigned long long>(state_.context ? state_.context->idle_postponed() : 0));
+        report_aliases(seconds);
         report_title_classes(seconds);
+    }
+
+    std::uint64_t bindless_table_bytes() const {
+        return state_.bindless ? state_.bindless->table_memory_bytes() : 0;
+    }
+
+    void report_aliases(double seconds) {
+        namespace L = leonida::gpu_ledger;
+        const auto a = state_.rt_alias.stats([](std::uint64_t cpu, std::uint64_t span, leonida::rt_alias::Runs& now) {
+            std::vector<gta6rt::title_pages::Range> ranges;
+            if (!gta6rt::title_pages::physical(cpu, span, ranges)) return false;
+            for (const auto& r : ranges) now.push_back({r.object, r.begin, r.end});
+            return true;
+        });
+        std::string refused;
+        for (int r = 0; r < 6; ++r) {
+            if (!a.refused[r]) continue;
+            char text[96];
+            std::snprintf(text, sizeof text, "%s%s %llu (%.1f MiB)", refused.empty() ? "" : ", ",
+                          leonida::rt_alias::refusal_name(r), static_cast<unsigned long long>(a.refused[r]),
+                          L::mib(a.refused_bytes[r]));
+            refused += text;
+        }
+        std::fprintf(stderr,
+                     "[rt] gpu-memory aliases t=%.0fs: %s; render targets on title pages %llu (%.0f MiB of images, %llu "
+                     "on more than one run of pages); in %llu extents %llu (%.0f MiB of images, %llu placed after "
+                     "their extent, %llu (%.0f MiB) found no room in theirs) held by %.0f MiB over %.0f MiB of title "
+                     "memory; private: %s; uses read %llu write %llu fresh %llu common %llu; hazards %llu; moved pages %llu "
+                     "(before binding %llu); bindless table %.0f MiB\n",
+                     seconds, leonida::rt_alias::Pool::enabled() ? "on" : "off",
+                     static_cast<unsigned long long>(a.candidates), L::mib(a.candidate_bytes),
+                     static_cast<unsigned long long>(a.split), static_cast<unsigned long long>(a.extents),
+                     static_cast<unsigned long long>(a.members), L::mib(a.member_bytes),
+                     static_cast<unsigned long long>(a.late), static_cast<unsigned long long>(a.no_room),
+                     L::mib(a.no_room_bytes), L::mib(a.extent_bytes),
+                     L::mib(a.extent_title_bytes), refused.empty() ? "none" : refused.c_str(),
+                     static_cast<unsigned long long>(a.uses[0]), static_cast<unsigned long long>(a.uses[1]),
+                     static_cast<unsigned long long>(a.uses[2]), static_cast<unsigned long long>(a.uses[3]),
+                     static_cast<unsigned long long>(a.hazards),
+                     static_cast<unsigned long long>(a.moved), static_cast<unsigned long long>(a.moved_before_bind),
+                     L::mib(bindless_table_bytes()));
     }
 
 private:

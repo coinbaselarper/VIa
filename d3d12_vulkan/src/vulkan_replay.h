@@ -124,7 +124,13 @@ struct ResourceBinding {
     bool (*ensure_residency)(void*) = nullptr;
     ResourceId depth_conversion = 0;  // R32_FLOAT transfer image for a widened Xbox D16+S8 attachment
     bool indirect_arguments = false;   // the backing VkBuffer was created with INDIRECT_BUFFER usage
+    const void* alias_watch = nullptr;  // port/: a render target that may share memory with others (rt_alias.h)
 };
+
+// port/: told how each prepared command uses a resource that has an alias_watch: 0 read, 1 write, 2 its contents
+// start over (discard, aliasing barrier, a barrier from the undefined layout), 3 a barrier to a common state.
+using AliasUseHook = void (*)(const void* watch, int use);
+inline std::atomic<AliasUseHook> alias_use_hook{nullptr};
 
 struct VulkanAccess {
     VkImageLayout layout;
@@ -1504,6 +1510,7 @@ struct PreparedDraw {
     // skip_unresolved in prepare).
     bool skipped = false;
     bool rect_by_vertex = false;  // GraphicsPipeline::rectangle_by_vertex: emitted as count / 3 instances of 6 vertices
+    bool rect_indirect = false;   // port/: an indirect rectangle list, its records rewritten by the clamp pass
 
     // Back to a new draw's state, keeping the vectors' storage.
     void reset() {
@@ -1528,6 +1535,8 @@ struct PreparedDraw {
         indirect_count_offset = 0;
         area = {};
         layers = 1;
+        rect_by_vertex = false;  // port/: a reused entry must not keep an earlier rectangle list's expansion
+        rect_indirect = false;
     }
 };
 
@@ -2656,6 +2665,24 @@ namespace detail {
 
 // Resolves a draw's pipeline, attachments and buffers. Attachment views take the pipeline's formats, so a
 // typeless texture is viewed as the format the pipeline renders.
+// port/: LEONIDA_INDEXED_INDIRECT_CLAMP=0 skips indexed indirect draws on a device without a robust index binding.
+inline bool indexed_indirect_clamp_enabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("LEONIDA_INDEXED_INDIRECT_CLAMP");
+        return !v || std::strcmp(v, "0");
+    }();
+    return on;
+}
+
+// port/: LEONIDA_RECT_INDIRECT=0 drops indirect rectangle lists again instead of expanding them through the clamp.
+inline bool rect_indirect_enabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("LEONIDA_RECT_INDIRECT");
+        return !v || std::strcmp(v, "0");
+    }();
+    return on;
+}
+
 template<typename Resolve>
 ReplayResult prepare_draw(const Draw& draw, const IndirectDrawArgs* arguments, Resolve&& resolve,
                           const ReplayFunctions& vk, PreparedDraw& p) {
@@ -2684,7 +2711,11 @@ ReplayResult prepare_draw(const Draw& draw, const IndirectDrawArgs* arguments, R
         if (!indirect_stats::topology_supported(draw.topology)) return skip(indirect_stats::topology);
         if (!vk.draw_indirect_first_instance) return skip(indirect_stats::first_instance);
         if (!entry_available) return skip(indirect_stats::entry);
-        if (draw.indexed && !vk.bind_robust_index_view) return skip(indirect_stats::robust_index);
+        // port/: without a robust index binding the clamp pass bounds each record's indices to the view instead
+        // (indirect_clamp.comp index_limit); LEONIDA_INDEXED_INDIRECT_CLAMP=0 skips such draws as before.
+        if (draw.indexed && !vk.bind_robust_index_view &&
+            !(vk.require_indirect_clamp && vk.prepare_indirect_clamp && indexed_indirect_clamp_enabled()))
+            return skip(indirect_stats::robust_index);
         if (arg.max_count > vk.max_draw_indirect_count) return skip(indirect_stats::count_limit);
         if (!counted && arg.max_count > 1 && !vk.multi_draw_indirect) return skip(indirect_stats::multi_draw);
         if (counted && !vk.draw_indirect_count_enabled) return skip(indirect_stats::count_feature);
@@ -2806,7 +2837,11 @@ ReplayResult prepare_draw(const Draw& draw, const IndirectDrawArgs* arguments, R
         unbound |= GraphicsPipeline::rectangle_stage;
         if (pipeline->rectangle_by_vertex) {
             // The vertex-stage expansion takes one non-indexed instance from instance 0 (rect_list_vertex.h).
-            const char* refused = arguments ? "indirect" : draw.indexed ? "indexed" : draw.instances != 1 ? "instanced"
+            // port/: an indirect one goes through the argument clamp pass, which rewrites each record to the
+            // expansion's shape (indirect_clamp.comp); LEONIDA_RECT_INDIRECT=0 drops them as before.
+            const bool by_clamp = arguments && !draw.indexed && vk.require_indirect_clamp && vk.prepare_indirect_clamp &&
+                                  rect_indirect_enabled();
+            const char* refused = by_clamp ? nullptr : arguments ? "indirect" : draw.indexed ? "indexed" : draw.instances != 1 ? "instanced"
                                 : draw.first_instance ? "from an instance other than 0"
                                 : draw.count % 3   ? "with a vertex count that is no multiple of 3"
                                                    : nullptr;
@@ -2820,6 +2855,7 @@ ReplayResult prepare_draw(const Draw& draw, const IndirectDrawArgs* arguments, R
                 return ReplayResult::success;
             }
             p.rect_by_vertex = true;
+            p.rect_indirect = by_clamp;
         }
     }
     for (std::size_t slot = 0; slot < p.colors.size(); ++slot)
@@ -3394,6 +3430,62 @@ inline bool zero_clear_unavailable(const PreparedList& prepared, const ReplayFun
     return false;
 }
 
+namespace detail {
+template<typename Resolve>
+void note_alias_uses(const Command& command, Resolve& resolve, AliasUseHook hook) {
+    const auto note = [&](ResourceId id, int use) {
+        if (!id) return;
+        if (const ResourceBinding* b = resolve(id); b && b->alias_watch) hook(b->alias_watch, use);
+    };
+    namespace s = d3d12_state;
+    namespace l = d3d12_layout;
+    constexpr std::uint32_t write_states =
+        s::render_target | s::unordered_access | s::depth_write | s::copy_dest | s::resolve_dest;
+    constexpr std::uint32_t read_states = s::non_pixel_shader_resource | s::pixel_shader_resource | s::copy_source |
+                                          s::resolve_source | s::depth_read;
+    const auto layout_use = [](std::uint32_t layout) {
+        switch (layout) {
+        case l::render_target: case l::unordered_access: case l::depth_stencil_write: case l::copy_dest:
+        case l::resolve_dest: case l::direct_queue_unordered_access: case l::direct_queue_copy_dest:
+        case l::compute_queue_unordered_access: case l::compute_queue_copy_dest:
+            return 1;
+        case l::generic_read: case l::depth_stencil_read: case l::shader_resource: case l::copy_source:
+        case l::resolve_source: case l::direct_queue_generic_read: case l::direct_queue_shader_resource:
+        case l::direct_queue_copy_source: case l::compute_queue_generic_read: case l::compute_queue_shader_resource:
+        case l::compute_queue_copy_source:
+            return 0;
+        default:
+            return -1;
+        }
+    };
+    if (const auto* t = std::get_if<TransitionBarrier>(&command)) {
+        note(t->resource, t->after & write_states ? 1 : t->after & read_states ? 0 : 3);
+    } else if (const auto* t = std::get_if<TextureBarrier>(&command)) {
+        if ((t->flags & texture_barrier_discard) || t->layout_before == l::undefined) note(t->resource, 2);
+        const int use = layout_use(t->layout_after);
+        note(t->resource, use >= 0 ? use : 3);
+    } else if (const auto* a = std::get_if<AliasingBarrier>(&command)) {
+        note(a->after, 2);
+    } else if (const auto* d = std::get_if<DiscardResource>(&command)) {
+        if (!d->partial) note(d->resource, 2);
+    } else if (const auto* c = std::get_if<ClearRenderTarget>(&command)) {
+        note(c->target.resource, 1);
+    } else if (const auto* c = std::get_if<ClearDepthStencil>(&command)) {
+        note(c->target.resource, 1);
+    } else if (const auto* c = std::get_if<ClearUnorderedAccess>(&command)) {
+        note(c->view.resource, 1);
+    } else if (const auto [dst, src] = copy_ids(command); dst || src) {
+        note(src, 0);
+        note(dst, 1);
+    } else if (const auto draw = draw_command(command); draw.state) {
+        if (draw.state->views)
+            for (std::uint32_t t = 0; t < draw.state->views->render_target_count && t < 8; ++t)
+                note(draw.state->views->render_targets[t].resource, 1);
+        note(draw.state->depth.resource, 1);
+    }
+}
+} // namespace detail
+
 // Resolves and checks every command. Nothing is written to a command buffer.
 // Resolve maps a ResourceId to a const ResourceBinding* (nullptr: unknown).
 // statistics_helpers promises a statistics segment pool at QueryReplay::plan(). Keep the default for replay()
@@ -3493,9 +3585,11 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
         return ReplayResult::success;
     };
 
+    const AliasUseHook alias_hook = alias_use_hook.load(std::memory_order_relaxed);
     for (std::size_t i = 0; i < commands.size(); ++i) {
         const auto& command = commands[i];
         auto& p = out.commands[i];
+        if (alias_hook) detail::note_alias_uses(command, resolve, alias_hook);
         const auto bind = [&](ResourceId id) {
             const ResourceBinding* binding = resolve(id);
             if (binding) p.binding = *binding;
@@ -4223,6 +4317,12 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                         arg.stride, arg.max_count, p.indirect_clamp))
                     return unsupported_at(__LINE__);
                 p.indirect_clamp.share_list_budget(indirect_list_budget);
+                p.indirect_clamp.rect = prepared_draw.rect_indirect;
+                if (draw.state->indexed && !vk.bind_robust_index_view) {
+                    const VkDeviceSize width = prepared_draw.index_type == VK_INDEX_TYPE_UINT16 ? 2 : 4;
+                    p.indirect_clamp.index_limit =
+                        std::uint32_t(std::min<VkDeviceSize>(prepared_draw.index_size / width, UINT32_MAX - 1));
+                }
                 prepared_draw.indirect_buffer = p.indirect_clamp.buffer;
                 prepared_draw.indirect_offset = p.indirect_clamp.offset;
                 prepared_draw.indirect_count_buffer = p.indirect_clamp.count_buffer;
@@ -5465,7 +5565,10 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
                     // Bind only complete indices in the captured D3D12 view, never any trailing storage.
                     const VkDeviceSize width = d.index_type == VK_INDEX_TYPE_UINT16 ? 2 : 4;
                     const VkDeviceSize bytes = draw->index.size - draw->index.size % width;
-                    vk.bind_robust_index_view(command_buffer, d.index_buffer, d.index_offset, bytes, d.index_type);
+                    if (vk.bind_robust_index_view)
+                        vk.bind_robust_index_view(command_buffer, d.index_buffer, d.index_offset, bytes, d.index_type);
+                    else  // port/: the clamp pass kept this draw's indices inside the view
+                        vk.bind_index_buffer(command_buffer, d.index_buffer, d.index_offset, d.index_type);
                 }
                 const auto stride = p.indirect_clamp.buffer ? p.indirect_clamp.stride : arg.stride;
                 if (arg.count_buffer) {

@@ -763,6 +763,26 @@ std::vector<DisplayInfo> enumerate_displays() {
         displays.push_back(info);
     }
     if (displays.empty()) displays.push_back(DisplayInfo{});
+    // port/: LEONIDA_DISPLAY_SIZE=WxH reports every display at that size (r7 memory: does the title size its targets
+    // by the output?). The answer is logged once either way.
+    static const std::pair<unsigned, unsigned> forced = [] {
+        unsigned w = 0, h = 0;
+        if (const char* v = std::getenv("LEONIDA_DISPLAY_SIZE"); v && std::sscanf(v, "%ux%u", &w, &h) != 2) w = h = 0;
+        return std::make_pair(w, h);
+    }();
+    for (DisplayInfo& d : displays)
+        if (forced.first && forced.second) {
+            d.current_width = forced.first;
+            d.current_height = forced.second;
+            d.desktop_coords.right = d.desktop_coords.left + LONG(forced.first);
+            d.desktop_coords.bottom = d.desktop_coords.top + LONG(forced.second);
+        }
+    static std::once_flag logged;
+    std::call_once(logged, [&] {
+        for (const DisplayInfo& d : displays)
+            std::fprintf(stderr, "[rt] dxgi: output %ux%u@%u%s%s\n", d.current_width, d.current_height,
+                         d.current_refresh_hz, d.primary ? " (primary)" : "", forced.first ? " (LEONIDA_DISPLAY_SIZE)" : "");
+    });
     return displays;
 }
 
@@ -929,10 +949,20 @@ public:
     HRESULT STDMETHODCALLTYPE GetDesc(DXGI_OUTPUT_DESC* desc) override {
         if (!desc) return E_INVALIDARG;
         fill_base_desc(*desc);
+        static std::atomic<bool> logged{false};
+        if (!logged.exchange(true))
+            std::fprintf(stderr, "[rt] dxgi: IDXGIOutput::GetDesc answered desktop %ldx%ld\n",
+                         long(desc->DesktopCoordinates.right - desc->DesktopCoordinates.left),
+                         long(desc->DesktopCoordinates.bottom - desc->DesktopCoordinates.top));
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE GetDisplayModeList(DXGI_FORMAT fmt, UINT, UINT* num_modes, DXGI_MODE_DESC* desc) override {
-        return fill_mode_list(info_, fmt, num_modes, desc, [](const DXGI_MODE_DESC& m) { return m; });
+        const HRESULT hr = fill_mode_list(info_, fmt, num_modes, desc, [](const DXGI_MODE_DESC& m) { return m; });
+        static std::atomic<int> logged{0};
+        if (desc && num_modes && *num_modes && logged.fetch_add(1) < 2)
+            std::fprintf(stderr, "[rt] dxgi: IDXGIOutput::GetDisplayModeList(format %d) answered %u modes, last %ux%u\n",
+                         int(fmt), *num_modes, desc[*num_modes - 1].Width, desc[*num_modes - 1].Height);
+        return hr;
     }
     HRESULT STDMETHODCALLTYPE FindClosestMatchingMode(const DXGI_MODE_DESC* mode_to_match, DXGI_MODE_DESC* closest,
                                                       IUnknown* concerned_device) override {

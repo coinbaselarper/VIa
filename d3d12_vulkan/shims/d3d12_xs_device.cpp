@@ -58,6 +58,7 @@
 #include "../src/hud_feed.h"
 #include "package_splash.h"
 #include "startup_trace.h"
+#include "../../shims_core/src/xbox_bvh_hooks.h"  // port/: what the XboxBvhBuilder shim asks of the proxies
 #endif
 
 #include <windows.h>
@@ -1061,6 +1062,7 @@ constexpr unsigned kQueueExecuteCommandLists = 10;   // (UINT, ID3D12CommandList
 constexpr unsigned kQueueSignal = 14, kQueueWait = 15;  // (ID3D12Fence*, UINT64)
 constexpr unsigned kQueueGetTimestampFrequency = 16, kQueueGetDesc = 18;  // the PC slots
 bool is_console_caller(const void* address);  // defined with the device proxy
+void note_4k_placement(const D3D12_RESOURCE_DESC& desc, std::uint64_t va, const void* frame);
 constexpr unsigned kQueueExecuteCommandListsX = 35;  // console ExecuteCommandLists(count, lists) variant
 static_assert(kQueueExecuteCommandLists < kQueuePublicSlots && kQueueExecuteCommandListsX < kQueueSlots,
               "queue execution slots must stay within their respective tables");
@@ -4536,6 +4538,25 @@ bool is_console_caller(const void* address) {
     return classify && classify(reinterpret_cast<std::uint64_t>(address));
 }
 
+// port/: who asks for a 3840x2160 target on a 1920x1080 profile (r7 memory): the title return addresses on this
+// thread's stack, first 16 placements.
+void note_4k_placement(const D3D12_RESOURCE_DESC& desc, std::uint64_t va, const void* frame) {
+    static std::atomic<int> logged{0};
+    if (logged.fetch_add(1, std::memory_order_relaxed) >= 16) return;
+    char text[512];
+    int n = std::snprintf(text, sizeof text, "[rt] d3d12_xs: slot 133 3840x2160 DXGI %d flags 0x%x at 0x%llx; title "
+                                             "return addresses on the stack:", int(desc.Format), unsigned(desc.Flags),
+                          static_cast<unsigned long long>(va));
+    const auto* words = static_cast<const std::uint64_t*>(frame);
+    for (int i = 0, found = 0; i < 2048 && found < 10 && n < int(sizeof text) - 24; ++i) {
+        const std::uint64_t w = words[i];
+        if (w < 0x10000 || !is_console_caller(reinterpret_cast<const void*>(w))) continue;
+        n += std::snprintf(text + n, sizeof text - n, " 0x%llx", static_cast<unsigned long long>(w));
+        ++found;
+    }
+    std::fprintf(stderr, "%s\n", text);
+}
+
 void proxy_create_sampler_x(DeviceProxy* self, const D3D12_SAMPLER_DESC* desc, std::uint64_t dest) {
     note_slot(61);
     if (!desc) {
@@ -5681,6 +5702,15 @@ void keep_pso_stream(IUnknown* pso, const D3D12_PIPELINE_STATE_STREAM_DESC& desc
     object->Release();
 }
 
+// A slot-55 PSO keeps the record derive_stream made: its bytes are the stream it was created from and its payloads are
+// the base's, so the shader bytecode and arrays the stream points at are not copied again for every derived PSO.
+void keep_derived_record(IUnknown* pso, std::unique_ptr<PsoStreamRecord> record) {
+    ID3D12Object* object = nullptr;
+    if (FAILED(pso->QueryInterface(__uuidof(ID3D12Object), reinterpret_cast<void**>(&object))) || !object) return;
+    attach_pso_record(object, std::move(record));
+    object->Release();
+}
+
 // The PC CreatePipelineState (PC slot 47) that slots 86 and 55 share: on success the stream is kept on the PSO.
 HRESULT create_pso_from_stream(DeviceProxy* self, const D3D12_PIPELINE_STATE_STREAM_DESC* desc, const IID* riid,
                                void** out, std::unique_ptr<PsoStreamRecord> derived = {}) {
@@ -5700,7 +5730,14 @@ HRESULT create_pso_from_stream(DeviceProxy* self, const D3D12_PIPELINE_STATE_STR
             audit_pso_stream(*desc, hr, used_console_stream);
         } catch (const std::bad_alloc&) {}
     }
-    if (SUCCEEDED(hr) && out && *out && desc) keep_pso_stream(static_cast<IUnknown*>(*out), *desc);
+    if (SUCCEEDED(hr) && out && *out && desc) {
+        static const bool share = [] {
+            char value[2]{};
+            return !(GetEnvironmentVariableA("LEONIDA_DERIVED_PSO_SHARE", value, sizeof(value)) == 1 && value[0] == '0');
+        }();
+        if (derived && share) keep_derived_record(static_cast<IUnknown*>(*out), std::move(derived));
+        else keep_pso_stream(static_cast<IUnknown*>(*out), *desc);
+    }
     return hr;
 }
 
@@ -6042,6 +6079,7 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
         return hr_to_u64(refused_pso_result(static_cast<HRESULT>(call.finish(hr))));
     } else if constexpr (Slot == 133) {
         const auto* desc = reinterpret_cast<const D3D12_RESOURCE_DESC*>(a2);
+        if (desc && desc->Width == 3840 && desc->Height == 2160) note_4k_placement(*desc, a1, __builtin_frame_address(0));
         auto** out = reinterpret_cast<void**>(a6);
         const HRESULT hr = proxy_create_placed_resource_slot133(
             self, a1, desc, static_cast<std::uint32_t>(a3), reinterpret_cast<const D3D12_CLEAR_VALUE*>(a4),
@@ -6425,6 +6463,14 @@ HRESULT create_device_proxy(ID3D12Device* real, REFIID riid, void** out, bool co
     }
     // The source consults the process-wide heap registry; it holds no pointer to this device.
     leonida::title_va_aliases().set_descriptor_source(nullptr, pull_title_descriptors);
+    // port/: the XboxBvhBuilder shim (shims_core) asks the PC interfaces of the device and list behind these proxies.
+    // Without the hooks it called them on the console-shaped proxies themselves: a PC
+    // BuildRaytracingAccelerationStructure (list slot 72) landed on console slot 72, write64, which recorded a value
+    // write of 0 to the address of the shim's temporary description; the list-values pump stored it once the GPU
+    // passed the part, into a host heap block the shim had already freed (spike/r8-world/STATUS.md).
+#ifdef LEONIDA_VULKAN_DEVICE
+    rt::xbox_bvh::set_hooks({&device_proxy_real_device, &real_object_behind_proxy, &rt::d3d12::hold_until_reset});
+#endif
     if (!d3d12_trace::enabled())
         std::fprintf(stderr, "[rt] d3d12_xs: device proxy %p wraps PC device %p (%u PC vtable slots)\n",
                      static_cast<void*>(proxy), static_cast<void*>(real), slot_count);

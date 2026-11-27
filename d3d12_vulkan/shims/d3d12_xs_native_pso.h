@@ -333,7 +333,8 @@ private:
     Container container(const std::filesystem::path& folder, const leonida::native_pso::ShaderRef& ref) {
         {
             std::lock_guard lock(mutex_);
-            if (const auto it = containers_.find(ref.digest); it != containers_.end()) return it->second;
+            if (const auto it = containers_.find(ref.digest); it != containers_.end())
+                if (auto live = it->second.lock()) return live;
         }
         // A catalog names files inside the shader workspace. Checking only its components lets a
         // reader with access to the two shader directories work without opening their ancestors.
@@ -359,21 +360,21 @@ private:
         if (!in.read(reinterpret_cast<char*>(result->data()), size)) return {};
         const auto hash = leonida::dxbc_part(*result, "HASH");
         if (hash.size() < 20 || std::memcmp(hash.data() + 4, ref.digest.data(), ref.digest.size())) return {};
+        // port/: the cache only dedupes: a container lives as long as a PSO record holds it, so the containers of
+        // refused PSOs (the mesh ones on a device without mesh shaders) are freed with the refusal.
         std::lock_guard lock(mutex_);
-        if (const auto it = containers_.find(ref.digest); it != containers_.end()) return it->second;
-        constexpr std::size_t budget = std::size_t{256} << 20;
-        if (result->size() <= budget - cached_bytes_) {
-            containers_.emplace(ref.digest, result);
-            cached_bytes_ += result->size();
-        }
+        auto& slot = containers_[ref.digest];
+        if (auto live = slot.lock()) return live;
+        slot = result;
+        if (++inserts_ % 4096 == 0) std::erase_if(containers_, [](const auto& e) { return e.second.expired(); });
         return result;
     }
 
     std::once_flag load_;
     leonida::native_pso::HashMap catalog_;
     std::mutex mutex_;
-    std::map<leonida::native_pso::Digest, Container> containers_;
-    std::size_t cached_bytes_ = 0;
+    std::map<leonida::native_pso::Digest, std::weak_ptr<const std::vector<std::uint8_t>>> containers_;
+    std::size_t inserts_ = 0;
 };
 
 }  // namespace rt::d3d12_xs

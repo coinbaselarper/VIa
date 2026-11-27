@@ -66,6 +66,13 @@ are always the current ones, so a new upstream entry point they call shows up as
 - `origin/hunks.txt` regenerated (the copy against the 15:15 snapshot: 524 hunks, 7,477 / 2,407 lines), so the merged
   blocks and this round's Metal changes show there as hunks of the copy.
 
+**Round 6 merges by hand**: `retire_overlapped_title_textures` (upstream round 5 "stale copies retired", from
+`d3d12_vulkan_device.cpp` as of 20:00) with `TitleTexture::span` and `max_title_span_`, called where a made image or
+a slot-133 texture enters the registry; its retired images wait for queue progress here instead of 3 s. Own code added
+this round (no upstream counterpart): `land_outside_arena`, `reserve_arena_va` / `register_metal.cpp`'s
+`reserve_arena_vas` and crash hooks, the split64 / dual-source / shrink_lds paths of `PipelineState`, `report_work`.
+`origin/hunks.txt` was not regenerated.
+
 What changed in each copy, by area (line ranges: `origin/hunks.txt`):
 
 - **`d3d12_com.h`**: includes `src/metal_context.h` instead of the Vulkan backend; `create_command_queue`,

@@ -4,6 +4,7 @@
 
 #include "metal_formats.h"
 #include "metal_context.h"
+#include "present_dump.h"
 #include "gfx10_descriptors.h"
 #include "rect_list_geometry.h"
 #include "title_texture_memory.h"
@@ -14,6 +15,8 @@
 #include <bit>
 #include <cstdio>
 #include <cstring>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -515,6 +518,7 @@ private:
         const char* why = nullptr;
         if (const Fate f = compute(c.pipeline, p, why); f != Fate::recorded) {
             st.dispatches_skipped.fetch_add(1, std::memory_order_relaxed);
+            if (f == Fate::compiling || f == Fate::library_pending) context_.note_compute_not_ready();
             context_.note_work(Work::dispatch, f, why);
             if (MetalContext::census_on()) context_.note_census(p.name, "dispatch-skipped");
             return;
@@ -534,7 +538,9 @@ private:
         }
         MetalComputePipeline p;
         const char* why = nullptr;
-        const Fate f = c.pipeline ? compute(c.pipeline, p, why) : Fate::pso_unknown;
+        Fate f = c.pipeline ? compute(c.pipeline, p, why) : Fate::pso_unknown;
+        if (f == Fate::compiling || f == Fate::library_pending) context_.note_compute_not_ready();
+        else if (f == Fate::recorded && context_.producers_settling()) f = Fate::producer_not_ready;
         if (f != Fate::recorded) {
             st.dispatches_skipped.fetch_add(1, std::memory_order_relaxed);
             context_.note_work(Work::indirect_dispatch, f, why);
@@ -722,10 +728,11 @@ private:
         }
         if (MetalContext::census_on())
             context_.note_census(p.name, draw.topology == gpu::topology::rect_list ? "draw-rect" : "draw");
-        trace_draw(draw, p);
+        const bool traced = trace_draw(draw, p);
         if (p.mesh) out_.draw_mesh(draw.count, draw.instances, draw.first);
         else if (draw.indexed) out_.draw_indexed(draw.count, draw.instances, draw.first, draw.base_vertex, draw.first_instance);
         else out_.draw(draw.count, draw.instances, draw.first, draw.first_instance);
+        if (traced) dump_target(draw, p);
         st.draws.fetch_add(1, std::memory_order_relaxed);
     }
     void record(const IndirectRasterDraw& payload) {
@@ -737,6 +744,7 @@ private:
         const char* why = nullptr;
         Fate f = graphics(draw, p, why);
         const Work work = work_of(draw, p, true);
+        if (f == Fate::recorded && context_.producers_settling()) f = Fate::producer_not_ready;
         if (f == Fate::recorded && !p.mesh && work != Work::indirect_rect &&
             (draw.topology == gpu::topology::quad_list || draw.topology > gpu::topology::triangle_strip)) {
             unsupported("indirect quad-list or adjacency draw");
@@ -768,7 +776,7 @@ private:
     // GTA6RT_METAL_DRAW_TRACE_EVERY=N: then every Nth such draw too, 64 lines at most. GTA6RT_METAL_DRAW_TRACE_TABLE=
     // <hex offsets>: the descriptor table at s8 (as the shader reads it, heap_base + s8) and, for each listed offset
     // holding a V#, the V# and the first 32 words of the memory it names.
-    void trace_draw(const Draw& draw, const MetalGraphicsPipeline& p) {
+    bool trace_draw(const Draw& draw, const MetalGraphicsPipeline& p) {
         static const std::vector<std::string> wants = [] {
             std::vector<std::string> out;
             const char* v = std::getenv("GTA6RT_METAL_DRAW_TRACE");
@@ -784,13 +792,13 @@ private:
             return v ? unsigned(std::strtoul(v, nullptr, 10)) : 0u;
         }();
         static std::atomic<unsigned> seen[4]{}, printed{0};
-        if (wants.empty() || !p.name) return;
+        if (wants.empty() || !p.name) return false;
         std::size_t which = 0;
         while (which < wants.size() && (wants[which].empty() || !std::strstr(p.name, wants[which].c_str()))) ++which;
-        if (which == wants.size()) return;
+        if (which == wants.size()) return false;
         const unsigned n = seen[std::min<std::size_t>(which, 3)].fetch_add(1);
-        if (n >= 8 && (!every || n % every)) return;
-        if (printed.fetch_add(1) >= 96) return;
+        if (n >= 8 && (!every || n % every)) return false;
+        if (printed.fetch_add(1) >= 96) return false;
         std::string text;
         char line[256];
         std::snprintf(line, sizeof line, "%s: count %u instances %u first %u indexed %d topology %u viewport %.0f,%.0f %.0fx%.0f",
@@ -819,6 +827,95 @@ private:
         }
         std::fprintf(stderr, "[rt] d3d12-metal: draw trace %u %s\n", n, text.c_str());
         trace_table(draw);
+        return true;
+    }
+    // GTA6RT_METAL_DRAW_DUMP_RT=<dir>: after a traced draw, its first render target (4-byte texels) is copied to a
+    // shared buffer; the next traced draw writes the previous copy, halved, as <dir>/rt_<n>_<pipeline>.png.
+    void dump_target(const Draw& draw, const MetalGraphicsPipeline& p) {
+        static const char* dir = std::getenv("GTA6RT_METAL_DRAW_DUMP_RT");
+        if (!dir || !*dir) return;
+        const MetalBinding* b = draw.views && draw.views->render_target_count
+                                    ? binding(draw.views->render_targets[0].resource) : nullptr;
+        if (!b || !b->texture) {
+            static std::atomic<int> told{0};
+            if (told.fetch_add(1) < 4)
+                std::fprintf(stderr, "[rt] d3d12-metal: draw trace target of %s not dumped: %u render targets, rt0 %s\n",
+                             p.name ? p.name : "?", draw.views ? draw.views->render_target_count : 0u,
+                             b ? "has no texture" : "unknown");
+            return;
+        }
+        const gpu::TextureDesc& td = b->texture->desc();
+        const bool bgra = td.format >= 87 && td.format <= 93;
+        const bool half4 = td.format == 10, rgb10a2 = td.format == 24;
+        const std::uint32_t texel = half4 ? 8 : 4;
+        if (!((td.format >= 27 && td.format <= 32) || bgra || half4 || rgb10a2) || td.samples > 1) {
+            static std::atomic<int> told{0};
+            if (told.fetch_add(1) < 4)
+                std::fprintf(stderr, "[rt] d3d12-metal: draw trace target of %s not dumped: DXGI %u %ux%u samples %u\n",
+                             p.name ? p.name : "?", td.format, td.width, td.height, td.samples);
+            return;
+        }
+        static std::mutex mutex;
+        static std::unique_ptr<gpu::Buffer> buffer;
+        static std::uint32_t pending_w = 0, pending_h = 0, dumps = 0, pending_format = 0;
+        static bool pending_bgra = false;
+        static std::string pending_name;
+        std::lock_guard lock(mutex);
+        if (pending_w && buffer && buffer->cpu_pointer()) {
+            const auto* src = static_cast<const std::uint8_t*>(buffer->cpu_pointer());
+            const std::uint32_t w = pending_w / 2, h = pending_h / 2;
+            std::vector<std::uint8_t> half(std::size_t(w) * h * 4);
+            for (std::uint32_t y = 0; y < h; ++y)
+                for (std::uint32_t x = 0; x < w; ++x) {
+                    std::uint8_t* d = half.data() + (std::size_t(y) * w + x) * 4;
+                    const std::size_t at = std::size_t(y) * 2 * pending_w + x * 2;
+                    if (pending_format == 10) {
+                        std::uint16_t h[4];
+                        std::memcpy(h, src + at * 8, 8);
+                        for (int c = 0; c < 4; ++c) d[c] = present_dump::half_unorm8(h[c]);
+                    } else if (pending_format == 24) {
+                        std::uint32_t v;
+                        std::memcpy(&v, src + at * 4, 4);
+                        d[0] = std::uint8_t((v & 1023) >> 2), d[1] = std::uint8_t(((v >> 10) & 1023) >> 2);
+                        d[2] = std::uint8_t(((v >> 20) & 1023) >> 2), d[3] = std::uint8_t((v >> 30) * 85);
+                    } else {
+                        const std::uint8_t* s = src + at * 4;
+                        d[0] = s[pending_bgra ? 2 : 0], d[1] = s[1], d[2] = s[pending_bgra ? 0 : 2], d[3] = s[3];
+                    }
+                }
+            const std::string path = std::string(dir) + "/" + pending_name + ".png";
+            if (std::FILE* f = std::fopen(path.c_str(), "wb")) {
+                present_dump::write_png(f, VkExtent2D{w, h}, VK_FORMAT_R8G8B8A8_UNORM, false, half.data());
+                std::fclose(f);
+                std::fprintf(stderr, "[rt] d3d12-metal: draw trace target dumped to %s\n", path.c_str());
+            }
+            pending_w = 0;
+        }
+        if (dumps >= 24) return;
+        const std::uint64_t bytes = std::uint64_t(td.width) * td.height * texel;
+        if (!buffer || buffer->size() < bytes) {
+            gpu::BufferDesc d;
+            d.size = bytes;
+            d.memory = gpu::MemoryKind::shared;
+            d.usage = gpu::usage::copy;
+            d.label = "draw trace target dump";
+            buffer = context_.gpu().create_buffer(d);
+            if (!buffer) return;
+        }
+        gpu::BufferTextureCopy k;
+        k.buffer = buffer.get();
+        k.row_pitch = td.width * texel;
+        k.texture = b->texture;
+        k.mip = draw.views->render_targets[0].mip;
+        k.layer = draw.views->render_targets[0].first_layer;
+        k.width = std::max(1u, td.width >> k.mip);
+        k.height = std::max(1u, td.height >> k.mip);
+        out_.copy_texture_to_buffer(k);
+        rt_dirty_ = true;
+        pending_w = k.width, pending_h = k.height, pending_bgra = bgra, pending_format = td.format;
+        std::string name = p.name ? p.name : "draw";
+        name = name.substr(0, name.find(','));
+        pending_name = "rt_" + std::to_string(dumps++) + "_" + name;
     }
     bool read_va(std::uint64_t address, void* to, std::uint64_t bytes) {
         std::uint64_t n = bytes;

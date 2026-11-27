@@ -1,4 +1,90 @@
-# port/d3d12_metal status (round 5)
+# port/d3d12_metal status (round 6)
+
+## Round 6 (2026-11-26, 20:05-21:55): the world phase on Metal (S4) — two crashes fixed; a heap-damage SIGSEGV and an FSR4 GPU timeout open; no world frame yet
+
+Host as round 5. Trees: `build/d3m-s4-x86_64` (`-build1..17.log`), ASAN tree `build/d3m-s4-asan-x86_64`
+(`-DGTA6RT_D3D12_METAL_ASAN=ON`: this module and port/metal under AddressSanitizer), backend tests
+`build/d3m-s4-metal-x86_64`. Launcher (imported saves, A every 5 s, world at +70 s):
+`d3d12_metal/tools/s4_world_run.sh` = `host/tools/s3_storyload.sh`'s imported flow with the import done before
+the slot is polled and a collision back-off (kills its own title when another started in the same instant). Evidence summary: `run/logs/s4-worldframe-metal.log`.
+
+### What ended the world phase, in the order found
+
+| run | world at | end | cause | fix |
+|---|---:|---|---|---|
+| d3m-s4-a, -b | - | SIGABRT at 9 s | `[seh] FATAL ... amd_fidelityfx_upscaler_xbox.dll+0x380d` reading 0 after "GPU address arena full; shader-visible heap 5248 KiB": the title's 32-bit reservations (first fit from 8 MiB, 8-439 MiB here; 215-1239 MiB with a 1 GiB arena) sit on the arena's console VAs, which are no mapping of the process, so the arena keeps out of them until it is full | `register_metal.cpp` `reserve_arena_vas`: the arena's VAs [1 MiB, LEONIDA_ARENA_MB) are reserved (no access, no memory) at backend registration, before the title runs (d3m-s4-d: "254 MiB of 1-256 MiB"); `GTA6RT_METAL_ARENA_RESERVE_VA=0` off |
+| d3m-s3-a (round 5), d3m-s4-c, -d | +70 s | SIGABRT 5-8 s into the world, no message | `malloc: Incorrect checksum for freed object 0x7f9fd5d96a50: probably modified after being freed` (MallocDebugReport=stderr, d3m-s4-d); the victim allocation in `note_layer_vsharp` (backtrace by the new handler, d3m-s4-c). The writer: list value writes landed by a host store at the VA's number (`list_values::Pump::land` -> `kernel_writes::store`), which reaches the malloc heap: r8-asan-a's ASAN report (WRITE of 8 bytes into a heap block from `Pump::land`); the "title memory" test behind it accepts any private host mapping (`title_memory_probe.cpp`) | `write_arena_value` -> `land_outside_arena`: past the arena, a live guest allocation (`gta6rt_vm_query`) -> as before; an external block's VA -> its memory; else dropped and logged. No SIGABRT since (d3m-s4-e..-i) |
+| d3m-s4-e, -f | +70 s | SIGSEGV at 0x10, 5-8 s into the world | in `GraphicsCommandList::Reset` destroying an `IndirectRasterDraw` (backtrace d3m-s4-f): a freed control block; the same heap damage class (the ASAN tree, whose allocator quarantines frees, never hit it: d3m-s4-g/-h/-i ran past it) | open (writer not instrumented: title, shims or os) |
+| d3m-s4-g, -h, -i (ASAN tree) | +73-75 s | GPU timeout 13-25 s into the world (`kIOGPUCommandBufferCallbackErrorTimeout`, "GPU time 0 ms", no command buffer ran 250 ms or more before it), then the layer's device-lost exit (code 3) and the title's device-removed int3 | not garbage indirect grids: -i had the record pre-pass and the producer guard (indirect mesh recorded 7 a frame instead of 300) and timed out as -g/-h did. **The FSR4 pass chain**: with every `fspx/` compute PSO refused (`GTA6RT_METAL_REFUSE_CS=fspx/`, d3m-s4-j) the world ran 27 s with no timeout, until the ASAN tree's footprint passed the 16 GiB guard (exit 4). FSR's programs 03/18 were off in -h/-i/-j (`GTA6RT_METAL_SPIRV_FALLBACK=off`), so one of the 25 others (or their sum in one command buffer) runs past the watchdog | open; kept (they bound damage, cost one tiny pre-pass per indirect call): the record pre-pass (`GTA6RT_METAL_INDIRECT_LIMITS`, mesh grids past D3D12's 65,535 per dimension / 2^22 groups and compute grids past 2^26 zeroed) and the producer guard (`GTA6RT_METAL_INDIRECT_GUARD_MS`, default 2000: GPU-driven indirect work skipped while a dispatch was skipped as not ready in the last 2 s) |
+
+All three GPU timeouts were my process's (each run started only with no other gta6rt up); Metal discarded other
+processes' work only if they were on the GPU at that moment. No world frame was reached: the frames dumped in the
+world phase are black with the loading spinner (`run/present/d3m-s4-j/present_001921.png`, +94 s, FSR refused, so the
+upscaled scene is not written either). The story-load screen now shows the loading artwork on Metal (round 5: a dark
+screen with a spinner): `run/present/d3m-s4-c/present_006301.png`.
+
+### Release safety (the device-loss lesson)
+
+`port/metal` api v5 (its STATUS): every GPU object's release waits until every command buffer committed or being
+encoded on any queue at the release has completed, including a descriptor slot's previous object and its residency
+removal; `metal_test_deferred_release` PASS under the debug layer. In the title: "364-4,489 held until the command
+buffers before them completed, up to 3,379 waiting at once, 0 command buffers failed" (gpu-releases lines, d3m-s4-c/-e).
+The adapter's own time-based release (retired title textures, 3 s) is keyed on queue progress now.
+
+### World draws (census per presented frame, `[rt] d3d12-metal work` every 10 s, new; d3m-s4-h t=84 s, ASAN tree)
+
+| class | per frame | recorded | skipped, why |
+|---|---:|---:|---|
+| ExecuteIndirect DISPATCH_MESH (new: recorded as indirect mesh draws) | 334 | 300 | Metal refused 26 (threadgroup memory 36,056 / 35,544 / 34,008 B > 32 KiB), PSO refused 3.5 (slot 55), library pending 1.5, compiling 2.7 |
+| indirect mesh, split64 route (new) | 1.1 | 0 | compiling 0.6, Metal refused 0.6 |
+| direct dispatch / indirect dispatch | 51 / 63 | 28 / 13 | compiling 23 / 51 |
+| indirect rect-list (new: backend pre-pass) | 19 | 0.6 | compiling 18 |
+| indirect draw indexed / draw | 5.3 / 0.4 | 2.5 / 0.1 | slot-55 refused 1.6, library pending 0.7 |
+| draw / draw indexed / draw rect-list | 3.7 / 5.5 / 0.9 | 1.3 / 4.7 / 0.7 | compiling |
+
+Before the world (landing, menus, loading): 10 draws, 1 rect-list draw, 1 dispatch a frame, all recorded. Mesh PSOs at
+creation: hw 24,693, split64 1,174 (all created now; were refused), 413 refused with no reason (slot 55), 15
+conservative rasterization. Not seen in any world frame: acceleration-structure builds (ray tracing off), the
+"two formats" texture copy (now done through a staging buffer when the block size matches).
+
+### Memory (d3m-s4-e +63 s, story load / d3m-s4-g +95 s, world)
+
+| | round 5 world (d3m-s3-a +213 s) | this round, world (d3m-s4-g +95 s, ASAN tree) |
+|---|---:|---:|
+| footprint | 13,368 MiB | 14,480 MiB (ASAN tree; the plain tree died before a world report) |
+| Metal (layer) | 6,429 | 4,287 |
+| title copies | 2,834 (33,535) | 793 (19,794): stale copies retired (merged `retire_overlapped_title_textures`: 4,409 images, 191 MiB by +63 s) |
+| render targets | 2,135 (1,182) | 2,135 (1,182): unchanged, see the plan |
+| descriptors/arena + hash table | 464 + 80 | 347 (arena 256 + 8 live table generations); d3m-s4-j +94 s: 537, of it **14 live hash-table generations, 281 MiB** (73 made, 854,022 slot writes) |
+
+The three memory-map findings on this path: (1) render targets 2,135-2,140 MiB in 1,182-1,184 textures, unchanged
+(each a private MTLTexture; aliasing needs the title's page -> pool slot map, see Next); (2) stale copies: retired now
+(the plain tree's title copies at +63 s 222-235 MiB in 13,535; the ASAN tree's world 793-1,002 MiB against round 5's
+2,834); (3) the bindless table: set 0's 28 argument buffers are fixed (65,536 2D slots = 512 KiB, the rest 2-32 KiB),
+but the descriptor hash table (binding 2) is a full copy per generation, about 20 MiB each at the world phase and up
+to 14 alive while submissions are slow (a generation is freed only when the queues passed it and 100 ms later); with
+fnv1a it grows as on the Vulkan path (fmix32 retranslation, spike/r6-memory-map). World footprint: 14,985 MiB at
++94 s in the ASAN tree (ASAN adds roughly 1-1.5 GiB); the plain tree's world report did not come before its crash.
+
+### Switches added this round
+
+`GTA6RT_METAL_CRASH_BACKTRACE` (SIGABRT/terminate/near-null host faults print a stack), `GTA6RT_METAL_CRASH_MEMGRAPH`,
+`GTA6RT_METAL_STACK_LOG_AT_S`, `GTA6RT_METAL_ARENA_RESERVE_VA`, `GTA6RT_METAL_MESH_SPLIT`, `GTA6RT_METAL_DUAL_SOURCE`,
+`GTA6RT_METAL_SPIRV_FALLBACK`, `GTA6RT_METAL_WORK_REPORT_S`, `GTA6RT_METAL_INDIRECT_LIMITS`,
+`GTA6RT_METAL_INDIRECT_GUARD_MS`, `GTA6RT_METAL_REFUSE_CS`, `GTA6RT_METAL_RELEASE_AT_ONCE` (backend),
+`LEONIDA_TITLE_OVERLAP_RETIRE`; CMake `-DGTA6RT_D3D12_METAL_ASAN=ON`.
+
+### Next (ranked)
+
+1. The FSR4 timeout: find the pass (bisect `GTA6RT_METAL_REFUSE_CS` over the 25 `fspx/` programs, one run per step,
+   alone on the machine) and whether it is one pass or the chain in one command buffer (split the command buffer
+   after each FSR dispatch); then either fix the translation or replace the upscaler on Metal (spike/r6-fsr4 routes b
+   and MetalFX). With FSR refused the world runs but the scene the title composes from FSR's output stays black.
+2. The heap damage behind the Reset SIGSEGV (plain tree only): `MallocScribble=1` + `GTA6RT_METAL_STACK_LOG_AT_S` +
+   the crash hooks here (malloc_history of the reported block hung in d3m-s4-d; a memgraph is the fallback).
+3. Mesh shaders over 32 KiB of threadgroup memory (26 records a frame refused): shaderc_msl's x_buf/shrink transform
+   for mesh stages.
+4. Render-target aliasing (2.1 GiB for ~0.65 GiB of title pages): needs xmem's page -> pool slot (request).
 
 ## Round 5 (2026-11-26, 17:55-19:45): runs for minutes; first-run pages, legal pages, story load and world phase on Metal
 

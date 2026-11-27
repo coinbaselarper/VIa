@@ -104,6 +104,13 @@ ID3D12Device5* device5_of(void* device) {
 // proxy_real_object, which real_object_behind_proxy follows.
 IUnknown* real_list(void* list) {
     if (!list) return nullptr;
+    if (!g_hooks.real_object_behind_proxy) {
+        // A console-shaped list proxy answers a PC slot with another method (PC 72, BuildRaytracingAccelerationStructure,
+        // is the console's write64): said once, since the D3D12 layer that owns the proxies installs the hooks.
+        static std::atomic<bool> s_logged{false};
+        log_once(s_logged, "no proxy hooks are installed (rt::xbox_bvh::set_hooks): the list the title passed is used "
+                           "as it is");
+    }
     IUnknown* real = g_hooks.real_object_behind_proxy ? g_hooks.real_object_behind_proxy(list) : nullptr;
     return real ? real : static_cast<IUnknown*>(list);
 }

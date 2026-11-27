@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 namespace leonida {
@@ -268,9 +269,31 @@ const char* MetalContext::work_name(Work w) {
 const char* MetalContext::fate_name(Fate f) {
     static const char* names[] = {"recorded", "PSO refused", "PSO unknown", "library pending", "pipeline compiling",
                                   "Metal refused the pipeline", "render target unknown", "vertex buffer unknown",
-                                  "index buffer unknown", "arguments unknown", "not implemented"};
+                                  "index buffer unknown", "arguments unknown", "not implemented",
+                                  "a compute pass before it not ready"};
     static_assert(sizeof(names) / sizeof(*names) == std::size_t(Fate::count));
     return names[std::size_t(f)];
+}
+
+static std::int64_t guard_ns() {
+    static const std::int64_t ns = [] {
+        const char* v = std::getenv("GTA6RT_METAL_INDIRECT_GUARD_MS");
+        return std::int64_t(v && *v ? std::strtoll(v, nullptr, 10) : 2000) * 1000000;
+    }();
+    return ns;
+}
+
+static std::int64_t steady_ns() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+void MetalContext::note_compute_not_ready() { last_compute_skip_ns_.store(steady_ns(), std::memory_order_relaxed); }
+
+bool MetalContext::producers_settling() const {
+    const std::int64_t g = guard_ns();
+    const std::int64_t last = last_compute_skip_ns_.load(std::memory_order_relaxed);
+    return g > 0 && last && steady_ns() - last < g;
 }
 
 void MetalContext::note_work(Work w, Fate f, const char* why) {
