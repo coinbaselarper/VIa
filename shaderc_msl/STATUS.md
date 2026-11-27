@@ -7,24 +7,127 @@ Host: M4 Pro, macOS 27.0.1, Metal compiler 32023.922 (`metal -c`), Homebrew `spi
 also as x86_64 under Rosetta). Numbers are measured in this module unless a spike is named. The machine was shared
 with other workers (load average 10-42 during this round); all timings below are loaded timings.
 
-## Round 14, shader-structure worker (2026-11-27 11:15-): translator fork; waterfall loops folded (in progress)
+## Round 14, shader-structure worker (2026-11-27 11:15-14:00): translator fork; waterfall loops folded, structured prefix before the mesh epilogue; mesh probe -10..-36% a group on the long path, bit-identical
 
-Preliminary (this section is rewritten at the end of the task). Translator copy `port/shaders_vk/translator-fork/`
-(leonida d3b8251b + the s2-make-game computed-I/J patch; byte-identical corpus output without the new flags), tool
-`tools/sstruct.py`, tree `port/build/sstruct-x86_64`. Measured so far (offline mesh probe, safe+capture variants,
-2,048 groups, best of 5, load 3-5): `--fold-waterfalls` on `+MS_VS_PropFoliageDeferred_7cf79608_Wrapped~8`: 382 -> 262
-switch cases, zero-heap path 5.84 -> 4.48 us a group, 0 of all output words differ (3 inputs).
+Translator copy `port/shaders_vk/translator-fork/` (leonida d3b8251b + the s2-make-game computed-I/J patch; `ORIGIN.md`;
+writes the corpus byte for byte without the new flags), tool `tools/sstruct.py` (+ `sstruct_passes.py`,
+`sstruct_cs_ab.mm`), tree `port/build/sstruct-x86_64`. M = measured, I = inferred. Offline only for every result below:
+GPU jobs through `tools/tmem_slot.sh` (probe binaries `gta6rt_sstruct_*`), load 3-8 (other workers' world runs and
+builds all along). Two world runs (sst-a/-b) did not reach the world (section 5). No shared source edited.
 
-## Round 13, compute-speed worker (port/d3d12_metal, 2026-11-27 11:20-13:10): the mspeed passes on library compute kernels
+### 1. What the fork changes (flags; each only under `--wave64-emulate`)
 
-Details: `d3d12_metal/STATUS.md`, round 13 compute-speed (continued). New files here: `tools/cspeed_overlay.py`
-(compute rows from the store recipe + merge_typed_reads / fp_inline / hash_memo / simd_votes / ...),
-`tools/cspeed_ab.mm` (`--shared-writes`), `tools/cspeed_capcfg.py`, `tools/cspeed_encprobe.mm`. Measured: on captured
-inputs every variant is bit-identical (0 words differ; verdicts for 01903/01905/01919/01921/01315, none for
-00977/00974/01267: they write nothing on those inputs); chain_segments / round_counts_simd / barrier_tg_only do not
-apply to these kernels; in the world the "all" variant (merge + fp_inline + hash_memo) makes 01905 +48%, 01903 +50%,
-00977 +29..56% slower a dispatch, the rest within run-to-run spread. So merge_typed_reads is a memory pass, not a speed
-pass, on compute; nothing default. Overlay of 3 verified, not slower rows: `build/cspeed-x86_64/overlay.tsv`.
+- `--fold-waterfalls` (`tools/waterfall_fold.py`): a waterfall loop over a per-lane descriptor (readfirstlane of the
+  descriptor words, equality compares ANDed into EXEC, the body, `s_xor exec` / `s_andn2_wrexec`, `s_cbranch_execnz`) runs
+  once with each lane's own descriptor words: no readfirstlane exchange, no EXEC vote. Exact because each lane that is on
+  at the head is on in exactly one iteration, the one whose first lane holds its own compared words; the rewrite is
+  applied only when the body is lane-local (loads, explicit-LOD image reads, lane-local VALU, scalar loads; no store,
+  atomic, LDS, export, barrier or cross-lane op), every readfirstlane word is compared with its own VGPR, nothing the
+  loop computes per lane (descriptor copies, masks, SCC) is live after it, EXEC is restored by `s_mov_b64` right after,
+  and a scalar load addressed through the per-lane copy loads only in lanes that are on (the others hold stale words).
+  World mesh shaders: 17 of 368 have waterfalls (185 loops, 178 folded); foliage~8: 75 -> 9 readfirstlane rounds,
+  16 -> 0 waterfall votes, 382 -> 262 switch cases.
+- `--barrier-tail` (`wave64_emulate_opt.plan_structured_emulation`): leonida's structured plan for multi-wave groups
+  refused every mesh shader because the epilogue's `s_barrier` sits in a wave-divergent region; now that region and what
+  follows run in a tail scheduler and the code before it is emitted structured (inline spine blocks, sync-free regions,
+  local mini-schedulers): foliage~8 one 382-case switch -> 5 switches, 225 cases. The mesh-speed `chain_segments` pass
+  only chains the first switch, so the fork's rows use `chain_segments_all` (`tools/sstruct_passes.py`, same rule on
+  every switch on the PC; without it the 9e3a1555 skin shaders lost 30-40%).
+- `--readlane-batch`: `v_readlane_b32` of a VGPR the current exchange round already published reads that copy
+  (lib_cs_00977 rounds 380 -> 186, 00974 326 -> 180, 01970 82 -> 20, 01969 53 -> 22). Not shipped (section 3).
+- `--uniform-votes` (`tools/wave_uniform.py`): votes over lane masks whose bit is the same in all 64 lanes and
+  readfirstlane/readlane of VGPRs that are the same in all 64 lanes take the lane's own value (whole-wave groups only).
+  foliage~8: 71 -> 63 rounds, probe within noise (4.08 -> 4.02 us with the tail). Not shipped.
+
+### 2. Mesh shaders: offline A/B (probe `mspeed_probe.mm`, safe+capture variants of every library, 2,048 groups, best of 5)
+
+A = the shipped mspeed row (corpus translation + store recipe + private outputs + the mesh-speed passes); B = the same
+build from the fork's translation (`chain_segments_all` for `chain_segments`). Each job times a warm-up copy of A, A,
+the variants, then A again ("A" below = mean of A and late A): the first library a probe times runs ~13% slow, which
+inflated my first numbers. Inputs: `zero` = zero heap (the longest path, 1 vertex a group), `fol_a` = the mesh-speed
+worker's structured heap (~64 vertices a group). Every output word (positions, attributes, indices, cull flags, sizes)
+compared: **0 differ in every row below**.
+
+| frame # | mesh shader | title after mspeed: ms a frame / us a group | waterfalls folded | cases A -> fold -> fold+tail | zero: A / fold / fold+tail (us a group) | fol_a: A / fold / fold+tail | row |
+|---:|---|---|---:|---|---|---|---|
+| 1 | `+MS_VS_PropFoliageDeferred_7cf79608_Wrapped~8` | 18.2 / 15.13 | 18 | 382 -> 262 -> 235 | 5.97 / 4.48 (-25%) / 3.89 (-35%) | 2.04 / 2.04 (+0%) / 1.50 (-26%) | fold+tail |
+| 3 | `1MSNC_VS_PropFoliageSkinDeferred_4352f5e1_Wrapped~8` | 7.9 / 17.06 | 18 | 375 -> 255 -> 228 | 6.23 / 4.75 (-24%) / 4.12 (-34%) | 2.30 / 2.34 (+2%) / 1.83 (-21%) | fold+tail |
+| 4 | `(MSNC_VS_TransformSkinD_9e3a1555_Wrapped~50` | 4.4 / 28.21 | 12 | 331 -> 253 -> 228 | 3.65 / 3.36 (-8%) / 4.47 (+22%) | 2.07 / 2.07 (+0%) / 2.82 (+36%) | fold |
+| 5 | `_MS_VS_TransformD_c5fd36bb_Wrapped~153` | 5.7 / 20.45 | 12 | 332 -> 254 -> 228 | 5.27 / 4.47 (-15%) / 3.84 (-27%) | 2.02 / 2.07 (+2%) / 1.64 (-19%) | fold+tail |
+| 7 | `;MSNC_VS_CascadeShadows_drawskinnedTexture_a14f0f80_Wrapped~30` | 2.6 / 6.20 | 9 | 214 -> 154 -> 130 | 4.46 / 3.45 (-23%) / 3.78 (-15%) | 1.29 / 1.29 (+0%) / 1.48 (+14%) | fold |
+| 9 | `_MS_VS_TransformD_c5fd36bb_Wrapped~23` | 2.0 / 1.80 | 0 | 41 -> 41 -> 31 | 1.22 / 1.26 (+4%) / 1.09 (-10%) | 1.35 / 1.39 (+3%) / 1.08 (-20%) | fold+tail |
+| 10 | `_MS_VS_TransformD_c5fd36bb_Wrapped` | 1.3 / 4.20 | 0 | 62 -> 62 -> 41 | 1.00 / 1.01 (+0%) / 0.69 (-31%) | 1.14 / 1.14 (+0%) / 0.83 (-27%) | fold+tail |
+|  | `'MSR_VS_TransformSkinD_1778b45a_Wrapped~1` | - | 2 | 103 -> 95 -> 85 | 1.62 / 1.64 (+1%) / 1.32 (-19%) | 1.77 / 1.80 (+1%) / 1.48 (-17%) | fold+tail |
+|  | `(MSNC_VS_TransformSkinD_9e3a1555_Wrapped~46` | - | 6 | 193 -> 154 -> 131 | 2.95 / 2.63 (-11%) / 3.10 (+5%) | 1.57 / 1.55 (-1%) / 1.67 (+6%) | fold |
+|  | `(MSNC_VS_TransformSkinD_9e3a1555_Wrapped~52` | - | 12 | 331 -> 253 -> 228 | 3.66 / 3.27 (-11%) / 4.50 (+23%) | 2.12 / 2.12 (+0%) / 2.92 (+38%) | fold |
+|  | `)MSNC_VS_LinearDepthSkin_1b4b70ba_Wrapped~2` | - | 9 | 224 -> 164 -> 140 | 4.74 / 3.62 (-24%) / 3.06 (-35%) | 1.42 / 1.39 (-2%) / 1.03 (-28%) | fold+tail |
+|  | `)MSNC_VS_LinearDepthSkin_f1f2249c_Wrapped~48` | - | 6 | 201 -> 162 -> 138 | 3.94 / 3.42 (-13%) / 2.84 (-28%) | 1.35 / 1.37 (+1%) / 1.00 (-26%) | fold+tail |
+|  | `1MSNC_VS_PropFoliageSkinDeferred_4352f5e1_Wrapped~3` | - | 18 | 375 -> 255 -> 228 | 6.77 / 5.05 (-25%) / 4.32 (-36%) | 2.58 / 2.51 (-3%) / 1.93 (-25%) | fold+tail |
+|  | `2MS_VS_CascadeShadows_drawTexture_04fe460e_Wrapped~31` | - | 9 | 221 -> 161 -> 137 | 4.28 / 3.25 (-24%) / 3.29 (-23%) | 1.13 / 1.12 (-1%) / 1.11 (-2%) | fold |
+|  | `2MS_VS_CascadeShadows_drawTexture_65459485_Wrapped~48` | - | 6 | 199 -> 160 -> 136 | 3.62 / 3.06 (-15%) / 3.07 (-15%) | 1.10 / 1.09 (-1%) / 1.10 (+0%) | fold |
+|  | `;MSNC_VS_CascadeShadows_drawskinnedTexture_a14f0f80_Wrapped~41` | - | 6 | 192 -> 153 -> 129 | 3.68 / 3.16 (-14%) / 3.41 (-7%) | 1.21 / 1.23 (+1%) / 1.38 (+14%) | fold |
+|  | `_MS_VS_TransformD_c5fd36bb_Wrapped~149` | - | 6 | 195 -> 156 -> 133 | 2.93 / 2.65 (-10%) / 2.20 (-25%) | 1.52 / 1.51 (+0%) / 1.21 (-20%) | fold+tail |
+|  | `_MS_VS_TransformD_c5fd36bb_Wrapped~151` | - | 17 | 386 -> 273 -> 247 | 6.13 / 4.78 (-22%) / 4.25 (-31%) | 2.16 / 2.15 (+0%) / 1.79 (-17%) | fold+tail |
+|  | `_MS_VS_TransformD_c5fd36bb_Wrapped~155` | - | 12 | 332 -> 254 -> 228 | 5.25 / 4.43 (-16%) / 3.80 (-28%) | 1.97 / 2.11 (+7%) / 1.67 (-15%) | fold+tail |
+
+- Choice rule (`build/sstruct-x86_64/select.py`): per shader the variant with the lowest mean ratio to A over both inputs,
+  0 words differing, not slower than A by >3% on either input; ties to A within ~5% are noise (identical code timed twice
+  differed by up to 8% in `c5fd36bb~23`'s run). `--barrier-tail` loses 15-38% on the 9e3a1555 skin family and on the
+  a14f0f80 cascade shadows (cause not measured; I: inline exchange barriers in the structured prefix that every wave
+  pays), so those keep `fold` only.
+- Inferred in-title effect (not measured, section 5): the long-path ratios applied to the mspeed-after title costs give
+  foliage~8 ~18.2 -> ~12-13.5 ms a frame, skin~8 ~7.9 -> ~5.2-6.2, c5fd36bb~153 ~5.7 -> ~4.2-4.6.
+- Not A/B-able here (no row): `_MSR_VS_TransformSkinD_DetailMapsOff_NoDeform_34f92402` (split64: the capture variant
+  does not fit the split MSL), `2MS_VS_TransformTerrainNormalTint_e74ae427~11/~8` (capture variant does not compile:
+  no local `gl_Position`).
+- Exactness limits: the probe inputs reach the folded loops with one descriptor value per wave (foliage's S# words are
+  SGPRs moved into VGPRs); a run with the per-lane offset of the T# waterfall made lane-varying (`sstruct.py pert`,
+  `v63 = v0 << 5`) was also bit-identical, but its trace saw no bindless lookups, so the divergent case rests on the
+  construction above.
+
+### 3. Compute kernels
+
+- The top 10 by frame cost: 7 are wave32 kernels already structured with native subgroup ops (01905, 01921, 01267,
+  00906, 01903, 01315, 01919) and 03004 is a single-wave `inline_all` program: the fork with all flags writes them byte
+  for byte (checked), so before = after.
+- 00977 / 00974 (cascade shadows, 16.3 + 4.2 ms a frame): `--fold-waterfalls --readlane-batch` built and A/B'd on the
+  compute-speed worker's title captures (`build/cspeed-x86_64/cap2`, `cspeed_ab.mm`, `--shared-writes`) and on random
+  inputs (`sstruct_cs_ab.mm`, every raw heap access bounded to the heap): 0 words differ, **but A writes nothing on any of
+  these inputs** (changed_by_A 0), so the changed paths are not exercised; time on those paths 3.149 -> 3.250 ms /
+  3.556 -> 3.713 ms for 10 dispatches (captures 0), equal on captures 1. Not verified, no gain shown: **no compute rows**.
+  Built anyway: `build/sstruct-x86_64/cs-rl/overlay.tsv` (4 rows, do not load).
+- No capture exists for 01970 / 01969.
+
+### 4. Pixel shaders
+
+The top 10 pixel shaders translate byte for byte with the fork's flags (no emulated rounds in a fragment program;
+derivatives are already `dfdx`/`dfdy` and quad ops). Their PS waterfalls (62941270~7: 28 loops) run as subgroup ballot
+loops whose descriptor lookup is broadcast from the first lane, so folding them needs the image-op codegen to keep a
+per-lane index: not done.
+
+### 5. Deliverables, commands, what is not done
+
+- **Overlay (not default): `build/sstruct-x86_64/mesh/overlay.tsv`** (19 mesh rows, the variant chosen per shader
+  as above; libraries in `ms-fold/cas`, `ms-ft/cas`). Use it in front of the default list:
+  `GTA6RT_METAL_SHADER_OVERLAY=$PORT/build/sstruct-x86_64/mesh/overlay.tsv:<the default list>` and
+  `GTA6RT_METAL_ARCHIVE_TIERS=$PORT/build/pc7/arch-world:$PORT/build/sstruct-x86_64/arch`.
+- **Prebuild** (done, 135 pipelines that use the 19 rows, 0 refused; `build/sstruct-x86_64/arch`, 6 shards, 129 MiB incl. ~40 MiB of pipelines of rows I replaced):
+  `python3 -I d3d12_metal/cache/tools/catalog_merge.py --base build/mspeed-x86_64/catalog-final.tsv --overlay build/sstruct-x86_64/mesh/overlay.tsv --out build/sstruct-x86_64/catalog-mesh.tsv`;
+  `python3 -I shaderc_msl/tools/sstruct.py manifest build/sstruct-x86_64/prebuild-mesh.manifest.txt build/sstruct-x86_64/mesh/overlay.tsv build/mspeed-x86_64/final.manifest.txt build/pc7/arch-world/pcache-tier.txt`;
+  `build/pc7-cache-x86_64/prepare_shaders --manifest build/sstruct-x86_64/prebuild-mesh.manifest.txt --catalog build/sstruct-x86_64/catalog-mesh.tsv --archive-dir build/sstruct-x86_64/arch --jobs 2 --title-jobs 1`.
+  To fold into the tier: the same prepare_shaders line with `--archive-dir build/pc7/arch-world`.
+- Rebuild rows: `sstruct.py overlay OUT --names-file F --flags=--fold-waterfalls[,--barrier-tail]`; A/B:
+  `sstruct.py ab WORK NAME --inputs zero,fol_a "--flags=--fold-waterfalls;--fold-waterfalls,--barrier-tail"`.
+- **World runs (sst-a defaults, sst-b with 3 rows; same binary, 200 s watchdog):** neither reached the world (a stalled
+  boot: game state 0x2 at +15.6 s in a and +214.6 s in b, then story load after the watchdog), so no in-title number.
+  0 failed command buffers, gpuEvent-gta6rt 9 before / 9 after each; present dumps deleted. The in-title per-group
+  numbers are the next step (`build/sstruct-x86_64/ab_world.sh`).
+- **Not done:** (1) structured control flow inside wave-divergent multi-wave regions: an exchange is a workgroup barrier
+  and the two waves of a group may be on different paths there, so those regions stay PC-switch round loops (the
+  remaining ~60 rounds of foliage are branch votes in them); removing them needs one SIMD group per wave (two lanes a
+  thread) or exchange-free regions. (2) Descriptor lookup hoisting on the IR: not done (the MSL `hash_memo` memo stays).
+  (3) PS waterfall folding (section 4). (4) Compute rows (section 3). (5) Divergent-descriptor exactness shown only by
+  construction.
 
 ## Round 12, mesh-speed worker (2026-11-27 09:06-11:20): exact MSL passes on the translated mesh and pixel shaders; world G-buffer geometry -30%, fragment -58% a frame (same binary, pass timer)
 

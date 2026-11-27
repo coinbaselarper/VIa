@@ -38,6 +38,11 @@ import mesh_tg_pack as P  # noqa: E402
 import mspeed  # noqa: E402
 import mspeed_cmp  # noqa: E402
 import mspeed_overlay as MO  # noqa: E402
+import mspeed_passes as MP  # noqa: E402
+import sstruct_passes as SP  # noqa: E402
+
+MP.PASSES["chain_segments_all"] = SP.chain_segments_all
+FORK_PASSES = ["chain_segments_all" if p == "chain_segments" else p for p in MO.DEFAULT_PASSES]
 
 FORK = os.path.join(PORT, "shaders_vk", "translator-fork", "tools", "rdna2spirv.py")
 DISASM = os.path.join(ROOT, "spike", "s2-make-game", "work", "shaders", "dxbc", "disasm")
@@ -343,7 +348,7 @@ def ab(work, name, inputs, groups, reps, variants):
         builds.append(("b%d" % k, fork_dir, flags))
     out = {}
     for k, spv_dir, flags in builds:
-        r = build_lib(work, spv_dir, name)
+        r = build_lib(work, spv_dir, name, None if k == "a" else FORK_PASSES)
         if r.get("status") != "ok":
             raise RuntimeError("%s build %s: %s" % (k, r.get("status"), r.get("error", "")))
         res["lib_" + k] = r["metallib"]
@@ -358,15 +363,29 @@ def ab(work, name, inputs, groups, reps, variants):
     if any(v[1]["record_words"] != rec for v in out.values()):
         raise RuntimeError("output layout differs")
     keys = [b[0] for b in builds]
+    # The first library a probe times runs measurably slower (clock ramp; ~13% in identical-code pairs): a warm-up copy
+    # of A goes first, and A is timed again last ("a_late").
+    for k2 in ("warm", "a_late"):
+        cp = out["a"][0][: -len(".metallib")] + "." + k2 + ".metallib"
+        if not os.path.exists(cp):
+            shutil.copyfile(out["a"][0], cp)
+        out[k2] = (cp, out["a"][1], out["a"][2])
+    order = ["warm"] + keys + ["a_late"]
     res["inputs"] = {}
     for inp in inputs:
         prefix = os.path.join(work, "%s.%s" % (tag, inp))
-        job = mesh_job(out["a"][2], [out[k][0] for k in keys], inp, groups, reps, prefix, rec)
+        job = mesh_job(out["a"][2], [out[k][0] for k in order], inp, groups, reps, prefix, rec)
         jp = prefix + ".job.json"
         json.dump(job, open(jp, "w"))
         t = probe(jp)
         fa = "%s.%s.out" % (prefix, os.path.basename(out["a"][0]))
-        ri = {"us_group_a": t[os.path.basename(out["a"][0])]}
+        ri = {"us_group_a": t[os.path.basename(out["a"][0])], "us_group_a_late": t[os.path.basename(out["a_late"][0])],
+              "us_group_warm": t[os.path.basename(out["warm"][0])]}
+        for k2 in ("warm", "a_late"):
+            try:
+                os.remove("%s.%s.out" % (prefix, os.path.basename(out[k2][0])))
+            except OSError:
+                pass
         for k in keys[1:]:
             fb = "%s.%s.out" % (prefix, os.path.basename(out[k][0]))
             st, first = mspeed_cmp.compare(rec, fa, fb)
@@ -496,7 +515,7 @@ def overlay(out_dir, names, flags):
         elif open(fork_spv, "rb").read() == open(corpus_spv, "rb").read():
             r["status"] = "same_spirv"
         elif row[2] == "ms":
-            r.update(build_lib(out_dir, spv, n))
+            r.update(build_lib(out_dir, spv, n, FORK_PASSES))
         elif row[2] == "cs":
             r.update(build_cs(out_dir, spv, n, row, CS_PASSES))
         else:
