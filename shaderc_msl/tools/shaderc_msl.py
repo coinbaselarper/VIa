@@ -411,14 +411,23 @@ def msl_fixups(text, passes):
     return (text if changed else None), info
 
 
+def dxbc_of(spv_path):
+    """The carved DXBC of a corpus shader: <shaders>/dxbc/X.dxbc for <shaders>/spirv/X.spv, <shaders>/D/X.dxbc for
+    a sub-corpus shader <shaders>/spirv/D/X.spv."""
+    d = os.path.dirname(os.path.abspath(spv_path))
+    stem = os.path.basename(spv_path)[:-4]
+    if os.path.basename(d) == "spirv":
+        return os.path.join(os.path.dirname(d), "dxbc", stem + ".dxbc")
+    return os.path.join(os.path.dirname(os.path.dirname(d)), os.path.basename(d), stem + ".dxbc")
+
+
 def declared_output_variants(spv_path, opts):
     """Pixel shaders: the output-type variant the HLSL signature asks for (an integer SV_Target, read from the
     shader's DXBC beside the SPIR-V corpus) joins opts["output_variants"] (tools/out_types.py)."""
     import out_types
     opts = dict(opts)
     if "output_signature" not in opts:
-        opts["output_signature"] = out_types.dxbc_targets(os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(spv_path))), "dxbc", os.path.basename(spv_path)[:-4] + ".dxbc"))
+        opts["output_signature"] = out_types.dxbc_targets(dxbc_of(spv_path))
     sig = opts["output_signature"] or {}
     code = "".join({"uint": "u", "int": "i"}.get(sig.get(loc), "f") for loc in range(max(sig) + 1 if sig else 0))
     if code.rstrip("f"):
@@ -620,9 +629,7 @@ def main():
     if a.output_variants:
         import out_types
         opts["output_variants"] = [c for c in a.output_variants.split(",") if c]
-        sd = a.spirv_dir or os.path.dirname(a.spv)
-        opts["output_signature"] = out_types.dxbc_targets(os.path.join(
-            os.path.dirname(os.path.abspath(sd)), "dxbc", os.path.basename(a.spv)[:-4] + ".dxbc"))
+        opts["output_signature"] = out_types.dxbc_targets(dxbc_of(a.spv))
     if a.drop:
         opts["drop_outputs"] = [int(x) for x in a.drop.split(",")]
     tr = translator_id(a.spirv_dir or os.path.dirname(a.spv))

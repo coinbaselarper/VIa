@@ -7,6 +7,119 @@ Host: M4 Pro, macOS 27.0.1, Metal compiler 32023.922 (`metal -c`), Homebrew `spi
 also as x86_64 under Rosetta). Numbers are measured in this module unless a spike is named. The machine was shared
 with other workers (load average 10-42 during this round); all timings below are loaded timings.
 
+## Round 8 (2026-11-27, 02:15-): pixel output-type variants, library compute shrink, FSR4 03/18
+
+Tree `port/build/uintps-x86_64`. Offline unless a run is named. Load average 6-13 throughout (another worker's title
+ran beside most of it); timings are loaded timings.
+
+### 1. Float outputs to integer render targets (measured)
+
+- **Cause.** The translation writes every colour export as a vec4 float. Metal refuses a float output to a uint/sint
+  attachment ("output of type float4 is not compatible with a MTLPixelFormatR32Uint color attachment"): 170
+  tiled-lighting rect-list draws a frame (RGBA16F + R32Uint), 27 RG32Uint, a few RGBA32Uint.
+- **What the value is.** The DXBC OSG1 signatures declare these targets `uint`, yet the console ISA exports them
+  through `v_cvt_pkrtz_f16_f32` + `exp ... compr` (`&PS_HairStrandVBuffer`: `exp mrt0 pkrtz(v2, v3) compr`;
+  `(TL_PS_PBR_MATERIAL_EYE` target 1: `pkrtz(v6, v6)`), and the translator decodes that as two f16 halves. So the
+  binaries are compiled for an FP16 export and the console binds the real export format with the PSO (inferred; the
+  registers hold integers: the classifier traces them to integer ops, `pk:int`). Neither "bit-cast the float output"
+  nor "pack the halves" gives the register value; the variant exports the **32-bit inputs of the pack**.
+- **Variant** (`tools/out_types.py`, recipe pass `output_variants`): one extra entry `main0_o<code>` per code in the
+  same metallib (code = one char per colour location: f/u/i, trailing f dropped; `fu` = RGBA16F + R32Uint). In it a
+  compressed component takes the pack's input (same block: directly; across blocks, the translator's "any lane
+  active" shape: Function-scope shadow registers written beside every store to the register), the float output
+  becomes a Private shadow and every return writes the uint/int output by bit cast. A float-declared location keeps
+  the bit-cast rule (D3D: undefined) - no list pipeline needs that (0 such pairs).
+- **Selection** (port/metal `mtl_pipeline.mm` `fragment_of`, render and mesh pipelines): with an integer colour
+  attachment it takes `<entry>_o<code>` from the pixel library when present; otherwise as before, plus a log line
+  naming the missing entry. Archives see an ordinary pipeline, so they prebuild.
+- **Default.** `shaderc_msl.py` adds the signature's code for every pixel shader (DXBC beside the corpus; sub-corpora
+  resolved), also for the adapter's on-demand builds; `--output-variants a,b` adds more.
+- **Corpus** (`tools/output_variants.py scan`, `<tree>/scan.json`, list `warmup/output_variants.tsv`): 964 of
+  12,112 pixel shaders declare an integer SV_Target (codes u 658, fu 303, uu 1, ffu 1, i 1); all 964 need a
+  variant; 0 lossy exports (every integer component traced to its pack input). In the world lists (pc7 specs + 5
+  recorded manifests): 228 shaders, 1,795 pipelines with an integer target: tiled lighting `*TL_PS_*` (180),
+  `*STUDIOSHOT*` (30), `PS_*VfxVBuffer*` (13), water raster (2), hair strand v-buffer, quad mask, `exe/container_02`.
+  The other 736: VfxVBuffer_AlphaClip variants (629), more TL (60), `*PS_MIRROR*` (30), water, Bink encode, masks.
+- **Tests.** `tests/outvar/` (ctest `shaderc_msl_outvar_render`, x86_64 and arm64, debug layer + shader validation):
+  a translator-shaped shader (software pkrtz, register array, exec selects; plain and `--branch`) built with
+  `u,ui,fu`, drawn into R32Uint, RG32Uint, RGBA32Uint + R32Sint, RGBA16F + R32Uint: **156 of 156 channel values
+  exact** per run, patterns including float denormals (1, 5, 0x7fffff), NaN/sNaN/inf, 0xffffffff; the base entry is
+  refused with R32Uint and a mismatched code is refused (controls). Real shaders through port/metal
+  (`prepare_shaders` built in this tree): 33 of 33 list pipelines with integer targets created from the variant
+  libraries; the same 11 from the store's libraries: 11 of 11 refused with the title's messages.
+- **Built**: 964 + 12 rows (`tools/output_variants.py build`): `<tree>/overlay.tsv` (976 rows, store root),
+  `<tree>/manifest.tsv` (store + rows), `<tree>/manifest-s4.tsv` (the S4 mesh override manifest + rows). Each
+  variant costs a second fragment function in the library (~6 s of compile per TL shader, 2 jobs).
+
+### 1b. In the title (two runs, my tree `build/uintps-x86_64/host`, live sources of 03:02, default settings)
+
+`build/uintps-x86_64/run_world.sh` (s7_world_run.sh with this tree, private rundir), B from +100 s,
+`GTA6RT_METAL_SHADER_MANIFEST=build/uintps-x86_64/manifest.tsv`, tiers `build/pc7/arch-world:build/uintps-x86_64/arch-int`.
+Alone on the machine (slot polled), load 7-9.
+
+| run | world at | end | in the world |
+|---|---:|---|---:|
+| uintps-a | +71.9 s | footprint cap (exit 4, 16.6 GiB; Metal buffers 2.0 GiB, "other" 2.85 GiB) | 28 s |
+| uintps-b (+ `GTA6RT_METAL_SCENE_DUMP` frames 1..29 every 4) | +71.6 s | footprint cap (exit 4, 16.5 GiB) | 75 s |
+
+- **Indirect rect-list (tiled lighting): 257.0 a frame, recorded 257.0** (round 7: 170 refused); 282.7 of 282.7 at
+  t=142 s. No "not compatible with a MTLPixelFormat" line and no missing-variant line in either log. Draws to
+  RG32Uint/RGBA32Uint: recorded (none refused).
+- Workgroup-memory refusals: only the 4 x_buf shaders remain (`lib_cs_03098 03100 03148 03149`); dispatches 1,672
+  a frame, recorded 1,672 (round 7: 1 refused a frame plus compiling).
+- Also in these runs (not mine: the draw/mesh worker's narrowed guard in the live sources): indirect mesh 2,206-2,806
+  a frame, 2,191-2,779 recorded (round 7: 0).
+- **Scene colour is no longer zero**: 75-100% of texels non-zero in 7 of 8 dumps (frame 17: all zero). It shows the
+  sky: atmosphere, volumetric clouds with stars, and in frame 21 a sunset horizon with blurred tree silhouettes over a
+  flat blue lower half. Kept: `run/present/uintps-b-first-sky-colour.png` (frame 21). What is wrong in it: no mesh
+  geometry at all - every G-buffer target is 0 except a constant 0.502 normal target, depth is the far plane
+  everywhere except the top/bottom letterbox bars (6.7% of texels at 1.0), so the 2,780 recorded mesh draws a
+  frame still rasterise nothing; the lower half is flat blue, the silhouettes are blurred (a sky/horizon impostor or
+  reflection, inferred), letterbox bars are in the scene target. Which change made the sky appear is not separated
+  (the tiled-lighting composite and the guard narrowing landed together, inferred).
+
+### 2. Other refusal classes (round-7 logs d3m-s7-a..k, pc7-*, up7-a..f; per-frame counts from the work census)
+
+| class | count | side | done |
+|---|---|---|---|
+| float output to R32Uint / RG32Uint / RGBA32Uint | 170 + 27 + 4 draws/frame | translator | section 1 |
+| mesh threadgroup memory 36,056 / 35,544 / 34,008 B, split64 36,336 B, TG + mesh 31,960 + 30,720 | 55-113 / 13 / 9-22 / 6-15 / 3 draws/frame | translator (SPIRV-Cross staging) | draw/mesh worker's `mesh_tg_pack.py` overlay (120 rows, default overlay this round); not duplicated here |
+| library compute over 32 KiB workgroup memory: 14 PSOs (15 dispatches/frame) | 14 | translator: `batch.shader_opts` never looked up a sub-corpus DXBC, so no `shrink_lds` for `library/` | **10 fixed** (`lib_cs_01202 02048 02049 03103 03108 03113 03114 03116 03121 03141`, rebuilt with `shrink_lds`, 10 of 10 compute pipelines created); 4 (`03098 03100 03148 03149`: 32 KiB real LDS + 8.6 KiB exchange) need `x_buf_device` + an adapter scratch binding (adapter) |
+| conservative rasterization | 22 PSOs, ~1 draw/frame | Metal has none (adapter policy) | - |
+| Xbox slot 55 CreateDerivedPipelineState "no reason recorded" | 8-422 PSOs | layer | - |
+| Xbox slot 86 CreatePipelineState | 2 | layer | - |
+| `GTA6RT_METAL_REFUSE_CS` | 2 | diagnostic switch | - |
+
+No output-count mismatch, missing-depth, sample-mask or unsupported-format refusal is in these logs.
+
+### 3. FSR4 programs 03 and 18 (measured)
+
+Built from `spike/r6-fsr4/corpus/fspx` (byte-identical to `build/shaders_vk/apple/spirv/fspx`): both ok, compute
+pipelines created through port/metal (03: 2.3 s, 18: 1.3 s); rows `fspx/amd_fidelityfx_upscaler_xbox_{03,18}` in
+the overlay. Not dispatched.
+
+### Use
+
+**Default from trees built after 03:24**: the adapter loads `build/uintps-x86_64/overlay.tsv` after the mesh
+overlay (draw/mesh worker's `GTA6RT_METAL_SHADER_OVERLAY` list); the overlay's libraries live in
+`build/uintps-x86_64/cas` (keep both). Older trees: `GTA6RT_METAL_SHADER_MANIFEST=port/build/uintps-x86_64/manifest.tsv`
+(with the S4 mesh rows: `manifest-s4.tsv`); the selection needs port/metal from 02:50 on. Prebuilt archive of the 240
+pipelines (228 integer-target list specs + the 10 compute + 2 FSR4): `<tree>/arch-int`
+(`GTA6RT_METAL_ARCHIVE_TIERS=build/pc7/arch-world:build/uintps-x86_64/arch-int`; offered to the cache worker's tier).
+Rebuild after a corpus change: `tools/output_variants.py scan --lists ... --out <tree>` then
+`build --out <tree> --also <names> --rows <fspx rows>` (resumable, `build.jsonl`).
+
+### Not done / risks
+
+- No console reference for the integer values: the "export the pack's inputs" rule rests on the OSG1 types and
+  the ISA reading above (inferred); the render test proves the transform delivers those inputs exactly.
+- The 4 x_buf compute shaders need an adapter scratch binding; conservative-raster and layer refusals are not
+  translator-side.
+- A pipeline pairing a float-declared output with an integer target gets no variant unless `--output-variants`
+  names it (none in the lists).
+- The store manifest itself (`build/shaderc_msl/runs/main`) is unchanged; a full store rebuild now produces these
+  rows by default (signature-derived codes, sub-corpus DXBC lookup).
+
 ## Round 4 addition (2026-11-26, by port/d3d12_metal): `--dual-source`
 
 The adapter measured 121 of the first 400 mesh PSOs refused by Metal with "Fragment shader does not write to render
@@ -367,6 +480,7 @@ Adapter-facing contract:
 | `tools/pipelines.py`, `tools/mesh_fit.py`, `tools/mesh_pso.py` | pipeline pairing, mesh output steps (model), mesh steps with real pipelines |
 | `tools/gs_census.py` | geometry-shader census |
 | `tools/cs_check.py`, `tools/huge_cs.py`, `tools/soft_f64.metal`, `tests/soft_f64_test.mm` | compute shaders at Metal limits |
+| `tools/out_types.py`, `tools/output_variants.py`, `tests/outvar/` | pixel output-type variants (round 8): pass, corpus scan / rebuild / overlay, render test |
 | `src/catalog.cpp` | manifest reader (`gta6rt_shaderc_msl` static library, C++20) |
 | `patches/` | translator / design proposals for what this module cannot fix |
 

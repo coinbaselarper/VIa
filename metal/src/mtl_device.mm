@@ -4,7 +4,10 @@
 
 #import <AppKit/AppKit.h>
 
+#include <algorithm>
 #include <chrono>
+#include <map>
+#include <vector>
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
@@ -621,7 +624,7 @@ std::unique_ptr<gpu::Buffer> MetalDevice::create_buffer(const BufferDesc& desc) 
     if (!b) return nullptr;
     if (desc.label) b.label = @(desc.label);
     const std::uint64_t va = va_.allocate(desc.size, 1ull << 16);
-    return std::make_unique<MetalBuffer>(this, b, va, desc.size, false, true);
+    return std::make_unique<MetalBuffer>(this, b, va, desc.size, false, true, MemoryCategory::buffer, desc.resident);
 }
 
 std::unique_ptr<gpu::Texture> MetalDevice::create_texture(const TextureDesc& desc) {
@@ -921,6 +924,64 @@ std::unique_ptr<gpu::Texture> MetalDevice::create_texture_view(gpu::Texture* tex
     plain.swizzled = false;
     auto out = std::make_unique<MetalTexture>(this, view, td, plain, true, MemoryCategory::count);
     out->set_parent(base);
+    return out;
+}
+
+bool make_resident(gpu::Device* device, gpu::Buffer* buffer) {
+    if (!dynamic_cast<MetalDevice*>(device) || !buffer) return false;
+    static_cast<MetalBuffer*>(buffer)->make_resident();
+    return true;
+}
+
+std::string memory_detail(gpu::Device* device, unsigned max_labels) {
+    auto* d = dynamic_cast<MetalDevice*>(device);
+    if (!d) return {};
+    struct Row {
+        std::uint64_t bytes = 0, count = 0;
+    };
+    std::map<std::string, Row> rows;
+    d->va_space().visit([&](MetalBuffer* b) {
+        if (b->placed() || b->category() == MemoryCategory::host_window) return;
+        NSString* l = b->mtl().label;
+        std::string key = l ? l.UTF8String : "(no label)";
+        if (!b->resident()) key += " [not resident]";
+        Row& r = rows[key];
+        r.bytes += b->mtl().allocatedSize;
+        ++r.count;
+    });
+    std::vector<std::pair<std::string, Row>> sorted(rows.begin(), rows.end());
+    std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) { return a.second.bytes > b.second.bytes; });
+    std::string out = "buffers by label (MiB, count):";
+    std::uint64_t rest = 0, rest_n = 0;
+    for (std::size_t i = 0; i < sorted.size(); ++i) {
+        if (i >= max_labels) {
+            rest += sorted[i].second.bytes, rest_n += sorted[i].second.count;
+            continue;
+        }
+        char t[256];
+        std::snprintf(t, sizeof t, "%s %s %.0f (%llu)", i ? "," : "", sorted[i].first.c_str(),
+                      double(sorted[i].second.bytes) / 1048576.0, (unsigned long long)sorted[i].second.count);
+        out += t;
+    }
+    const MemoryBudget mb = d->memory_budget();
+    std::uint64_t categorised = 0;
+    for (std::size_t i = 0; i < std::size_t(MemoryCategory::count); ++i)
+        if (MemoryCategory(i) != MemoryCategory::host_window) categorised += mb.bytes[i];
+    const std::uint64_t windows = mb.bytes[std::size_t(MemoryCategory::host_window)];
+    const std::uint64_t other = mb.device_allocated > categorised + windows ? mb.device_allocated - categorised - windows : 0;
+    const DeviceStats st = d->stats();
+    char t[256];
+    if (rest_n) {
+        std::snprintf(t, sizeof t, ", %llu more labels' %.0f (%llu)", (unsigned long long)(sorted.size() - max_labels),
+                      double(rest) / 1048576.0, (unsigned long long)rest_n);
+        out += t;
+    }
+    std::snprintf(t, sizeof t,
+                  "; Metal allocated outside every backend category %.0f MiB (pipeline code, libraries, encoders; "
+                  "pipelines created %llu, compiled %llu)",
+                  double(other) / 1048576.0, (unsigned long long)st.pipelines_created,
+                  (unsigned long long)st.pipelines_compiled);
+    out += t;
     return out;
 }
 

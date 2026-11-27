@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <string>
 
 namespace gta6rt::metal {
 
@@ -56,5 +57,12 @@ std::string d24_quantize_probe_msl();
 // indirect mesh/compute pre-pass adds its record counters to words 0-127. Set before the first command list is
 // encoded; null (the default) binds nothing. False for a device of another backend.
 bool set_debug_buffer(gpu::Device* device, gpu::Buffer* buffer);
+
+// A buffer made with BufferDesc::resident = false joins the device residency set. False for another backend.
+bool make_resident(gpu::Device* device, gpu::Buffer* buffer);
+
+// Diagnostics: live buffers outside heaps by label (MiB and count, resident or not, largest first), and Metal's
+// allocated size that no backend category holds (pipeline code, libraries, encoder memory).
+std::string memory_detail(gpu::Device* device, unsigned max_labels = 12);
 
 }  // namespace gta6rt::metal

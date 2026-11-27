@@ -6,7 +6,7 @@ output must have the recorded size, else the shader is skipped), one MSL change 
 OUT/cas; OUT/manifest.tsv is an overlay (only those rows, paths relative to the store root) for
 GTA6RT_METAL_SHADER_DEBUG_OVERLAY.
 
-Words of the debug buffer written here (the pre-pass owns 0-127):
+Words of the debug buffer written here (the pre-pass owns 0-127; --regs adds 134 and 1024-2047, see register_dump):
   mesh (hw route): 128 groups run, 129 groups with primitives, 130 primitives, 131 vertices, 132 primitives culled by
     the shader's own flag, 133 sample slots taken; samples at 256 + 16 * slot: group id x, vertices, primitives, the
     first unculled primitive, then that primitive's three gl_Position (x, y, z, w floats)
@@ -89,7 +89,7 @@ def simd_add(word):
             "atomic_fetch_add_explicit(&gta6rt_dbg[%d], gta6rt_n%d, memory_order_relaxed); }" % (word, word, word))
 
 
-def instrument_mesh(msl):
+def instrument_mesh(msl, regs=False, only_if=None):
     head = "[[mesh]] void main0("
     i = msl.find(head)
     if i < 0:
@@ -146,7 +146,58 @@ def instrument_mesh(msl):
         "    }",
     ]
     k = i + j + len("    threadgroup_barrier(mem_flags::mem_threadgroup);\n")
-    return msl[:k] + "\n".join(add) + "\n" + msl[k:], None
+    msl = msl[:k] + "\n".join(add) + "\n" + msl[k:]
+    return register_dump(msl, only_if) if regs else (msl, None)
+
+
+def register_dump(msl, only_if=None):
+    """At the output-count message (the store to the threadgroup word the counts are read from), lane 0 of the first
+    four groups copies the scalar register file, its own first 64 vector registers and the push constants to words
+    1024 + 256 * slot (134: slots taken), and the first 8 words the GPU reads at the bases of the V#s in s[32:35] and
+    s[36:39] (heap base + 48-bit base, as the shader addresses memory) to words 232-247 of the slot."""
+    store = re.search(r"^(\s*)atomic_store_explicit\(\(threadgroup atomic_uint\*\)&(_\d+), (\w+), memory_order_relaxed\);$", msl, re.M)
+    head = re.search(r"^void (\w+)\((.*)threadgroup uint2& spvMeshSizes\)$", msl, re.M)
+    if not store or not head or msl.find(head.group(0)) > store.start():
+        return None, "no output-count store in a helper"
+    fn = head.group(1)
+    body = msl[head.end():store.start()]
+    sg = re.search(r"spvUnsafeArray<uint, 128> (_\d+) = ", body)
+    vg = re.search(r"spvUnsafeArray<uint, 256> (_\d+) = ", body)
+    pc = re.search(r"ulong (_\d+) = \(ulong\((_\d+)\._m2\) << 32ul\) \| ulong\(\2\._m1\);", body)
+    if not sg or not vg or not pc:
+        return None, "register arrays not found"
+    hb, push = pc.group(1), pc.group(2)
+    ind = store.group(1)
+    dump = [
+        ind + "if (gl_LocalInvocationIndex == 0u%s)" % ("" if only_if is None else " && %s[%du] != 0u" % (sg.group(1), only_if)),
+        ind + "{",
+        ind + "    uint gta6rt_s = atomic_fetch_add_explicit(&gta6rt_dbg[134], 1u, memory_order_relaxed);",
+        ind + "    if (gta6rt_s < 4u)",
+        ind + "    {",
+        ind + "        device uint* gta6rt_r = (device uint*)(gta6rt_dbg + 1024u + gta6rt_s * 256u);",
+        ind + "        for (uint gta6rt_k = 0u; gta6rt_k < 128u; ++gta6rt_k) gta6rt_r[gta6rt_k] = %s[gta6rt_k];" % sg.group(1),
+        ind + "        for (uint gta6rt_k = 0u; gta6rt_k < 64u; ++gta6rt_k) gta6rt_r[128u + gta6rt_k] = %s[gta6rt_k];" % vg.group(1),
+        ind + "        gta6rt_r[192] = gl_WorkGroupID.x; gta6rt_r[193] = gl_NumWorkGroups.x; gta6rt_r[194] = %s;" % store.group(3),
+        ind + "        for (uint gta6rt_k = 0u; gta6rt_k < 32u; ++gta6rt_k) gta6rt_r[196u + gta6rt_k] = %s._m0[gta6rt_k];" % push,
+        ind + "        gta6rt_r[228] = %s._m1; gta6rt_r[229] = %s._m2;" % (push, push),
+        ind + "        for (uint gta6rt_q = 0u; gta6rt_q < 2u; ++gta6rt_q)",
+        ind + "        {",
+        ind + "            uint gta6rt_lo = %s[32u + gta6rt_q * 4u], gta6rt_hi = %s[33u + gta6rt_q * 4u] & 65535u;" % (sg.group(1), sg.group(1)),
+        ind + "            ulong gta6rt_b = (ulong(gta6rt_hi) << 32ul) | ulong(gta6rt_lo);",
+        ind + "            if (gta6rt_b == 0ul) continue;",
+        ind + "            device const uint* gta6rt_m = reinterpret_cast<const device uint*>(%s + ulong(long(gta6rt_b << ulong(16u)) >> long(16u)));" % hb,
+        ind + "            for (uint gta6rt_k = 0u; gta6rt_k < 8u; ++gta6rt_k) gta6rt_r[232u + gta6rt_q * 8u + gta6rt_k] = gta6rt_m[gta6rt_k];",
+        ind + "        }",
+        ind + "    }",
+        ind + "}",
+    ]
+    msl = msl[:store.end()] + "\n" + "\n".join(dump) + msl[store.end():]
+    msl = msl.replace(head.group(0), head.group(0)[:-1] + ", device atomic_uint* gta6rt_dbg)", 1)
+    call = re.compile(r"^(\s*)" + re.escape(fn) + r"\((.*)spvMeshSizes\);$", re.M)
+    msl, n = call.subn(lambda m: "%s%s(%sspvMeshSizes, gta6rt_dbg);" % (m.group(1), fn, m.group(2)), msl)
+    if n != 1:
+        return None, "helper called %d times" % n
+    return msl, None
 
 
 def instrument_pixel(msl):
@@ -171,7 +222,7 @@ def instrument_pixel(msl):
     return msl[:body_start] + body + msl[k:], None
 
 
-def build(out_dir, name, row, base_row):
+def build(out_dir, name, row, base_row, regs=False, only_if=None):
     stage = row[2]
     tmp = os.path.join(out_dir, "tmp", str(os.getpid()))
     r = {"name": name, "stage": stage}
@@ -186,7 +237,7 @@ def build(out_dir, name, row, base_row):
     packed = base_row is not None and "pack_threadgroup_vec3" in base_row[8]
     if packed:
         msl, _ = P.pack(msl, P.tg_bytes(msl)[1])
-    msl, why = (instrument_mesh if stage == "ms" else instrument_pixel)(msl)
+    msl, why = instrument_mesh(msl, regs, only_if) if stage == "ms" else instrument_pixel(msl)
     if msl is None:
         r["status"] = "skipped"
         r["error"] = why
@@ -238,6 +289,8 @@ def main():
     ap.add_argument("patterns", nargs="+")
     ap.add_argument("--base")
     ap.add_argument("--jobs", type=int, default=3)
+    ap.add_argument("--regs", action="store_true", help="mesh: also dump the registers at the output-count message")
+    ap.add_argument("--regs-if", type=int, help="with --regs: only groups whose scalar register N is non-zero")
     a = ap.parse_args()
     out_dir = os.path.abspath(a.out)
     head, rows = P.manifest_rows()
@@ -246,7 +299,7 @@ def main():
     names = [n for n, f in rows.items() if f[2] in ("ms", "ps") and any(p.search(n) for p in pats)]
     results = []
     with cf.ProcessPoolExecutor(max_workers=a.jobs) as ex:
-        futs = {ex.submit(build, out_dir, n, rows[n], base.get(n)): n for n in names}
+        futs = {ex.submit(build, out_dir, n, rows[n], base.get(n), a.regs, a.regs_if): n for n in names}
         for f in cf.as_completed(futs):
             try:
                 r = f.result()

@@ -347,36 +347,34 @@ void enumerate_containers(const fs::path& user_dir, std::string_view prefix, voi
 
 // ---- Reading blobs into the title's buffer ----
 //
-// The buffer is laid out as the GDK samples read it: an array of XGameSaveBlob, one per blob, whose info.name and
-// data point further into the same buffer (each blob's bytes 8-aligned, then its name).
+// The buffer is an array of XGameSaveBlob, one per blob, whose info.name and data point further into the same
+// buffer: each blob's name with its NUL, then its bytes, with no padding. Titles size the buffer of the sync
+// XGameSaveReadBlobData themselves as sizeof(XGameSaveBlob) + strlen(name) + 1 + size per blob (measured: the title
+// passes 337 bytes for one 296-byte blob named "Save Game Header"), so any padding makes the read fail.
 
 struct BlobRead {
     std::string name;
     std::vector<uint8_t> data;
 };
 
-size_t align8(size_t n) { return (n + 7) & ~size_t{7}; }
-
 size_t packed_size(const std::vector<BlobRead>& blobs) {
-    size_t n = align8(blobs.size() * sizeof(XGameSaveBlob));
-    for (const BlobRead& b : blobs) n += align8(b.data.size()) + align8(b.name.size() + 1);
+    size_t n = blobs.size() * sizeof(XGameSaveBlob);
+    for (const BlobRead& b : blobs) n += b.name.size() + 1 + b.data.size();
     return n;
 }
 
 void pack(const std::vector<BlobRead>& blobs, void* buffer) {
     auto* base = static_cast<uint8_t*>(buffer);
-    auto* entries = static_cast<XGameSaveBlob*>(buffer);
-    size_t at = align8(blobs.size() * sizeof(XGameSaveBlob));
+    size_t at = blobs.size() * sizeof(XGameSaveBlob);
     for (size_t i = 0; i < blobs.size(); ++i) {
-        uint8_t* data = base + at;
-        if (!blobs[i].data.empty()) std::memcpy(data, blobs[i].data.data(), blobs[i].data.size());
-        at += align8(blobs[i].data.size());
         char* name = reinterpret_cast<char*>(base + at);
         std::memcpy(name, blobs[i].name.c_str(), blobs[i].name.size() + 1);
-        at += align8(blobs[i].name.size() + 1);
-        entries[i].info.name = name;
-        entries[i].info.size = static_cast<uint32_t>(blobs[i].data.size());
-        entries[i].data = data;
+        at += blobs[i].name.size() + 1;
+        uint8_t* data = base + at;
+        if (!blobs[i].data.empty()) std::memcpy(data, blobs[i].data.data(), blobs[i].data.size());
+        at += blobs[i].data.size();
+        const XGameSaveBlob entry{{name, static_cast<uint32_t>(blobs[i].data.size())}, data};
+        std::memcpy(base + i * sizeof(XGameSaveBlob), &entry, sizeof entry);
     }
 }
 
@@ -891,13 +889,15 @@ HRESULT STDMETHODCALLTYPE save_read(void*, XGameSaveContainerHandle c, const cha
     std::lock_guard<std::recursive_mutex> lock(g_mutex);
     if (!live(g_containers, c)) return E_GS_HANDLE_EXPIRED;
     std::vector<BlobRead> blobs;
-    const HRESULT hr = read_blobs(c, names, names ? *count : 0, blobs);
+    HRESULT hr = read_blobs(c, names, names ? *count : 0, blobs);
     size_t bytes = 0;
     for (const BlobRead& b : blobs) bytes += b.data.size();
-    log_call("ReadBlobData(\"%s\", %s, buffer %zu) -> %#lx, %zu blob(s), %zu bytes", c->name.c_str(),
-             name_list(names, names ? *count : 0).c_str(), size, static_cast<unsigned long>(hr), blobs.size(), bytes);
+    const size_t need = packed_size(blobs);
+    if (SUCCEEDED(hr) && size < need) hr = E_GS_PROVIDED_BUFFER_TOO_SMALL;
+    log_call("ReadBlobData(\"%s\", %s, buffer %zu, needs %zu) -> %#lx, %zu blob(s), %zu bytes", c->name.c_str(),
+             name_list(names, names ? *count : 0).c_str(), size, need, static_cast<unsigned long>(hr), blobs.size(),
+             bytes);
     if (FAILED(hr)) return hr;
-    if (size < packed_size(blobs)) return E_GS_PROVIDED_BUFFER_TOO_SMALL;
     pack(blobs, out);
     *count = static_cast<uint32_t>(blobs.size());
     return S_OK;

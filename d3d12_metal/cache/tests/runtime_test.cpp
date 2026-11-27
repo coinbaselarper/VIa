@@ -46,6 +46,11 @@ int main(int argc, char** argv) {
         std::printf("SKIP: test shaders not in the store\n");
         return 77;
     }
+    const std::filesystem::path tier = dir.string() + "-tier";
+    std::filesystem::remove_all(tier);
+    std::filesystem::create_directories(tier);
+    ::setenv("GTA6RT_METAL_ARCHIVE_TIERS", tier.c_str(), 1);
+    ::setenv("GTA6RT_METAL_PCACHE_RELEASE_S", "3", 1);
     auto device = gta6rt::metal::create_device({});
     std::string log;
     CHECK(pc::open_archive(*device, dir.string(), "pcache runtime test", true, &log) == gpu::Status::ok);
@@ -86,6 +91,8 @@ int main(int argc, char** argv) {
     blit_bgra.rt_formats[0] = 87;
     gpu::RenderPipelineDesc blit_rgba16 = blit;
     blit_rgba16.rt_formats[0] = 10;
+    gpu::RenderPipelineDesc blit_tier = blit;
+    blit_tier.rt_formats[0] = 24;
     gpu::ComputePipelineDesc comp;
     comp.threads = {8, 8, 1};
 
@@ -101,6 +108,24 @@ int main(int argc, char** argv) {
         }
         CHECK(m.save((dir / "pcache-manifest.txt").string()));
         std::ofstream(dir / "pcache-bootstrap.txt") << "# test\nL\tlanding\t" << cs << "\n";
+        pc::Manifest t;
+        pc::Spec stale = pc::spec_of(blit_tier, vs, ps, content);
+        stale.content[1] = "0123456789abcdef";
+        pc::Entry e;
+        e.text = pc::encode(stale);
+        e.key = pc::key_of(e.text);
+        e.phase = pc::Phase::boot;
+        e.t = 1.5;
+        t.note(e);
+        gpu::RenderPipelineDesc blit_late = blit;
+        blit_late.rt_formats[0] = 2;
+        pc::Entry late;
+        late.text = pc::encode(pc::spec_of(blit_late, vs, ps, content));
+        late.key = pc::key_of(late.text);
+        late.phase = pc::Phase::boot;
+        late.t = 1000.0;
+        t.note(late);
+        CHECK(t.save((tier / "pcache-tier.txt").string()));
     }
 
     pc::StartConfig cfg;
@@ -119,7 +144,7 @@ int main(int argc, char** argv) {
         }
         return true;
     };
-    CHECK(wait_for([] { return pc::counters().prebuilt == 2; }, 60));
+    CHECK(wait_for([] { return pc::counters().prebuilt == 3; }, 60));
 
     int owner = 0;
     const auto refs = [&](auto& d) {
@@ -136,6 +161,14 @@ int main(int argc, char** argv) {
     CHECK(adopted && adopted->state() == gpu::PipelineState::ready);
     CHECK(pc::counters().adopted_ready == 1);
 
+    gpu::RenderPipelineDesc from_tier = blit_tier;
+    refs(from_tier);
+    from_tier.mode = gpu::CompileMode::async;
+    from_tier.not_ready = gpu::NotReady::skip;
+    auto tiered = pc::make_render(*device, from_tier, &owner, vs, ps);
+    CHECK(tiered && tiered->state() == gpu::PipelineState::ready);
+    CHECK(pc::counters().adopted_ready == 2);
+
     gpu::RenderPipelineDesc demand2 = blit_rgba16;
     demand2.mode = gpu::CompileMode::async;
     demand2.not_ready = gpu::NotReady::skip;
@@ -147,22 +180,24 @@ int main(int argc, char** argv) {
 
     pc::created(&owner, "", cs, comp, cs);
     CHECK(pc::counters().bootstrap_matched == 1);
-    CHECK(wait_for([] { return pc::counters().prebuilt == 3; }, 120));
+    CHECK(wait_for([] { return pc::counters().prebuilt == 4; }, 120));
     gpu::ComputePipelineDesc demand3 = comp;
     demand3.mode = gpu::CompileMode::async;
     demand3.cs = {library(cs, "cs", {}).library, "main0"};
     demand3.root = root.get();
     auto compute = pc::make_compute(*device, demand3, &owner, cs);
     CHECK(compute && compute->state() == gpu::PipelineState::ready);
-    CHECK(pc::counters().adopted_ready == 2);
+    CHECK(pc::counters().adopted_ready == 3);
+    CHECK(wait_for([] { return pc::report().find("1 released unused") != std::string::npos; }, 10));
 
     pc::flush("test");
     pc::forget(&owner);
     std::printf("%s\n", pc::report().c_str());
+    CHECK(pc::report().find(", 1 queued,") != std::string::npos);
     pc::Manifest back;
     std::string why;
     CHECK(back.load((dir / "pcache-manifest.txt").string(), &why));
-    CHECK(back.size() == 4);
+    CHECK(back.size() == 5);
     std::size_t twice = 0;
     for (const auto& e : back.ordered()) twice += e.runs == 2;
     CHECK(twice == 1);
@@ -170,6 +205,7 @@ int main(int argc, char** argv) {
     for (const auto& f : std::filesystem::directory_iterator(dir / "pcache-runs")) run_files += f.is_regular_file();
     CHECK(run_files == 1);
     pc::stop();
+    std::filesystem::remove_all(tier);
     CHECK(device->flush_pipeline_cache(nullptr) == gpu::Status::ok);
     std::printf("%s (%d failures)\n", failures ? "FAIL" : "PASS", failures);
     return failures ? 1 : 0;

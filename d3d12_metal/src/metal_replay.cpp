@@ -588,7 +588,7 @@ private:
         out_.set_code_base(p.code_base);
     }
     // The producer guard (MetalContext::guard_mode): a compute pass not recorded marks the buffer ranges its
-    // descriptor tables (any user-data word as a 32-bit table address, its first 16 descriptors decoded as V#s) and
+    // descriptor tables (any user-data word as a 32-bit table address, its first 1 KiB decoded as V#s) and
     // root pointers (a word pair resolving to a known buffer: from there to the buffer's end) name; when none, the
     // indirect work after it in this list is skipped instead.
     void producer_skipped(const char* name, Fate fate, const std::array<std::uint32_t, 32>& user_data) {
@@ -598,15 +598,15 @@ private:
         for (std::uint32_t i = 0; i < 32; ++i) {
             const std::uint64_t t = user_data[i] & ~3ull;
             if (t < 0x10000) continue;
-            std::uint32_t words[64];
-            if (read_va(t, words, sizeof words))
-                for (int k = 0; k < 64; k += 4) {
+            std::uint32_t words[256] = {};
+            if (read_va(t, words, sizeof words) || read_va(t, words, 64 * 4))
+                for (int k = 0; k < 256; k += 4) {
                     gfx10::BufferWords bw{words[k], words[k + 1], words[k + 2], words[k + 3]};
                     gfx10::Buffer v{};
                     if (!gfx10::decode(bw, v) || !v.num_records) continue;
                     const std::uint64_t base = std::uint64_t(std::int64_t(v.address << 16) >> 16);
                     const std::uint64_t bytes = v.stride ? std::uint64_t(v.stride) * v.num_records : v.num_records;
-                    if (!base || bytes > (1ull << 32) || !context_.knows_buffer_va(base)) continue;
+                    if (base < 0x10000 || !bytes || bytes > (1ull << 32)) continue;
                     context_.note_unproduced(base, base + bytes, name, false);
                     ++tables;
                 }
@@ -620,6 +620,21 @@ private:
         }
         context_.note_guard_pass(tables, pointers);
         if (!tables && !pointers) list_unknown_producer_ = name ? name : "?";
+        static std::atomic<int> shown{0};
+        if (context_.gpu_debug() && shown.fetch_add(1) < 6) {
+            std::string text;
+            char t[96];
+            for (std::uint32_t i = 0; i < 32; ++i) {
+                std::uint64_t n = 4;
+                gpu::Buffer* b = nullptr;
+                std::uint64_t off = 0;
+                const bool known = (user_data[i] & ~3u) >= 0x10000 && context_.buffer_at(user_data[i] & ~3u, n, b, off) && b;
+                std::snprintf(t, sizeof t, " %x%s", user_data[i], known ? (b->cpu_pointer() ? "(cpu)" : "(gpu)") : "");
+                text += t;
+            }
+            std::fprintf(stderr, "[rt] d3d12-metal: guard: %s skipped (%s), %u table and %u pointer ranges; user data%s\n",
+                         name ? name : "?", MetalContext::fate_name(fate), tables, pointers, text.c_str());
+        }
     }
     Fate guard(ResourceId args, std::uint64_t args_offset, std::uint64_t args_bytes, ResourceId count,
                std::uint64_t count_offset, const char*& why) {
@@ -917,6 +932,8 @@ private:
             return;
         }
         if (MetalContext::census_on()) context_.note_census(p.name, "indirect-draw");
+        if (p.mesh && context_.gpu_debug() && p.name && std::strstr(p.name, "MS_VS_TransformD_c5fd36bb"))
+            context_.gpu_debug()->note_table_slot(draw.user_data[9], 0x80);
         out_.execute_indirect(d);
         st.draws.fetch_add(1, std::memory_order_relaxed);
     }

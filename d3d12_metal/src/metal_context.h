@@ -275,6 +275,14 @@ public:
     SceneProbe* scene() const { return scene_.get(); }
     // Null unless GTA6RT_METAL_GPU_DEBUG is set (GpuDebug).
     GpuDebug* gpu_debug() const { return gpu_debug_.get(); }
+    // Diagnostics: the title address a shader VA inside a console descriptor heap's GPU copy was copied from.
+    void set_console_source(std::function<bool(std::uint64_t, std::uint64_t&)> f) { console_source_ = std::move(f); }
+    bool console_source(std::uint64_t va, std::uint64_t& title) const { return console_source_ && console_source_(va, title); }
+    // Diagnostics: the title address and size a descriptor slot that Create*View wrote with no records stood for.
+    void set_view_source(std::function<bool(std::uint64_t, std::uint64_t&, std::uint64_t&)> f) { view_source_ = std::move(f); }
+    bool view_source(std::uint64_t slot, std::uint64_t& target, std::uint64_t& bytes) const {
+        return view_source_ && view_source_(slot, target, bytes);
+    }
 
 private:
     friend class MetalQueue;
@@ -335,6 +343,8 @@ private:
     std::map<gpu::Fence*, std::uint64_t> submitted_;
     std::unique_ptr<SceneProbe> scene_;
     std::unique_ptr<GpuDebug> gpu_debug_;
+    std::function<bool(std::uint64_t, std::uint64_t&)> console_source_;
+    std::function<bool(std::uint64_t, std::uint64_t&, std::uint64_t&)> view_source_;
 };
 
 // GTA6RT_METAL_GPU_DEBUG=1: a 64 KiB shared buffer bound at Metal buffer index 30 of every object, mesh and fragment
@@ -344,11 +354,24 @@ private:
 // clears it (the device's work report).
 class GpuDebug {
 public:
-    static std::unique_ptr<GpuDebug> create(gpu::Device& device);
+    static std::unique_ptr<GpuDebug> create(MetalContext& context);
     std::string take_report();
+    // Replay, when it records an indirect mesh draw: the 16 bytes at a descriptor-table address (user data 9 + 0x80,
+    // the draw header's V#) in the arena copy and in the title's heap, as they are at record time.
+    void note_table_slot(std::uint32_t table, std::uint32_t offset);
 
 private:
+    struct Snapshot {
+        std::uint32_t arena[4]{}, title[4]{};
+        bool title_read = false;
+        std::chrono::steady_clock::time_point at{};
+    };
+    std::string describe_va(std::uint64_t va) const;
+    MetalContext* context_ = nullptr;
     std::unique_ptr<gpu::Buffer> buffer_;
+    std::mutex mutex_;
+    std::unordered_map<std::uint64_t, Snapshot> snapshots_;
+    std::uint64_t slot_kinds_[2][4]{};  // [arena, title][valid, null with format, all zero, unread]
 };
 
 // The frame's render-resolution targets, seen by replay (GTA6RT_METAL_SCENE_SIZE, default 1280x720): the HDR colour

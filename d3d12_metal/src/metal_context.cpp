@@ -1,6 +1,9 @@
 #include "metal_context.h"
 #include "present_dump.h"
 #include "vulkan_gpu_labels.h"
+#include "gfx10_descriptors.h"
+#include "title_texture_memory.h"
+#include "title_va_alias.h"
 
 #include <gta6rt_metal/metal_backend.h>
 
@@ -15,7 +18,7 @@ namespace leonida {
 
 MetalContext::MetalContext(gpu::Device& device) : device_(device) {
     scene_ = SceneProbe::create(*this);
-    gpu_debug_ = GpuDebug::create(device);
+    gpu_debug_ = GpuDebug::create(*this);
 }
 
 MetalContext::~MetalContext() = default;
@@ -1184,10 +1187,12 @@ gpu::Texture* SceneProbe::present_source(float& exposure) {
 }
 
 
-std::unique_ptr<GpuDebug> GpuDebug::create(gpu::Device& device) {
+std::unique_ptr<GpuDebug> GpuDebug::create(MetalContext& context) {
     const char* v = std::getenv("GTA6RT_METAL_GPU_DEBUG");
     if (!v || !*v || *v == '0') return nullptr;
+    gpu::Device& device = context.gpu();
     auto out = std::make_unique<GpuDebug>();
+    out->context_ = &context;
     gpu::BufferDesc d;
     d.size = 64 * 1024;
     d.memory = gpu::MemoryKind::shared;
@@ -1210,9 +1215,9 @@ std::unique_ptr<GpuDebug> GpuDebug::create(gpu::Device& device) {
 
 std::string GpuDebug::take_report() {
     auto* w = static_cast<volatile std::uint32_t*>(buffer_->cpu_pointer());
-    std::uint32_t c[512];
-    for (int i = 0; i < 512; ++i) c[i] = w[i];
-    for (int i = 0; i < 512; ++i) w[i] = 0;
+    static std::uint32_t c[2048];
+    for (int i = 0; i < 2048; ++i) c[i] = w[i];
+    for (int i = 0; i < 2048; ++i) w[i] = 0;
     std::string out;
     char t[256];
     for (int k = 0; k < 2; ++k) {
@@ -1262,6 +1267,202 @@ std::string GpuDebug::take_report() {
         std::snprintf(t, sizeof t, "%spixel (debug variants): invocations %u, discards %u, returns %u",
                       out.empty() ? "" : "; ", c[160], c[161], c[162]);
         out += t;
+    }
+    {
+        std::lock_guard lock(mutex_);
+        const auto* a = slot_kinds_[0];
+        const auto* w = slot_kinds_[1];
+        if (a[0] + a[1] + a[2] + a[3]) {
+            std::snprintf(t, sizeof t,
+                          "%sheader V# slots (user data 9 + 0x80) at record time: arena %llu valid, %llu null V#, %llu "
+                          "zero, %llu unread; title heap %llu / %llu / %llu / %llu",
+                          out.empty() ? "" : "; ", (unsigned long long)a[0], (unsigned long long)a[1],
+                          (unsigned long long)a[2], (unsigned long long)a[3], (unsigned long long)w[0],
+                          (unsigned long long)w[1], (unsigned long long)w[2], (unsigned long long)w[3]);
+            out += t;
+        }
+        std::memset(slot_kinds_, 0, sizeof slot_kinds_);
+    }
+    for (std::uint32_t slot = 0; slot < std::min<std::uint32_t>(c[134], 4); ++slot) {
+        const std::uint32_t* r = c + 1024 + slot * 256;
+        std::snprintf(t, sizeof t, "\n    registers at the output-count message, group %u of %u, m0 0x%x (%u vertices, %u "
+                                   "primitives); heap base 0x%llx; user data", r[192], r[193], r[194], r[194] & 4095,
+                      (r[194] >> 12) & 4095, static_cast<unsigned long long>((std::uint64_t(r[229]) << 32) | r[228]));
+        out += t;
+        for (int k = 0; k < 32; ++k) {
+            std::snprintf(t, sizeof t, " %x", r[196 + k]);
+            out += t;
+        }
+        out += "\n    s:";
+        for (int k = 0; k < 128; ++k)
+            if (r[k]) {
+                std::snprintf(t, sizeof t, " s%d=%x", k, r[k]);
+                out += t;
+            }
+        out += "\n    v (lane 0):";
+        for (int k = 0; k < 64; ++k)
+            if (r[128 + k]) {
+                std::snprintf(t, sizeof t, " v%d=%x", k, r[128 + k]);
+                out += t;
+            }
+        for (int k = 0; k < 32; ++k)
+            if (r[196 + k] >= 0x10000) {
+                std::snprintf(t, sizeof t, "\n    user data %d = 0x%x: ", k, r[196 + k]);
+                out += t + describe_va(r[196 + k]);
+            }
+        for (int q = 0; q < 2; ++q) {
+            const std::uint64_t base = (std::uint64_t(r[33 + q * 4] & 0xffff) << 32) | r[32 + q * 4];
+            if (!base) continue;
+            std::snprintf(t, sizeof t, "\n    the GPU reads at the base of s[%d:%d] (0x%llx):", 32 + q * 4, 35 + q * 4,
+                          static_cast<unsigned long long>(base));
+            out += t;
+            for (int k = 0; k < 8; ++k) {
+                std::snprintf(t, sizeof t, " %08x", r[232 + q * 8 + k]);
+                out += t;
+            }
+        }
+        if (r[196 + 8] >= 0x10000) {
+            const std::uint64_t slot = std::uint64_t(r[196 + 8] & ~3u) + 0x600;
+            std::snprintf(t, sizeof t, "\n    user data 8 + 0x600 (the V# of s[36:39]): ");
+            out += t + describe_va(slot);
+            std::uint64_t title = 0;
+            if (context_->console_source(slot, title) && texture_memory_readable(std::uintptr_t(title), 16)) {
+                std::uint32_t w[4];
+                std::memcpy(w, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(title)), sizeof w);
+                std::snprintf(t, sizeof t, "\n      the title wrote it at 0x%llx: %08x %08x %08x %08x",
+                              static_cast<unsigned long long>(title), w[0], w[1], w[2], w[3]);
+                out += t;
+            }
+        }
+        if (r[196 + 9] >= 0x10000) {
+            const std::uint64_t slot = std::uint64_t(r[196 + 9] & ~3u) + 128;
+            std::snprintf(t, sizeof t, "\n    user data 9 + 0x80 (the V# of s[32:35], the draw header): ");
+            out += t + describe_va(slot);
+            {
+                std::lock_guard lock(mutex_);
+                const auto it = snapshots_.find(slot);
+                if (it != snapshots_.end()) {
+                    const Snapshot& s = it->second;
+                    const double ago = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - s.at).count();
+                    std::snprintf(t, sizeof t, "\n      when replay recorded the draw (%.0f ms ago): arena %08x %08x %08x %08x, title ",
+                                  ago, s.arena[0], s.arena[1], s.arena[2], s.arena[3]);
+                    out += t;
+                    if (s.title_read) {
+                        std::snprintf(t, sizeof t, "%08x %08x %08x %08x", s.title[0], s.title[1], s.title[2], s.title[3]);
+                        out += t;
+                    } else {
+                        out += "unread";
+                    }
+                } else {
+                    out += "\n      no record-time copy of this slot";
+                }
+            }
+            std::uint64_t title = 0;
+            if (context_->console_source(slot, title) && texture_memory_readable(std::uintptr_t(title), 16)) {
+                std::uint32_t w[4];
+                std::memcpy(w, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(title)), sizeof w);
+                gfx10::BufferWords bw{w[0], w[1], w[2], w[3]};
+                gfx10::Buffer b{};
+                const bool v = gfx10::decode(bw, b);
+                const std::uint64_t base = std::uint64_t(std::int64_t(b.address << 16) >> 16);
+                std::snprintf(t, sizeof t, "\n      the title wrote it at 0x%llx: %08x %08x %08x %08x%s base 0x%llx stride %u records %u: ",
+                              static_cast<unsigned long long>(title), w[0], w[1], w[2], w[3], v ? " (a V#)" : " (not a V#)",
+                              static_cast<unsigned long long>(base), b.stride, b.num_records);
+                out += t + describe_va(base);
+                std::uint64_t target = 0, bytes = 0;
+                if (context_->view_source(title, target, bytes)) {
+                    std::snprintf(t, sizeof t, "\n      Create*View wrote it with no records for title 0x%llx (%llu bytes): ",
+                                  static_cast<unsigned long long>(target), static_cast<unsigned long long>(bytes));
+                    out += t + describe_va(target);
+                }
+            }
+        }
+        for (int k = 0; k + 3 < 128; k += 4) {
+            gfx10::BufferWords bw{r[k], r[k + 1], r[k + 2], r[k + 3]};
+            gfx10::Buffer b{};
+            if (!gfx10::decode(bw, b) || !b.address || !b.num_records) continue;
+            const std::uint64_t base = std::uint64_t(std::int64_t(b.address << 16) >> 16);
+            std::snprintf(t, sizeof t, "\n    V# s[%d:%d]: base 0x%llx stride %u records %u: ", k, k + 3,
+                          static_cast<unsigned long long>(base), b.stride, b.num_records);
+            out += t + describe_va(base);
+        }
+    }
+    return out;
+}
+
+void GpuDebug::note_table_slot(std::uint32_t table, std::uint32_t offset) {
+    const std::uint64_t slot = std::uint64_t(table & ~3u) + offset;
+    if (slot < 0x10000) return;
+    Snapshot s;
+    s.at = std::chrono::steady_clock::now();
+    std::uint64_t n = 16, off = 0;
+    gpu::Buffer* b = nullptr;
+    const bool arena_read = context_->buffer_at(slot, n, b, off) && b && b->cpu_pointer() && n >= 16;
+    if (arena_read) std::memcpy(s.arena, static_cast<const std::uint8_t*>(b->cpu_pointer()) + off, 16);
+    std::uint64_t title = 0;
+    s.title_read = context_->console_source(slot, title) && texture_memory_readable(std::uintptr_t(title), 16);
+    if (s.title_read) std::memcpy(s.title, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(title)), 16);
+    const auto kind = [](const std::uint32_t* w, bool read) {
+        if (!read) return 3;
+        if (!w[0] && !w[1] && !w[2] && !w[3]) return 2;
+        return (w[0] || (w[1] & 0xffff)) && w[2] ? 0 : 1;
+    };
+    std::lock_guard lock(mutex_);
+    ++slot_kinds_[0][kind(s.arena, arena_read)];
+    ++slot_kinds_[1][kind(s.title, s.title_read)];
+    if (snapshots_.size() >= 65536) snapshots_.clear();
+    snapshots_[slot] = s;
+}
+
+std::string GpuDebug::describe_va(std::uint64_t va) const {
+    std::string out;
+    char t[192];
+    std::uint64_t n = 32;
+    gpu::Buffer* b = nullptr;
+    std::uint64_t off = 0;
+    const auto words = [&](const std::uint8_t* p) {
+        std::uint32_t w[8];
+        std::memcpy(w, p, sizeof w);
+        for (int i = 0; i < 8; ++i) {
+            std::snprintf(t, sizeof t, " %08x", w[i]);
+            out += t;
+        }
+    };
+    if (context_->buffer_at(va, n, b, off) && b) {
+        std::snprintf(t, sizeof t, "replay finds %s (+0x%llx, %llu bytes on)", b == context_->arena_buffer() ? "the arena" : "a buffer",
+                      static_cast<unsigned long long>(off), static_cast<unsigned long long>(n));
+        out += t;
+        if (b->cpu_pointer() && n >= 32) {
+            out += ", CPU view:";
+            words(static_cast<const std::uint8_t*>(b->cpu_pointer()) + off);
+        }
+    } else {
+        out += "replay finds nothing";
+    }
+    std::uint64_t lo = 0, hi = 0, shader = 0, room = 0;
+    if (title_va_aliases().title_memory(va, lo, hi)) {
+        std::snprintf(t, sizeof t, "; title memory [0x%llx, 0x%llx)", static_cast<unsigned long long>(lo),
+                      static_cast<unsigned long long>(hi));
+        out += t;
+        if (hi - va >= 32 && texture_memory_readable(std::uintptr_t(va), 32)) {
+            out += ", title bytes:";
+            words(reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(va)));
+        }
+    }
+    if (title_va_aliases().range_of(va, shader, room)) {
+        std::snprintf(t, sizeof t, "; alias -> shader VA 0x%llx (%llu bytes)", static_cast<unsigned long long>(shader),
+                      static_cast<unsigned long long>(room));
+        out += t;
+    }
+    std::uint64_t source = 0, source_room = 0;
+    if (title_va_aliases().source_of_vsharp(va, source, source_room)) {
+        std::snprintf(t, sizeof t, "; as a shader VA it is title 0x%llx (%llu bytes on)", static_cast<unsigned long long>(source),
+                      static_cast<unsigned long long>(source_room));
+        out += t;
+        if (source_room >= 32 && texture_memory_readable(std::uintptr_t(source), 32)) {
+            out += ", bytes there:";
+            words(reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(source)));
+        }
     }
     return out;
 }

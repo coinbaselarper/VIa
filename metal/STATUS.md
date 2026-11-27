@@ -1,5 +1,21 @@
 # gta6rt_metal status (S5.1, round 2)
 
+## Round 8 additions (made by port/d3d12_metal, gates worker; api_version stays 5, no interface change)
+
+- **Commit gate** (`mtl_queue.mm`, `GTA6RT_METAL_COMMIT_GATE`, default on): a command buffer whose event waits (a
+  `Queue::wait` on another queue's or the CPU's fence, a present's waits, `wait_value`'s CPU-released gate) are unmet
+  when `end_command_buffer` runs is `enqueue`d, not committed, and committed from a listener of its own once every
+  event reached its value; Metal holds the queue's later command buffers on the CPU behind it (enqueue order;
+  measured). No command buffer waits on the GPU for anything but its own queue, so the watchdog never sees a waiting
+  command buffer (port/d3d12_metal STATUS round 8: 0 timeouts in 257 + 313 s of world). The budget monitor skips a
+  queue while its first command buffer is held and logs "has been held on the CPU" past the budget.
+- **Reports** every `GTA6RT_METAL_GPU_REPORT_S` (10 s, 0 off) from the monitor thread: GPU busy time per queue and
+  over all queues (union of GPUStartTime..GPUEndTime) per presented frame; commit-gate holds; GPU writes this backend
+  encodes into bytesNoCopy title buffers (labels "title ...", "slot-133 ...") by kind (`GTA6RT_METAL_TITLE_WRITES=0`
+  off). `GTA6RT_METAL_TAIL_WATCH=<lo>,<hi>` (hex, off): a thread reading every 64 KiB tail in the range every 20 ms
+  for the title pool-node fault (exe+0x4e9b54a), naming the command buffers that completed before a change.
+- Tests: `build/gates-x86_64/tests/test_commit_gate.cpp` (not in the ctest suite; links `libgta6rt_metal.a`) PASS.
+
 ## Round 7 additions (made by port/d3d12_metal; api_version stays 5, all additive)
 
 - `PresentPlane::tone_exposure` (> 0): the plane is HDR linear colour, drawn as 1 - exp(-c * exposure), sRGB encoded,

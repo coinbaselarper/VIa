@@ -9,7 +9,8 @@
 #
 # Environment:
 #   S3_SAVES=imported (default)  the user's save set, imported into run/saves by s3_import_saves.py (idempotent), with
-#                                its persistent local storage in run/overlay; the default run dir
+#                                its persistent local storage in run/overlay; the default run dir. The title gets a
+#                                fresh copy of run/saves in run/s3-saves/NAME, so it never writes the imported set
 #   S3_SAVES=empty               a fresh run dir run/fresh/NAME (no saves, no settings: the new-game path); the
 #                                pipeline cache stays the shared one
 #   S3_FLOW=save|newgame         the default presses (save: A every 5 s from 40 s; newgame: also the legal pages;
@@ -40,7 +41,11 @@ case "${S3_SAVES:-imported}" in
     imported)
         python3 -I "$port/host/tools/s3_import_saves.py" "$savesrc" >"$port/run/logs/$name.import.log" 2>&1 || {
             cat "$port/run/logs/$name.import.log" >&2; exit 2; }
-        export LEONIDA_SAVE_DIR="$port/run/saves" ;;
+        work="$port/run/s3-saves/$name"
+        rm -rf "$work"
+        mkdir -p "$port/run/s3-saves"
+        cp -R "$port/run/saves" "$work" || exit 2
+        export LEONIDA_SAVE_DIR="$work" ;;
     empty)
         fresh="$port/run/fresh/$name"
         rm -rf "$fresh"

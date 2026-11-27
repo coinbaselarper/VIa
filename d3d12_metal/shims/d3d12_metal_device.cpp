@@ -2015,8 +2015,27 @@ struct DeviceState {
     std::vector<ExternalBlock> external_blocks;
     std::uint64_t external_bytes = 0, external_live = 0, external_reused = 0;
     std::uint64_t external_reserved_bytes = 0, external_va_taken = 0;
+    std::uint64_t external_set_aside_bytes = 0, external_spacer_bytes = 0, external_spacers = 0, external_refused = 0;
     std::vector<std::unique_ptr<leonida::gpu::Buffer>> external_set_aside;
     std::mutex external_mutex;
+    // Where process memory from `va` on leaves a gap of at least `need` bytes (0: none found in 256 regions).
+    static std::uint64_t free_gap_from(std::uint64_t va, std::uint64_t need) {
+        mach_vm_address_t at = va;
+        std::uint64_t gap_start = va;
+        for (int i = 0; i < 256; ++i) {
+            mach_vm_size_t size = 0;
+            vm_region_basic_info_data_64_t info{};
+            mach_msg_type_number_t n = VM_REGION_BASIC_INFO_COUNT_64;
+            mach_port_t object = MACH_PORT_NULL;
+            if (mach_vm_region(mach_task_self(), &at, &size, VM_REGION_BASIC_INFO_64,
+                               reinterpret_cast<vm_region_info_t>(&info), &n, &object) != KERN_SUCCESS)
+                return gap_start;
+            if (at >= gap_start + need) return gap_start;
+            gap_start = at + size;
+            at = gap_start;
+        }
+        return 0;
+    }
     void external_release(const leonida::gpu::Buffer* buffer, std::uint64_t in_block, std::uint64_t bytes) {
         std::lock_guard lock(external_mutex);
         for (ExternalBlock& b : external_blocks)
@@ -2063,6 +2082,20 @@ struct DeviceState {
             const char* v = std::getenv("GTA6RT_METAL_EXTERNAL_RESERVE_VA");
             return !v || std::strcmp(v, "0") != 0;
         }();
+        // A block set aside is kept out of the residency set and never touched, so it costs no footprint (it was
+        // wired before: 256-511 of them, 1.8-2.8 GiB, in world runs). Metal's GPU VAs follow its allocations while the
+        // CPU mappings of shared memory sit in the same numbers, so after a collision a private spacer (GPU VA only,
+        // no CPU mapping, untouched) moves the next block's shader VA past the occupied CPU range.
+        // GTA6RT_METAL_EXTERNAL_SPACER=0: no spacer; GTA6RT_METAL_EXTERNAL_SET_ASIDE_RESIDENT=1: the old residency.
+        static const bool spacer_on = [] {
+            const char* v = std::getenv("GTA6RT_METAL_EXTERNAL_SPACER");
+            return !v || std::strcmp(v, "0") != 0;
+        }();
+        static const bool old_residency = [] {
+            const char* v = std::getenv("GTA6RT_METAL_EXTERNAL_SET_ASIDE_RESIDENT");
+            return v && std::strcmp(v, "1") == 0;
+        }();
+        d.resident = !reserve || old_residency;
         for (int attempt = 0;; ++attempt) {
             b.buffer = gpu->create_buffer(d);
             if (!b.buffer || !b.buffer->cpu_pointer() || !b.buffer->host_gpu_address()) return false;
@@ -2073,20 +2106,46 @@ struct DeviceState {
                 mach_vm_map(mach_task_self(), &at, b.capacity, 0, VM_FLAGS_FIXED, MEMORY_OBJECT_NULL, 0, FALSE,
                             VM_PROT_NONE, VM_PROT_NONE, VM_INHERIT_NONE) == KERN_SUCCESS) {
                 external_reserved_bytes += b.capacity;
+                if (!d.resident) gta6rt::metal::make_resident(gpu.get(), b.buffer.get());
                 break;
             }
             ++external_va_taken;
+            external_set_aside_bytes += b.capacity;
             if (external_va_taken <= 8 || !(external_va_taken & (external_va_taken - 1)))
                 std::fprintf(stderr, "[rt] d3d12-metal: a block outside the arena at shader VA 0x%llx (%llu KiB) overlaps "
-                                     "memory of this process; set aside (%llu so far)\n",
+                                     "memory of this process; set aside (%llu so far, %.0f MiB, %s; spacers %llu, %.0f "
+                                     "MiB of GPU VA)\n",
                              static_cast<unsigned long long>(b.shader_va),
                              static_cast<unsigned long long>(b.capacity >> 10),
-                             static_cast<unsigned long long>(external_va_taken));
+                             static_cast<unsigned long long>(external_va_taken),
+                             double(external_set_aside_bytes) / 1048576.0,
+                             d.resident ? "resident" : "not resident", static_cast<unsigned long long>(external_spacers),
+                             double(external_spacer_bytes) / 1048576.0);
+            const bool upward = b.buffer->host_gpu_address() > arena.address;
             external_set_aside.push_back(std::move(b.buffer));
-            if (attempt >= 15) {
+            if (attempt >= 47) {
+                ++external_refused;
                 std::fprintf(stderr, "[rt] d3d12-metal: no block outside the arena with a free shader-VA range after %d "
-                                     "tries; the buffer is refused\n", attempt + 1);
+                                     "tries; the buffer is refused (%llu refused so far)\n",
+                             attempt + 1, static_cast<unsigned long long>(external_refused));
                 return false;
+            }
+            // Spacers count in Metal's allocated size, which the governor and DXGI's budget read: 2 GiB in all.
+            if (!spacer_on || !upward || external_spacer_bytes >= (2ull << 30)) continue;
+            const std::uint64_t gap = free_gap_from(b.shader_va, b.capacity + (256ull << 20));
+            if (!gap || gap <= b.shader_va + b.capacity) continue;
+            const std::uint64_t limit = std::min<std::uint64_t>((2ull << 30) - external_spacer_bytes, 512ull << 20);
+            const std::uint64_t shift = std::min(limit, (gap - b.shader_va - b.capacity + (64ull << 20) + 0xffff) & ~0xffffull);
+            leonida::gpu::BufferDesc sd;
+            sd.size = shift;
+            sd.memory = leonida::gpu::MemoryKind::device_local;
+            sd.usage = leonida::gpu::usage::copy;
+            sd.label = "shader-VA spacer for blocks outside the arena";
+            sd.resident = false;
+            if (auto spacer = gpu->create_buffer(sd)) {
+                ++external_spacers;
+                external_spacer_bytes += shift;
+                external_set_aside.push_back(std::move(spacer));
             }
         }
         b.mapped = static_cast<std::uint8_t*>(b.buffer->cpu_pointer());
@@ -2196,12 +2255,19 @@ struct DeviceState {
     std::vector<std::unique_ptr<leonida::gpu::Buffer>> in_place_windows;
     std::uint64_t in_place_window_bytes = 0;
     std::uint64_t title_window_in_place(std::uint64_t va, std::uint64_t want, std::uint64_t lo, std::uint64_t hi) {
+        // GTA6RT_METAL_TITLE_WINDOWS_IN_PLACE: 1 = [4 GiB, 0x7f00'0000'0000), "all", "low" = [arena size, 4 GiB) only
+        // (the title's own VirtualAlloc'd low memory; 1 and "all" ended runs in a SIGBUS: d3m-r5-e, d3m-s3-b, d3m-s8-f),
+        // "soft" = only for the ambiguous V#s GTA6RT_METAL_VSHARP_TITLE_FIRST=soft takes as the title's.
         static const int mode = [] {
             const char* v = std::getenv("GTA6RT_METAL_TITLE_WINDOWS_IN_PLACE");
-            return !v || !*v || std::strcmp(v, "0") == 0 ? 0 : std::strcmp(v, "all") == 0 ? 2 : 1;
+            return !v || !*v || std::strcmp(v, "0") == 0 ? 0 : std::strcmp(v, "all") == 0 ? 2
+                                                           : std::strcmp(v, "low") == 0 ? 3
+                                                           : std::strcmp(v, "soft") == 0 ? 4 : 1;
         }();
         if (!mode || !gpu || !context) return 0;
+        if (mode == 4 && (!soft_in_place || va < arena.size)) return 0;
         if (mode == 1 && (va < (1ull << 32) || va >= 0x7f0000000000ull)) return 0;
+        if (mode == 3 && (va < arena.size || va >= (1ull << 32))) return 0;
         const std::uint64_t page = gpu->caps().host_page_size ? gpu->caps().host_page_size : 4096;
         const std::uint64_t start = va & ~(page - 1);
         if (start < lo || hi <= va) return 0;
@@ -2237,6 +2303,7 @@ struct DeviceState {
         }
         const std::uint64_t shader = buffer->host_gpu_address() - arena.address;
         context->add_va_range(shader, d.size, buffer.get(), 0);
+        backing(buffer->host_gpu_address(), d.size, shader, true);
         leonida::title_va_aliases().add(start, d.size, shader);
         leonida::metal_ledger::add_imported(d.size);
         in_place_window_bytes += d.size;
@@ -2776,8 +2843,46 @@ struct DeviceState {
         }();
         return on;
     }
+    // GTA6RT_METAL_VSHARP_TITLE_FIRST=soft: an ambiguous base in a record the layer did not write (or the address a
+    // Create*View call gets from the title) is taken as the title's only when a backing can be made for it; otherwise
+    // the raw base stays, as with the rule off, so no zero-record V# is added (=1 added ~32k, which world compute
+    // passes spun on until the GPU watchdog fired: d3m-s8-e).
+    static bool vsharp_title_soft() {
+        static const bool on = [] {
+            const char* v = std::getenv("GTA6RT_METAL_VSHARP_TITLE_FIRST");
+            return v && std::strcmp(v, "soft") == 0;
+        }();
+        return on;
+    }
+    std::atomic<uint64_t> soft_rebased{0}, soft_kept{0};
+    // Under GTA6RT_METAL_GPU_DEBUG: the title address each descriptor slot Create*View wrote as no records stood for.
+    std::mutex unbacked_slot_mutex;
+    std::unordered_map<std::uint64_t, std::pair<std::uint64_t, std::uint64_t>> unbacked_slots;
+    void note_unbacked_slot(std::uint64_t slot, std::uint64_t target, std::uint64_t bytes) {
+        if (!context || !context->gpu_debug()) return;
+        std::lock_guard lock(unbacked_slot_mutex);
+        if (unbacked_slots.size() > (1u << 20)) unbacked_slots.clear();
+        unbacked_slots[slot] = {target, bytes};
+    }
+    static inline thread_local bool soft_in_place = false;
+    // Under GTA6RT_METAL_GPU_DEBUG: the first 24 V# bases in GTA6RT_METAL_VSHARP_SOFT_RANGE, with what the rules found.
+    bool vsharp_trace(uint64_t base) {
+        static std::atomic<int> traced{0};
+        return context && context->gpu_debug() && soft_range(base) && std::getenv("GTA6RT_METAL_VSHARP_SOFT_RANGE") &&
+               traced.fetch_add(1) < 24;
+    }
+    // GTA6RT_METAL_VSHARP_SOFT_RANGE=<lo>-<hi> (hex): the soft rule only for bases in [lo, hi).
+    static bool soft_range(uint64_t base) {
+        static const std::pair<uint64_t, uint64_t> range = [] {
+            const char* v = std::getenv("GTA6RT_METAL_VSHARP_SOFT_RANGE");
+            unsigned long long lo = 0, hi = ~0ull;
+            if (v && std::sscanf(v, "%llx-%llx", &lo, &hi) != 2) lo = 0, hi = ~0ull;
+            return std::pair<uint64_t, uint64_t>{lo, hi};
+        }();
+        return base >= range.first && base < range.second;
+    }
     void note_layer_vsharp(const uint32_t* w) {
-        if (!vsharp_title_first() || (w[3] >> 30) || !w[2]) return;
+        if ((!vsharp_title_first() && !vsharp_title_soft()) || (w[3] >> 30) || !w[2]) return;
         std::lock_guard lock(layer_vsharp_mutex);
         if (layer_vsharps.size() >= (1u << 21)) {
             std::fprintf(stderr, "[rt] d3d12-metal: %zu V# records written by the layer: the set starts over\n",
@@ -2791,8 +2896,51 @@ struct DeviceState {
         return layer_vsharps.count({w[0], w[1], w[2], w[3]}) != 0;
     }
 
+    // LEONIDA_CONSOLE_FREE_CACHE (1 by default, 0: off): while a console heap is refreshed, an address the title-memory
+    // table misses is looked up once more to find the free range around it (gta6rt_vm_query: no os region and no host
+    // mapping there), and later misses in that range take the answer without the probe (a VM-table lock and two
+    // mach_vm_region calls, ~4 us; ~1,000 a refresh in the world, the bases of title data read as V#s). The ranges are
+    // forgotten when a refresh starts and before the re-fix of live V#s. A V# the title wrote names memory it
+    // allocated before writing it, so before the scan that read it: a range free when the refresh looked is not where a
+    // real V# of this refresh points.
+    static inline thread_local bool console_refresh_thread = false;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> refresh_free_ranges;  // [lo, hi), on the refreshing thread
+    std::uint64_t refresh_free_hits = 0, refresh_free_misses = 0;
+    static bool refresh_free_cache_on() {
+        static const bool on = [] {
+            char text[4] = {};
+            if (GetEnvironmentVariableA("LEONIDA_CONSOLE_FREE_CACHE", text, sizeof(text)) > 0) return text[0] != '0';
+            return true;
+        }();
+        return on;
+    }
+    bool title_memory_during_refresh(leonida::TitleVaAliases& aliases, uint64_t va, uint64_t& lo, uint64_t& hi) {
+        if (!console_refresh_thread || !refresh_free_cache_on()) return aliases.title_memory(va, lo, hi);
+        for (const auto& [from, to] : refresh_free_ranges)
+            if (va - from < to - from) {
+                ++refresh_free_hits;
+                return false;
+            }
+        if (aliases.title_memory(va, lo, hi)) return true;
+        ++refresh_free_misses;
+        constexpr std::uint64_t kUserEnd = 1ull << 47;
+        if (va >= kUserEnd) {
+            if (refresh_free_ranges.size() < 64) refresh_free_ranges.emplace_back(kUserEnd, UINT64_MAX);
+            return false;
+        }
+        gta6rt_vm_region region{};
+        if (gta6rt_vm_query(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(va)), &region) == GTA6RT_OK &&
+            region.state == GTA6RT_VM_STATE_FREE && region.size) {
+            const std::uint64_t from = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(region.base));
+            if (va >= from && va - from < region.size && refresh_free_ranges.size() < 64)
+                refresh_free_ranges.emplace_back(from, from + region.size);
+        }
+        return false;
+    }
+
     uint64_t vsharp_address(uint64_t base, uint64_t bytes, leonida::TitleVaAliases::Kind kind = leonida::TitleVaAliases::created_view,
-                            bool make_window = true, bool try_geometry = false, bool title_first = false) {
+                            bool make_window = true, bool try_geometry = false, bool title_first = false,
+                            bool soft = vsharp_title_soft()) {
         if (!base || !bytes) return 0;
         auto& aliases = leonida::title_va_aliases();
         constexpr uint64_t mask = (1ull << 48) - 1;
@@ -2817,14 +2965,32 @@ struct DeviceState {
             return geometry.cap() && geometry.lookup(bda, host, room) && room >= bytes;
         };
         uint64_t to{}, room{};
+        const bool traced = soft && vsharp_trace(base);
         if (aliases.range_of(base, to, room)) {
+            if (traced)
+                std::fprintf(stderr, "[rt] d3d12-metal: V# trace 0x%llx (%llu bytes): alias -> 0x%llx (%llu bytes), backed %d\n",
+                             (unsigned long long)base, (unsigned long long)bytes, (unsigned long long)to,
+                             (unsigned long long)room, int(to && backed(to)));
             if (!to || room < bytes || !backed(to)) return 0;
             aliases.note_translation(kind);
             return to;
         }
         uint64_t lo{}, hi{};
-        const bool title = aliases.title_memory(base, lo, hi) && bytes <= hi - base;
-        if (title_first && title && base >= arena.size) {
+        // Whether `base` is the title's memory, asked only where the answer is used: a base the arena backs below its
+        // size never needs it, and the console heaps' slots are mostly such data (spike/r9-heapcopy).
+        int title_known = -1;
+        const auto title = [&] {
+            if (title_known < 0) title_known = title_memory_during_refresh(aliases, base, lo, hi) && bytes <= hi - base;
+            return title_known == 1;
+        };
+        if (traced) {
+            const bool in_title = title();
+            std::fprintf(stderr, "[rt] d3d12-metal: V# trace 0x%llx (%llu bytes): no alias; title %d [0x%llx, 0x%llx), "
+                                 "backed %d, known buffer %d, make_window %d\n",
+                         (unsigned long long)base, (unsigned long long)bytes, int(in_title), (unsigned long long)lo,
+                         (unsigned long long)hi, int(backed(base)), int(context->knows_buffer_va(base)), int(make_window));
+        }
+        if (title_first && title() && base >= arena.size) {
             to = aliases.resolve(base, bytes, kind);
             uint64_t mapped{};
             if (to && aliases.range_of(base, mapped, room) && mapped == to && room >= bytes && backed(to)) {
@@ -2845,7 +3011,24 @@ struct DeviceState {
         uint64_t offset = base;
         if (signed_vsharp_offsets() && base <= mask && (base & (1ull << 47))) offset |= ~mask;
         if (backed(offset)) {
-            if (offset == base && base >= arena.size && title) {
+            if (offset == base && base >= arena.size && soft && title() && !context->knows_buffer_va(base) &&
+                soft_range(base)) {
+                soft_in_place = true;
+                to = aliases.resolve(base, bytes, kind);
+                soft_in_place = false;
+                uint64_t mapped{};
+                if (to && to != base && aliases.range_of(base, mapped, room) && mapped == to && room >= bytes && backed(to)) {
+                    const uint64_t n = soft_rebased.fetch_add(1, std::memory_order_relaxed) + 1;
+                    if (!(n & (n - 1)) && n <= (1u << 20))
+                        std::fprintf(stderr, "[rt] d3d12-metal: ambiguous V# base 0x%llx (%llu bytes) taken as the title's: "
+                                             "shader VA 0x%llx (%llu so far; %llu kept raw)\n",
+                                     (unsigned long long)base, (unsigned long long)bytes, (unsigned long long)to,
+                                     (unsigned long long)n, (unsigned long long)soft_kept.load());
+                    return to;
+                }
+                soft_kept.fetch_add(1, std::memory_order_relaxed);
+            }
+            if (offset == base && base >= arena.size && title()) {
                 const uint64_t n = ambiguous_vsharps.fetch_add(1, std::memory_order_relaxed) + 1;
                 if (!(n & (n - 1)) && n <= (1u << 20))
                     std::fprintf(stderr, "[rt] d3d12-metal: V# base 0x%llx is title memory and a backed shader VA; taken "
@@ -2860,7 +3043,7 @@ struct DeviceState {
             to = geometry_va(base, bytes, false);
             if (to && encodable(to)) return to;
         }
-        if (make_window && title) {
+        if (make_window && title()) {
             to = aliases.resolve(base, bytes, kind);
             uint64_t mapped{};
             if (to && aliases.range_of(base, mapped, room) && mapped == to && room >= bytes && backed(to)) return to;
@@ -2878,8 +3061,13 @@ struct DeviceState {
         leonida::gfx10::Buffer desc{};
         const bool copy_geometry = leonida::gfx10::decode(words, desc) &&
             (path != VsharpPath::scratch || span <= kTitleWindowMax || (desc.format && leonida::gfx10::encode(desc) == words));
+        const bool soft = vsharp_title_soft() && !layer_vsharp(w);
+        if (vsharp_title_soft() && vsharp_trace(base))
+            std::fprintf(stderr, "[rt] d3d12-metal: V# trace 0x%llx in a %s slot: %08x %08x %08x %08x, written by the layer %d\n",
+                         (unsigned long long)base, path == VsharpPath::table ? "table" : path == VsharpPath::shadow ? "shadow" : "scratch",
+                         w[0], w[1], w[2], w[3], int(!soft));
         const auto to = vsharp_address(base, span, leonida::TitleVaAliases::table_view,
-                                       path != VsharpPath::scratch, copy_geometry, title_first);
+                                       path != VsharpPath::scratch, copy_geometry, title_first, soft);
         if (!to) {
             static std::atomic_flag noted[3]{};
             if (!noted[unsigned(path)].test_and_set(std::memory_order_relaxed)) {
@@ -3201,14 +3389,74 @@ struct DeviceState {
         std::vector<std::uint8_t> mirror;  // the title's bytes as the tracker last copied them
         std::vector<std::uint8_t> made;    // the title's bytes each arena slot was last made from
         std::vector<std::uint8_t> retry;   // per slot: not settled yet (fix_console_slot), in `retries`
+        // vsharp_memo_find / vsharp_memo_keep: the V# slots fixed in this refresh, by their 32 bytes
+        struct VsharpMemo {
+            std::uint32_t in[8], out[8];
+            std::uint32_t serial;
+            std::uint8_t result, counter;
+        };
+        std::vector<VsharpMemo> vsharp_memo;
+        std::uint32_t vsharp_memo_serial = 1;
+        bool vsharp_memo_bypass = false;
+        std::uint64_t vsharp_memo_hits = 0;
         leonida::ConsoleHeapVsharpSlots live_vsharps;  // slots whose GPU copy holds a live buffer V#
         std::vector<std::uint32_t> retries;
-        std::set<std::uint32_t> empty_slots;
+        // Slots whose last fix left an empty V# (the probe below revisits them): a bitset, ascending like the std::set it
+        // replaces, without a node allocation per insert (one insert or erase per fixed slot).
+        struct SlotBits {
+            std::vector<std::uint64_t> words;
+            std::size_t count = 0;
+            void insert(std::uint32_t slot) {
+                if (slot / 64 >= words.size()) words.resize(slot / 64 + 1, 0);
+                std::uint64_t& w = words[slot / 64];
+                const std::uint64_t m = std::uint64_t(1) << (slot & 63);
+                count += !(w & m);
+                w |= m;
+            }
+            void erase(std::uint32_t slot) {
+                if (slot / 64 >= words.size()) return;
+                std::uint64_t& w = words[slot / 64];
+                const std::uint64_t m = std::uint64_t(1) << (slot & 63);
+                count -= (w & m) != 0;
+                w &= ~m;
+            }
+            void erase_range(std::uint32_t first, std::uint32_t end) {
+                for (std::uint32_t s = first; s < end && count; ++s) {
+                    if (!(s & 63) && s + 64 <= end && s / 64 < words.size()) {
+                        count -= std::size_t(std::popcount(words[s / 64]));
+                        words[s / 64] = 0;
+                        s += 63;
+                        continue;
+                    }
+                    erase(s);
+                }
+            }
+            bool empty() const { return !count; }
+            std::size_t size() const { return count; }
+            // The first member at or after `slot`, or SIZE_MAX.
+            std::size_t next_from(std::size_t slot) const {
+                std::size_t w = slot / 64;
+                if (w >= words.size()) return SIZE_MAX;
+                std::uint64_t bits = words[w] & (~std::uint64_t(0) << (slot & 63));
+                for (;;) {
+                    if (bits) return w * 64 + std::size_t(std::countr_zero(bits));
+                    if (++w >= words.size()) return SIZE_MAX;
+                    bits = words[w];
+                }
+            }
+        };
+        SlotBits empty_slots;
         std::uint32_t next_empty = 0;
         std::size_t retry_at = 0;  // where retry_console_slots goes on
         // scan_console_heap: per 4 KiB page, zero in the copies already; the ranges it copied this time; counters
         std::vector<std::uint8_t> scan_zero;
         std::vector<std::pair<std::size_t, std::size_t>> scan_changed;
+        struct ScanRun {
+            std::size_t offset, bytes;
+            bool readable;
+        };
+        std::vector<ScanRun> scan_runs;                       // the striped scan's chunks, in address order
+        std::vector<std::vector<std::uint64_t>> scan_events;  // per stripe: page offset << 1 | to zero
         std::uint64_t scan_queries = 0, scan_zeroed = 0;
         // fix_console_slots' budget, for the current refresh, and the slots it nulled since the last log line
         std::chrono::steady_clock::time_point fix_start{};
@@ -3260,8 +3508,14 @@ struct DeviceState {
         bool settled = true, empty = false;
         if (!(w[3] >> 30)) {
             const auto path = heap.scratch ? VsharpPath::scratch : VsharpPath::shadow;
-            const auto result = fix_vsharp(w, path);
-            const auto counter = fix_vsharp(w + 4, path);
+            VsharpResult result, counter;
+            if (!vsharp_memo_find(heap, w, result, counter)) {
+                std::uint32_t in[kDescriptorSize / 4];
+                std::memcpy(in, w, kDescriptorSize);
+                result = fix_vsharp(w, path);
+                counter = fix_vsharp(w + 4, path);
+                vsharp_memo_keep(heap, in, w, result, counter);
+            }
             if (result == VsharpResult::rebased) ++heap.vsharps;
             if (result == VsharpResult::empty || counter == VsharpResult::empty) {
                 ++heap.unbacked;
@@ -3291,6 +3545,69 @@ struct DeviceState {
         std::memcpy(heap.copy + slot * kDescriptorSize, w, kDescriptorSize);
         heap.live_vsharps.set(slot, leonida::ConsoleHeapVsharpSlots::is_live_vsharp(w));
         return settled;
+    }
+
+    // LEONIDA_CONSOLE_VSHARP_MEMO (1 by default, 0: off): within one refresh of a resource heap, a slot read as buffer
+    // V#s whose 32 bytes equal a slot fixed earlier in the same refresh takes that slot's words and results instead of
+    // resolving both V#s again (alias table, title-memory probe, backings, window requests). Most slots the world's
+    // heap changes are the title's own data read as V#s, and the same words recur within a refresh
+    // (spike/r9-heapcopy). The memo is emptied when a refresh starts and before the re-fix of every live V# that a
+    // released backing or an alias invalidation calls for, so no result outlives either; a result reused within a
+    // refresh is one the slot would have got had it been fixed at the same moment as the first. The empty-slot probe
+    // bypasses it. Off under GTA6RT_METAL_VSHARP_TITLE_FIRST (whose rule depends on records the layer writes meanwhile).
+    bool vsharp_memo_on() const {
+        static const bool on = [] {
+            char text[4] = {};
+            if (GetEnvironmentVariableA("LEONIDA_CONSOLE_VSHARP_MEMO", text, sizeof(text)) > 0) return text[0] != '0';
+            return true;
+        }();
+        return on && !vsharp_title_first() && !vsharp_title_soft();
+    }
+    static constexpr std::size_t kVsharpMemoSize = 65536, kVsharpMemoProbe = 16;
+    static std::size_t vsharp_memo_hash(const std::uint32_t* w) {
+        std::uint64_t h = 0x9E3779B97F4A7C15ull;
+        for (int i = 0; i < 8; ++i) h = (h ^ w[i]) * 0xff51afd7ed558ccdull;
+        h ^= h >> 33;
+        h *= 0xc4ceb9fe1a85ec53ull;
+        return std::size_t(h ^ (h >> 33));
+    }
+    bool vsharp_memo_find(ConsoleHeap& heap, std::uint32_t* w, VsharpResult& result, VsharpResult& counter) {
+        if (heap.vsharp_memo_bypass || heap.vsharp_memo.empty()) return false;
+        const std::size_t h = vsharp_memo_hash(w);
+        for (std::size_t k = 0; k < kVsharpMemoProbe; ++k) {
+            const auto& e = heap.vsharp_memo[(h + k) & (kVsharpMemoSize - 1)];
+            if (e.serial != heap.vsharp_memo_serial) return false;
+            if (std::memcmp(e.in, w, sizeof e.in)) continue;
+            std::memcpy(w, e.out, sizeof e.out);
+            result = VsharpResult(e.result);
+            counter = VsharpResult(e.counter);
+            ++heap.vsharp_memo_hits;
+            return true;
+        }
+        return false;
+    }
+    void vsharp_memo_keep(ConsoleHeap& heap, const std::uint32_t* in, const std::uint32_t* out, VsharpResult result,
+                          VsharpResult counter) {
+        if (heap.vsharp_memo_bypass || !heap.resource_heap || !vsharp_memo_on()) return;
+        if (heap.vsharp_memo.empty()) heap.vsharp_memo.resize(kVsharpMemoSize);
+        const std::size_t h = vsharp_memo_hash(in);
+        for (std::size_t k = 0; k < kVsharpMemoProbe; ++k) {
+            auto& e = heap.vsharp_memo[(h + k) & (kVsharpMemoSize - 1)];
+            if (e.serial == heap.vsharp_memo_serial) continue;
+            std::memcpy(e.in, in, sizeof e.in);
+            std::memcpy(e.out, out, sizeof e.out);
+            e.result = std::uint8_t(result);
+            e.counter = std::uint8_t(counter);
+            e.serial = heap.vsharp_memo_serial;
+            return;
+        }
+    }
+    void vsharp_memo_clear(ConsoleHeap& heap) {
+        if (heap.vsharp_memo.empty()) return;
+        if (++heap.vsharp_memo_serial == 0) {
+            for (auto& e : heap.vsharp_memo) e.serial = 0;
+            heap.vsharp_memo_serial = 1;
+        }
     }
 
     // The slots on [offset, offset + bytes) of a heap copy's mirror, just brought up to date: each that differs from
@@ -3426,6 +3743,36 @@ struct DeviceState {
             heap.scan_zero[offset / kPage] = 0;
             changed(offset, n);
         };
+        const std::size_t stripes = console_heap_scan_stripes();
+        if (stripes > 1) {
+            heap.scan_runs.clear();
+            for (std::size_t at = 0; at < bytes;) {
+                MEMORY_BASIC_INFORMATION region{};
+                std::size_t next = std::min(bytes, at + kPage);
+                bool readable = false;
+                if (VirtualQuery(title + at, &region, sizeof(region))) {
+                    const auto end = reinterpret_cast<std::uintptr_t>(region.BaseAddress) + region.RegionSize;
+                    next = std::min<std::size_t>(bytes, std::max<std::size_t>(end - reinterpret_cast<std::uintptr_t>(title), at + kPage));
+                    readable = region.State == MEM_COMMIT && region.Protect && !(region.Protect & (PAGE_NOACCESS | PAGE_GUARD));
+                }
+                ++heap.scan_queries;
+                for (std::size_t chunk = at; chunk < next; chunk += kChunk)
+                    heap.scan_runs.push_back({chunk, std::min(kChunk, next - chunk), readable});
+                at = next;
+            }
+            scan_console_chunks(heap, title, stripes);
+            for (const auto& events : heap.scan_events)
+                for (const std::uint64_t e : events) {
+                    const std::size_t offset = std::size_t(e >> 1), n = std::min(kPage, bytes - offset);
+                    if (e & 1) {
+                        zero(offset, n);
+                        ++heap.scan_zeroed;
+                    } else {
+                        changed(offset, n);
+                    }
+                }
+            return;
+        }
         for (std::size_t at = 0; at < bytes;) {
             MEMORY_BASIC_INFORMATION region{};
             std::size_t next = std::min(bytes, at + kPage);
@@ -3452,6 +3799,63 @@ struct DeviceState {
         }
     }
 
+    // LEONIDA_CONSOLE_HEAP_SCAN_STRIPES (4 by default; 0 or 1: the serial scan above): the scan's compares and copies
+    // cut into that many runs of 64 KiB chunks for the copy pool (3 helpers and the caller). A stripe writes only its
+    // own pages of `input` and `scan_zero` and lists, in address order, the pages it copied and the pages to zero; the
+    // caller then zeroes and lists them in that order, so fix_console_slots is handed exactly what the serial scan
+    // gives it (spike/r9-heapcopy: 0 differing refreshes in the replay). The 38 MiB compare was ~1 ms a submission.
+    static std::size_t console_heap_scan_stripes() {
+        static const std::size_t stripes = [] {
+            char text[8] = {};
+            const DWORD n = GetEnvironmentVariableA("LEONIDA_CONSOLE_HEAP_SCAN_STRIPES", text, sizeof(text));
+            return n > 0 && n < sizeof(text) ? std::size_t(std::strtoul(text, nullptr, 10)) : std::size_t(4);
+        }();
+        return stripes;
+    }
+
+    void scan_console_chunks(ConsoleHeap& heap, const std::uint8_t* title, std::size_t stripes) {
+        constexpr std::size_t kPage = 4096;
+        const std::size_t chunks = heap.scan_runs.size();
+        stripes = std::max<std::size_t>(1, std::min(stripes, chunks));
+        heap.scan_events.resize(stripes);
+        leonida::CopyPool::get().run_jobs(stripes, [&](std::size_t s) {
+            auto& events = heap.scan_events[s];
+            events.clear();
+            const auto zero_page = [&](std::size_t p) {
+                std::uint8_t& z = heap.scan_zero[p / kPage];
+                if (z) return;
+                z = 1;
+                events.push_back(std::uint64_t(p) << 1 | 1);
+            };
+            for (std::size_t c = chunks * s / stripes, end = chunks * (s + 1) / stripes; c < end; ++c) {
+                const auto& run = heap.scan_runs[c];
+                const std::size_t chunk = run.offset, n = run.bytes;
+                if (!run.readable) {
+                    for (std::size_t p = chunk; p < chunk + n; p += kPage) zero_page(p);
+                    continue;
+                }
+                if (rthost::guarded_compare(title + chunk, heap.previous + chunk, n) == 0) {
+                    for (std::size_t p = chunk; p < chunk + n; p += kPage) heap.scan_zero[p / kPage] = 0;
+                    continue;
+                }
+                for (std::size_t p = chunk; p < chunk + n; p += kPage) {
+                    const std::size_t pn = std::min(kPage, chunk + n - p);
+                    const int r = rthost::guarded_compare(title + p, heap.previous + p, pn);
+                    if (r == 0) {
+                        heap.scan_zero[p / kPage] = 0;
+                        continue;
+                    }
+                    if (r < 0 || !rthost::guarded_copy(heap.input + p, title + p, pn)) {
+                        zero_page(p);
+                        continue;
+                    }
+                    heap.scan_zero[p / kPage] = 0;
+                    events.push_back(std::uint64_t(p) << 1);
+                }
+            }
+        });
+    }
+
     void refresh_console_heap(ConsoleHeap& heap) {  // console_heap_mutex held
         if (heap.imported) return;  // directly imported sampler heap
         using clock = std::chrono::steady_clock;
@@ -3464,10 +3868,16 @@ struct DeviceState {
             std::memset(heap.previous + offset, 0, bytes);
             const auto first = std::uint32_t(offset / kDescriptorSize);
             const auto end = std::uint32_t((offset + bytes) / kDescriptorSize);
-            heap.empty_slots.erase(heap.empty_slots.lower_bound(first), heap.empty_slots.lower_bound(end));
+            heap.empty_slots.erase_range(first, end);
             for (auto slot = first; slot < end; ++slot) heap.retry[slot] = 0;
             heap.live_vsharps.clear_range(first, end);
         };
+        vsharp_memo_clear(heap);
+        refresh_free_ranges.clear();
+        console_refresh_thread = true;
+        struct RefreshThread {
+            ~RefreshThread() { console_refresh_thread = false; }
+        } refresh_thread;
         const bool scan = heap.resource_heap && console_heap_scan();
         if (scan) {
             scan_console_heap(heap, zero);
@@ -3488,6 +3898,8 @@ struct DeviceState {
         if (heap.resource_heap && (generation != heap.checked_generation || alias_generation != heap.alias_generation)) {
             heap.alias_generation = alias_generation;
             heap.checked_generation = generation;
+            refresh_free_ranges.clear();
+            vsharp_memo_clear(heap);
             // Even an unchanged title slot may name a buffer released since the last submission.
             // Walk the host-RAM V# bitset instead of reading every slot of `heap.copy` (which may be uncached WC VRAM).
             heap.live_vsharps.for_each([&](std::size_t slot) {
@@ -3501,14 +3913,17 @@ struct DeviceState {
         // A settled zero can acquire GPU backing without a CPU map event. Probe at most eight in
         // round-robin order every 32 submissions. Keep texture and copy-budget retries independent.
         if ((heap.refreshes & 31) == 31 && !heap.empty_slots.empty()) {
-            auto it = heap.empty_slots.lower_bound(heap.next_empty);
+            std::size_t it = heap.empty_slots.next_from(heap.next_empty);
             const auto count = (std::min)(std::size_t{8}, heap.empty_slots.size());
             for (std::size_t n = 0; n < count && !heap.empty_slots.empty(); ++n) {
-                if (it == heap.empty_slots.end()) it = heap.empty_slots.begin();
-                const auto slot = *it++;
+                if (it == SIZE_MAX) it = heap.empty_slots.next_from(0);
+                const auto slot = std::uint32_t(it);
+                it = heap.empty_slots.next_from(std::size_t(slot) + 1);
                 heap.next_empty = slot + 1;
                 if (!heap.retry[slot]) {
+                    heap.vsharp_memo_bypass = true;
                     fix_console_slot(heap, slot);
+                    heap.vsharp_memo_bypass = false;
                     ++heap.retried;
                 }
             }
@@ -8369,6 +8784,37 @@ public:
             state_.scan_title_table(table, descriptors);
             return true;
         });
+        state_.context->set_view_source([this](std::uint64_t slot, std::uint64_t& target, std::uint64_t& bytes) {
+            std::lock_guard lock(state_.unbacked_slot_mutex);
+            const auto it = state_.unbacked_slots.find(slot);
+            if (it == state_.unbacked_slots.end()) return false;
+            target = it->second.first;
+            bytes = it->second.second;
+            MEMORY_BASIC_INFORMATION region{};
+            if (VirtualQuery(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(target)), &region, sizeof region))
+                std::fprintf(stderr,
+                             "[rt] d3d12-metal gpu-debug: unbacked view target 0x%llx (%llu bytes): region 0x%llx+0x%llx "
+                             "of allocation 0x%llx, state 0x%lx, type 0x%lx (0x40000 mapped, 0x20000 private, 0x1000000 "
+                             "image), protect 0x%lx; title windows %llu KiB of %llu KiB\n",
+                             static_cast<unsigned long long>(target), static_cast<unsigned long long>(bytes),
+                             static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(region.BaseAddress)),
+                             static_cast<unsigned long long>(region.RegionSize),
+                             static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(region.AllocationBase)),
+                             static_cast<unsigned long>(region.State), static_cast<unsigned long>(region.Type),
+                             static_cast<unsigned long>(region.Protect),
+                             static_cast<unsigned long long>(state_.title_window_bytes >> 10),
+                             static_cast<unsigned long long>(state_.title_window_cap >> 10));
+            return true;
+        });
+        state_.context->set_console_source([this](std::uint64_t va, std::uint64_t& title) {
+            std::lock_guard lock(state_.console_heap_mutex);
+            for (const auto& heap : state_.console_heaps)
+                if (va >= heap->shader_va && va - heap->shader_va < heap->bytes) {
+                    title = heap->console_va + (va - heap->shader_va);
+                    return true;
+                }
+            return false;
+        });
         leonida::value_sink::set_arena(
             [](void* device, std::uint64_t address, const void* bytes, unsigned size) {
                 return static_cast<DeviceState*>(device)->write_arena_value(address, bytes, size);
@@ -8414,15 +8860,26 @@ public:
             const char* builders = std::getenv("GTA6RT_METAL_SHADER_BUILDERS");
             config.builders = builders ? unsigned(std::strtoul(builders, nullptr, 10)) : 2u;
             // GTA6RT_METAL_SHADER_DEBUG_OVERLAY (only with GTA6RT_METAL_GPU_DEBUG: its shaders write the debug buffer)
-            // first, then GTA6RT_METAL_SHADER_OVERLAY ("off": none; default the mesh shaders packed or split under
-            // Metal's threadgroup limit, d3d12_metal/tools/mesh_tg_pack.py + msl_overlay.py).
+            // first, then GTA6RT_METAL_SHADER_OVERLAY (':'-separated, the first listed winning; "off": none; default
+            // the mesh shaders packed or split under Metal's threadgroup limit, d3d12_metal/tools/mesh_tg_pack.py +
+            // msl_overlay.py, then the uint-output worker's integer-output pixel variants when that file exists).
             if (const char* d = std::getenv("GTA6RT_METAL_SHADER_DEBUG_OVERLAY"); d && *d) {
                 if (state_.context->gpu_debug()) config.overlays.push_back(d);
                 else std::fprintf(stderr, "[rt] d3d12-metal: GTA6RT_METAL_SHADER_DEBUG_OVERLAY ignored without "
                                           "GTA6RT_METAL_GPU_DEBUG=1\n");
             }
-            const std::string overlay = env("GTA6RT_METAL_SHADER_OVERLAY", (root + "/build/d3d12_metal-msl-overrides/manifest.tsv").c_str());
-            if (overlay != "off" && std::filesystem::exists(overlay)) config.overlays.push_back(overlay);
+            const bool overlays_set = std::getenv("GTA6RT_METAL_SHADER_OVERLAY") && *std::getenv("GTA6RT_METAL_SHADER_OVERLAY");
+            const std::string overlays = env("GTA6RT_METAL_SHADER_OVERLAY",
+                                             (root + "/build/d3d12_metal-msl-overrides/manifest.tsv:" + root +
+                                              "/build/uintps-x86_64/overlay.tsv").c_str());
+            for (std::size_t at = 0; overlays != "off" && at <= overlays.size();) {
+                const std::size_t colon = std::min(overlays.find(':', at), overlays.size());
+                const std::string one = overlays.substr(at, colon - at);
+                if (!one.empty() && std::filesystem::exists(one)) config.overlays.push_back(one);
+                else if (!one.empty() && overlays_set)
+                    std::fprintf(stderr, "[rt] d3d12-metal: shader overlay %s does not exist\n", one.c_str());
+                at = colon + 1;
+            }
             state_.shaders = std::make_unique<leonida::MetalShaders>(*state_.gpu, config);
         }
         {
@@ -8534,6 +8991,17 @@ public:
         const unsigned report_s = unsigned(setting("GTA6RT_METAL_MEMORY_REPORT_S", 30));
         const unsigned census_s = std::max(1u, unsigned(setting("GTA6RT_METAL_CENSUS_S", 2)));
         const unsigned work_s = unsigned(setting("GTA6RT_METAL_WORK_REPORT_S", 10));
+        const bool trace_footprint = setting("GTA6RT_METAL_FOOTPRINT_TRACE", 0) != 0;
+        std::vector<std::uint64_t> snapshots;
+        if (const char* v = std::getenv("GTA6RT_METAL_FOOTPRINT_SNAPSHOT_MB"))
+            for (const char* p = v; *p;) {
+                char* end = nullptr;
+                const unsigned long long mb = std::strtoull(p, &end, 10);
+                if (end == p) break;
+                if (mb) snapshots.push_back(std::uint64_t(mb) << 20);
+                p = *end ? end + 1 : end;
+            }
+        std::sort(snapshots.begin(), snapshots.end(), std::greater<>());
         std::uint64_t peak = 0;
         unsigned ticks = 0;
         std::unique_lock lock(state_.guard_mutex);
@@ -8541,6 +9009,10 @@ public:
             lock.unlock();
             const std::uint64_t footprint = state_.gpu->memory_budget().process_footprint;
             if (footprint > peak) peak = footprint;
+            if (!snapshots.empty() && footprint > snapshots.back()) {
+                while (!snapshots.empty() && footprint > snapshots.back()) snapshots.pop_back();
+                footprint_snapshot(footprint);
+            }
             if (cap && footprint > cap) {
                 char text[96];
                 std::snprintf(text, sizeof text, "%.0f MiB, cap %.0f MiB", double(footprint) / 1048576.0,
@@ -8548,6 +9020,7 @@ public:
                 end_run("process footprint over GTA6RT_METAL_FOOTPRINT_CAP_MB", text, 4);
             }
             ++ticks;
+            if (trace_footprint) footprint_trace(footprint);
             if (report_s && ticks % report_s == 0) report_gpu_memory("periodic");
             if (work_s && ticks % work_s == 0) report_work(work_s);
             if (leonida::MetalContext::census_on() && ticks % census_s == 0) {
@@ -8558,6 +9031,33 @@ public:
             }
             lock.lock();
         }
+    }
+
+    // /usr/bin/footprint on this process (categories with dirty, compressed and wired bytes), into the log.
+    void footprint_snapshot(std::uint64_t footprint) {
+        std::fprintf(stderr, "[rt] footprint snapshot at %.0f MiB (t=%.0fs):\n", double(footprint) / 1048576.0,
+                     leonida::run_counters::process_age_s());
+        std::fflush(stderr);
+        char command[96];
+        std::snprintf(command, sizeof command, "/usr/bin/footprint --pid %d --swapped --wired 1>&2", int(getpid()));
+        if (std::system(command) != 0) std::fprintf(stderr, "[rt] footprint snapshot: the tool failed\n");
+    }
+
+    void footprint_trace(std::uint64_t footprint) {
+        task_vm_info_data_t vm{};
+        mach_msg_type_number_t n = TASK_VM_INFO_COUNT;
+        if (task_info(mach_task_self(), TASK_VM_INFO, reinterpret_cast<task_info_t>(&vm), &n) != KERN_SUCCESS) return;
+        malloc_statistics_t ms{};
+        malloc_zone_statistics(nullptr, &ms);
+        const auto mb = state_.gpu->memory_budget();
+        const auto m = [](std::uint64_t b) { return double(b) / 1048576.0; };
+        std::fprintf(stderr,
+                     "[rt] footprint trace t=%.0fs: footprint %.0f MiB = internal %.0f + compressed %.0f + graphics "
+                     "%.0f (+%.0f compressed) + other; Metal allocated %.0f MiB; malloc in use %.0f MiB\n",
+                     leonida::run_counters::process_age_s(), m(footprint), m(vm.internal), m(vm.compressed),
+                     m(std::uint64_t(vm.ledger_tag_graphics_footprint)),
+                     m(std::uint64_t(vm.ledger_tag_graphics_footprint_compressed)), m(mb.device_allocated),
+                     m(ms.size_in_use));
     }
 
     // Every GTA6RT_METAL_WORK_REPORT_S (default 10, 0: off): what replay did with each class of draw and dispatch,
@@ -8652,6 +9152,29 @@ public:
                          static_cast<unsigned long long>(ds.command_buffers),
                          static_cast<unsigned long long>(ds.command_buffer_errors));
         }
+        {
+            std::size_t blocks = 0;
+            std::uint64_t block_bytes = 0, set_aside = 0, set_aside_bytes = 0, spacers = 0, spacer_bytes = 0, refused = 0;
+            {
+                std::lock_guard lock(state_.external_mutex);
+                blocks = state_.external_blocks.size();
+                block_bytes = state_.external_bytes;
+                set_aside = state_.external_va_taken;
+                set_aside_bytes = state_.external_set_aside_bytes;
+                spacers = state_.external_spacers;
+                spacer_bytes = state_.external_spacer_bytes;
+                refused = state_.external_refused;
+            }
+            const std::string detail = gta6rt::metal::memory_detail(state_.gpu.get());
+            std::fprintf(stderr,
+                         "[rt] gpu-memory detail t=%.0fs: %s; blocks outside the arena %zu (%.0f MiB), set aside %llu "
+                         "(%.0f MiB), shader-VA spacers %llu (%.0f MiB, no memory), buffers refused %llu; hash table "
+                         "%.0f MiB a generation\n",
+                         seconds, detail.c_str(), blocks, L::mib(std::int64_t(block_bytes)),
+                         static_cast<unsigned long long>(set_aside), L::mib(std::int64_t(set_aside_bytes)),
+                         static_cast<unsigned long long>(spacers), L::mib(std::int64_t(spacer_bytes)),
+                         static_cast<unsigned long long>(refused), L::mib(std::int64_t(bs.table_bytes)));
+        }
         report_title_classes(seconds);
     }
 
@@ -8725,10 +9248,12 @@ public:
         // A larger default does not help: the arena's VAs (0-based) run into the title's own low ranges, which the
         // allocator skips (measured with 1536 MiB, d3m-m2-b: a 69 MiB heap refused with 1415 MiB free). Title windows
         // that do not fit go to blocks outside it (external_window), as on the Vulkan path.
-        // On Metal the default stays 256 MiB (upstream's is 384): in this title the arena's VAs from about 227 MiB on
-        // are the title's own memory (the keep-out report, d3m-r5-b), so a larger arena only adds footprint; what does
-        // not fit goes to reusable blocks outside it.
-        const leonida::ArenaSize size = leonida::decide_arena_size(set ? text : "256", limits);
+        // On Metal the default is 384 MiB, reserved before the title runs (register_metal.cpp, which also keeps the
+        // title memory probe off the reservation): at world entry 256 MiB held 129 MiB of buffers, 102 of descriptor
+        // heaps and 22 of shaders, and the world's next 35 buffers found no block outside it whose shader VA was free
+        // (d3m-s9-a); 512 MiB peaked at 327 MiB 28 s into the world (d3m-s9-b) but left the title's 185 MiB 32-bit
+        // reservation no room below 4 GiB in d3m-s9-c (boot abort). The two defaults must agree.
+        const leonida::ArenaSize size = leonida::decide_arena_size(set ? text : "384", limits);
         auto& arena = state_.arena;
         leonida::gpu::HeapDesc hd;
         hd.size = size.bytes;
@@ -11533,6 +12058,7 @@ public:
         if (!backed) {
             buffer.stride = 0, buffer.num_records = 0;
             leonida::note_unbacked_view("constant-buffer view", desc->BufferLocation, desc->SizeInBytes);
+            state_.note_unbacked_slot(destination.ptr, desc->BufferLocation, desc->SizeInBytes);
         }
         leonida::gfx10::BufferWords words = leonida::gfx10::encode(buffer);
         // The console's constant-buffer V# is a table of 16-byte rows: the title's own inline form of this descriptor
@@ -11638,6 +12164,7 @@ public:
             if (!buffer.address) {
                 buffer.stride = 0, buffer.num_records = 0;
                 leonida::note_unbacked_view("buffer SRV", target, bytes);
+                state_.note_unbacked_slot(destination.ptr, target, bytes);
             }
         }
         const leonida::gfx10::BufferWords words = leonida::gfx10::encode(buffer);
@@ -11865,6 +12392,7 @@ public:
         if (!buffer.address) {
             buffer.stride = 0, buffer.num_records = 0;
             leonida::note_unbacked_view("buffer UAV", target, std::uint64_t(view.NumElements) * (unit ? unit : 1));
+            state_.note_unbacked_slot(destination.ptr, target, std::uint64_t(view.NumElements) * (unit ? unit : 1));
         }
         const g::BufferWords words = g::encode(buffer);
         std::memcpy(reinterpret_cast<void*>(destination.ptr), words.data(), sizeof(words));

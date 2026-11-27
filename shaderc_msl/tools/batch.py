@@ -116,8 +116,10 @@ def shader_opts(index, k, mo, dxbc_dir, vs_route="lane"):
     o = {"vs_route": vs_route}
     if st == "ms" and k in mo:
         o.update(mo[k])
-    if st == "cs" and index[k].get("lds_bytes", 0) > 32768 and "/" not in k:
-        alloc = S.lds_allocation(os.path.join(dxbc_dir, k + ".dxbc"))
+    if st == "cs" and index[k].get("lds_bytes", 0) > 32768:
+        sub, _, stem = k.rpartition("/")
+        alloc = S.lds_allocation(os.path.join(os.path.dirname(dxbc_dir), sub, stem + ".dxbc") if sub
+                                 else os.path.join(dxbc_dir, k + ".dxbc"))
         lds_array = 4 * 8192
         if alloc and alloc + index[k]["lds_bytes"] - lds_array <= 32768:
             o["shrink_lds"] = alloc // 4

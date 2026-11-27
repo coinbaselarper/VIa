@@ -102,4 +102,12 @@ if(GTA6RT_SHADERC_MSL_TESTS)
   set_tests_properties(shaderc_msl_vs_lane shaderc_msl_catalog shaderc_msl_vs_lane_identity PROPERTIES SKIP_RETURN_CODE 77)
   set_tests_properties(shaderc_msl_soft_f64 shaderc_msl_vs_lane shaderc_msl_catalog shaderc_msl_vs_lane_identity PROPERTIES
     ENVIRONMENT "MTL_DEBUG_LAYER=1;MTL_SHADER_VALIDATION=1")
+
+  add_executable(shaderc_msl_outvar_render_test tests/outvar/outvar_render_test.mm)
+  target_compile_features(shaderc_msl_outvar_render_test PRIVATE cxx_std_20)
+  target_compile_options(shaderc_msl_outvar_render_test PRIVATE -fobjc-arc)
+  target_link_libraries(shaderc_msl_outvar_render_test PRIVATE "-framework Metal" "-framework Foundation")
+  add_test(NAME shaderc_msl_outvar_render
+           COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/outvar/run.sh $<TARGET_FILE:shaderc_msl_outvar_render_test>
+                   ${CMAKE_CURRENT_BINARY_DIR}/outvar)
 endif()

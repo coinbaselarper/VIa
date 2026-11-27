@@ -228,6 +228,8 @@ struct BufferDesc {
     MemoryKind memory = MemoryKind::device_local;
     std::uint32_t usage = 0;
     const char* label = nullptr;
+    // false: kept out of the device residency set (no footprint while untouched) until metal::make_resident
+    bool resident = true;
 };
 
 enum class TextureDimension : std::uint32_t { tex1d, tex2d, tex2d_array, tex3d, cube };

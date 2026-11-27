@@ -1,5 +1,8 @@
 #include <gta6rt/d3d12_backend.h>
+#include <gta6rt/os.h>
 #include <gta6rt/shims.h>
+
+#include "../../d3d12_vulkan/src/title_va_alias.h"
 
 #include <cxxabi.h>
 #include <dlfcn.h>
@@ -197,6 +200,16 @@ void on_fault(int sig, siginfo_t* si, void* uc) {
         print_thread(sig == SIGSEGV ? "SIGSEGV near 0 in host code" : "SIGBUS near 0 in host code");
         walk_context(uc);
         std::fflush(stderr);
+    } else if (sig == SIGBUS && g_in_crash.exchange(1) == 0) {
+        if (pc && !info.dli_fname) dladdr(reinterpret_cast<void*>(pc), &info);
+        char line[256];
+        const int n = std::snprintf(line, sizeof line, "[d3m-crash] SIGBUS at address %p, pc 0x%llx (%s+0x%llx), code %d\n",
+                                    si ? si->si_addr : nullptr, static_cast<unsigned long long>(pc),
+                                    info.dli_fname ? info.dli_fname : "?",
+                                    static_cast<unsigned long long>(info.dli_fbase ? pc - reinterpret_cast<std::uintptr_t>(info.dli_fbase) : 0),
+                                    si ? si->si_code : 0);
+        if (n > 0) (void)!write(2, line, std::size_t(std::min(n, int(sizeof line) - 1)));
+        g_in_crash.store(0);
     }
     const struct sigaction& prev = sig == SIGSEGV ? g_prev_segv : g_prev_bus;
     if ((prev.sa_flags & SA_SIGINFO) && prev.sa_sigaction) {
@@ -258,6 +271,7 @@ void install_crash_reports() {
 }
 
 std::atomic<std::uint64_t> g_arena_reserved{0}, g_arena_reserve_end{0};
+std::atomic<std::uint64_t> g_reserved_chunks[64]{};
 
 // GTA6RT_METAL_STACK_LOG_AT_S=<s>: malloc stack logging (lite) is turned on that many seconds after registration, so
 // a memory graph written at a crash names who allocated and freed a block (from the start it slows the boot ~5x).
@@ -282,7 +296,7 @@ void reserve_arena_vas() {
     const char* v = std::getenv("GTA6RT_METAL_ARENA_RESERVE_VA");
     if (v && !std::strcmp(v, "0")) return;
     const char* mb = std::getenv("LEONIDA_ARENA_MB");
-    long long size_mb = mb && *mb ? std::strtoll(mb, nullptr, 10) : 256;
+    long long size_mb = mb && *mb ? std::strtoll(mb, nullptr, 10) : 384;
     size_mb = std::min(4095ll, std::max(16ll, size_mb));
     constexpr std::uint64_t chunk = 1ull << 20;
     const std::uint64_t end = std::uint64_t(size_mb) << 20;
@@ -290,11 +304,66 @@ void reserve_arena_vas() {
     for (std::uint64_t at = chunk; at < end; at += chunk) {
         mach_vm_address_t a = at;
         if (mach_vm_map(mach_task_self(), &a, chunk, 0, VM_FLAGS_FIXED, MEMORY_OBJECT_NULL, 0, FALSE, VM_PROT_NONE,
-                        VM_PROT_NONE, VM_INHERIT_NONE) == KERN_SUCCESS)
+                        VM_PROT_NONE, VM_INHERIT_NONE) == KERN_SUCCESS) {
             reserved += chunk;
+            g_reserved_chunks[at >> 20 >> 6].fetch_or(1ull << ((at >> 20) & 63), std::memory_order_relaxed);
+        }
     }
     g_arena_reserved = reserved;
     g_arena_reserve_end = end;
+}
+
+bool arena_reservation(std::uint64_t va) {
+    const std::uint64_t mb = va >> 20;
+    return mb < 4096 && (g_reserved_chunks[mb >> 6].load(std::memory_order_relaxed) >> (mb & 63) & 1);
+}
+
+// The shared probe (d3d12_vulkan/platform/title_memory_probe.cpp) takes any mapping gta6rt_vm_query does not call free
+// for a guest allocation, so each 1 MiB chunk reserved above became "title memory" on its first lookup and the arena
+// kept out of it: in d3m-s8-m the arena refused every buffer over 1 MiB from world entry (41 MiB free, gaps of 1 MiB).
+// This one answers no for the reservation and otherwise asks what the shared probe asks.
+std::atomic<unsigned> g_probe_logged{0};
+std::atomic<std::uint64_t> g_probe_refused{0};
+bool metal_title_memory_probe(std::uint64_t va, std::uint64_t& lo, std::uint64_t& hi) {
+    if (arena_reservation(va)) {
+        const std::uint64_t n = g_probe_refused.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (!(n & (n - 1)) && n <= (1u << 20))
+            std::fprintf(stderr, "[rt] d3d12-metal: title memory probe: 0x%llx is the arena's VA reservation, no title "
+                                 "memory (%llu so far)\n",
+                         static_cast<unsigned long long>(va), static_cast<unsigned long long>(n));
+        return false;
+    }
+    const auto note = [&](const char* what) {
+        if (g_probe_logged.fetch_add(1, std::memory_order_relaxed) < 16)
+            std::fprintf(stderr, "[rt] d3d12: title memory probe: 0x%llx %s [0x%llx, 0x%llx)\n",
+                         static_cast<unsigned long long>(va), what, static_cast<unsigned long long>(lo),
+                         static_cast<unsigned long long>(hi));
+    };
+    gta6rt_vm_region region{};
+    if (gta6rt_vm_query(reinterpret_cast<const void*>(va), &region) == GTA6RT_OK && !region.is_image &&
+        region.state != GTA6RT_VM_STATE_FREE && region.allocation_base && region.allocation_size) {
+        lo = reinterpret_cast<std::uintptr_t>(region.allocation_base);
+        hi = lo + region.allocation_size;
+        note("is in a guest allocation");
+        return true;
+    }
+    mach_vm_address_t address = va;
+    mach_vm_size_t size = 0;
+    vm_region_basic_info_data_64_t info{};
+    mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+    mach_port_t object = MACH_PORT_NULL;
+    if (mach_vm_region(mach_task_self(), &address, &size, VM_REGION_BASIC_INFO_64,
+                       reinterpret_cast<vm_region_info_t>(&info), &count, &object) == KERN_SUCCESS &&
+        address <= va && va < address + size &&
+        (info.protection & (VM_PROT_READ | VM_PROT_WRITE)) == (VM_PROT_READ | VM_PROT_WRITE) && !info.shared) {
+        lo = address;
+        hi = address + size;
+        note("is in a private host mapping (XMemAlloc heap)");
+        return true;
+    }
+    lo = hi = 0;
+    note("is in no guest allocation or writable private mapping");
+    return false;
 }
 
 }  // namespace
@@ -312,6 +381,9 @@ extern "C" gta6rt_status gta6rt_d3d12_metal_register(void) {
     install_crash_reports();
     start_stack_logging_later();
     reserve_arena_vas();
-    return gta6rt_d3d12_vulkan_register();
+    const gta6rt_status status = gta6rt_d3d12_vulkan_register();
+    const char* v = std::getenv("GTA6RT_METAL_ARENA_PROBE");
+    if (!v || std::strcmp(v, "shared") != 0) leonida::title_va_aliases().set_memory_probe(&metal_title_memory_probe);
+    return status;
 }
 extern "C" gta6rt_status gta6rt_d3d12_metal_at_exit(uint32_t wait_ms) { return gta6rt_d3d12_vulkan_at_exit(wait_ms); }

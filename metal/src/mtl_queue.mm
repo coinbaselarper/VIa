@@ -454,7 +454,8 @@ public:
         const std::string queue = queue_label ? queue_label.UTF8String : "queue";
         const std::uint64_t host = std::uint64_t(reinterpret_cast<std::uintptr_t>(b->mtl().contents)) + offset;
         const std::uint64_t block_end = (host | 0xffff) + 1;
-        const bool tail = host + size > block_end - 0x18;
+        const bool tail = host + size > block_end - 0x18 &&
+                          (watch_on_ ? host < hi_ && host + size > lo_ : host < 0x100000000ull);
         std::lock_guard lock(mutex_);
         ++kinds_[what];
         if (!tail) return;
@@ -523,7 +524,10 @@ private:
         std::uint32_t count;
         std::memcpy(&object, b + 8, 8);
         std::memcpy(&count, b + 16, 4);
-        return object >= 0x10000 && object < 0x800000000000ull && count < (1u << 20);
+        std::uint64_t next;
+        std::memcpy(&next, b, 8);
+        const auto title_heap = [](std::uint64_t p) { return p >= 0x100000000ull && p < 0x7f0000000000ull; };
+        return title_heap(object) && (next == 0 || title_heap(next)) && count < (1u << 20);
     }
     static bool node_cleared(const std::uint8_t* b) {
         std::uint64_t object;
@@ -562,10 +566,11 @@ private:
                     break;
                 if (addr >= hi_) break;
                 const std::uint64_t end = std::min<std::uint64_t>(addr + size, hi_);
+                const std::uint64_t from = std::max<std::uint64_t>(addr, lo_);
                 if (info.protection & VM_PROT_READ) {
-                    for (std::uint64_t b = (addr | 0xffff) + 1; b <= end; b += 0x10000) {
+                    for (std::uint64_t b = (from | 0xffff) + 1; b <= end; b += 0x10000) {
                         const std::uint64_t at = b - 0x18;
-                        if (at < addr) continue;
+                        if (at < from) continue;
                         std::uint8_t now_bytes[24];
                         mach_vm_size_t got = 0;
                         if (mach_vm_read_overwrite(mach_task_self(), at, 24, mach_vm_address_t(now_bytes), &got) !=
@@ -573,7 +578,7 @@ private:
                             continue;
                         auto [it, fresh] = tails.try_emplace(at);
                         Tail& t = it->second;
-                        if (!fresh && t.valid && node_cleared(now_bytes) && reports < 24) {
+                        if (!fresh && t.valid && node_cleared(now_bytes) && reports < 400) {
                             ++reports;
                             report_change(at, t.bytes, now_bytes, last, now);
                         }
@@ -602,15 +607,22 @@ private:
             }
         if (!shown) log("  no logged GPU write of this backend covers it");
         shown = 0;
-        for (auto it = recent_.rbegin(); it != recent_.rend() && shown < 24; ++it) {
+        std::string empty;
+        for (auto it = recent_.rbegin(); it != recent_.rend(); ++it) {
             if (it->at < last - 0.010) break;
-            ++shown;
-            log("  completed since the previous scan: %s command buffer %llu, GPU %.1f..%.1f ms ago: %s",
-                it->queue.c_str(), (unsigned long long)it->serial, (now - it->start) * 1e3, (now - it->end) * 1e3,
-                it->summary.c_str());
+            if (it->summary.empty()) {
+                if (empty.size() < 600) empty += (empty.empty() ? "" : ", ") + it->queue + " " + std::to_string(it->serial);
+                continue;
+            }
+            if (++shown > 12) continue;
+            log("  completed since the previous scan: %s command buffer %llu, GPU end %.1f ms ago (ran %.1f ms): %s",
+                it->queue.c_str(), (unsigned long long)it->serial, (now - it->end) * 1e3,
+                it->start > 0 ? (it->end - it->start) * 1e3 : 0.0, it->summary.c_str());
         }
-        if (!shown) log("  no command buffer completed since the previous scan (a CPU writer, or a GPU write not yet "
-                        "reported complete)");
+        if (!empty.empty()) log("  completed since the previous scan with no encoder: %s", empty.c_str());
+        if (!shown && empty.empty())
+            log("  no command buffer completed since the previous scan (a CPU writer, or a GPU write not yet reported "
+                "complete)");
     }
 
     bool on_ = true, watch_on_ = false;
@@ -738,6 +750,9 @@ private:
     InFlight() {
         const char* v = std::getenv("GTA6RT_METAL_CB_BUDGET_MS");
         budget_ms_ = v && *v ? std::strtod(v, nullptr) : 1500.0;
+        const char* a = std::getenv("GTA6RT_METAL_CB_ABORT_MS");
+        abort_ms_ = a && *a ? std::strtod(a, nullptr) : 0.0;
+        if (abort_ms_ > 0 && budget_ms_ <= 0) budget_ms_ = abort_ms_;
         const char* r = std::getenv("GTA6RT_METAL_GPU_REPORT_S");
         report_s_ = r && *r ? std::strtod(r, nullptr) : 10.0;
     }
@@ -768,6 +783,13 @@ private:
                 const auto done = last_done_ns_.find(queue);
                 e.start_ns = std::max(e.committed_ns, done == last_done_ns_.end() ? 0 : done->second);
                 const double ms = double(now - e.start_ns) / 1e6;
+                if (abort_ms_ > 0 && ms >= abort_ms_ && !e.summary.empty()) {
+                    log("command buffer %llu has run %.0f ms without completing, past GTA6RT_METAL_CB_ABORT_MS %.0f: "
+                        "ending the process before the GPU watchdog does: %s",
+                        (unsigned long long)key.second, ms, abort_ms_, e.summary.c_str());
+                    std::fflush(stderr);
+                    std::_Exit(5);
+                }
                 if (e.told || ms < budget_ms_ || e.summary.empty()) continue;
                 e.told = true;
                 if (++over_ <= 64)
@@ -783,7 +805,7 @@ private:
     std::map<std::pair<const void*, std::uint64_t>, Entry> live_;
     std::map<const void*, std::uint64_t> last_done_ns_;
     bool started_ = false;
-    double budget_ms_ = 0, report_s_ = 10;
+    double budget_ms_ = 0, report_s_ = 10, abort_ms_ = 0;
     std::uint64_t over_ = 0;
 };
 }  // namespace
@@ -836,9 +858,13 @@ void MetalQueue::end_command_buffer(id<MTLCommandBuffer> cb, std::span<const Eve
           NSError* e = done.error;
           const std::string text = e ? e.localizedDescription.UTF8String : "no error object";
           const bool victim = as_victim || (e && (e.code == 5 || text.find("InnocentVictim") != std::string::npos));
+          static const bool go_on = [] {
+              const char* v = std::getenv("GTA6RT_METAL_GPU_ERRORS");
+              return v && !std::strcmp(v, "continue");
+          }();
           const bool lost = !victim && e &&
-                            (e.code == MTLCommandBufferErrorTimeout || e.code == MTLCommandBufferErrorAccessRevoked ||
-                             e.code == MTLCommandBufferErrorDeviceRemoved);
+                            (!go_on || e.code == MTLCommandBufferErrorTimeout ||
+                             e.code == MTLCommandBufferErrorAccessRevoked || e.code == MTLCommandBufferErrorDeviceRemoved);
           stats->command_buffer_errors++;
           if (victim) stats->command_buffer_victims++;
           errors->unreported.fetch_add(1);

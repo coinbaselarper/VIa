@@ -7,6 +7,8 @@
   build   rebuilds those shaders' libraries with their variant entries into <out>/cas and writes <out>/manifest.tsv
           (the base manifest with those rows replaced; root = the base's) and <out>/overlay.tsv (the replaced rows
           only); --names limits the set, --first-lists builds the list-paired shaders first
+          --also FILE adds shaders of any stage rebuilt with batch.py's options (e.g. the library compute shaders
+          over 32 KiB of threadgroup memory that take shrink_lds since the sub-corpus DXBC lookup)
   specs   writes <out>/int-targets.specs: the list pipelines with an integer colour target (for prepare_shaders)
 """
 import argparse, json, os, re, sys, time
@@ -54,8 +56,8 @@ def declared_code(sig):
 
 
 def scan(a):
-    idx = json.load(open(os.path.join(a.spirv_dir, "index.json")))
-    dxbc = os.path.join(os.path.dirname(os.path.abspath(a.spirv_dir)), "dxbc")
+    import batch
+    idx = batch.load_index(a.spirv_dir, "library,exe,fspx,bvh")
     pairs = list_pipelines(a.lists)
     listed = {}
     for kind, ps, code, _ in pairs:
@@ -64,7 +66,7 @@ def scan(a):
     for k, v in sorted(idx.items()):
         if v.get("stage") != "ps":
             continue
-        sig = out_types.dxbc_targets(os.path.join(dxbc, k + ".dxbc"))
+        sig = out_types.dxbc_targets(S.dxbc_of(os.path.join(a.spirv_dir, k + ".spv")))
         dc = declared_code(sig)
         lc = {c for c in listed.get(k, ()) if c}
         if not dc and not lc:
@@ -110,7 +112,7 @@ def scan(a):
 def read_manifest(path):
     head, rows = [], {}
     for line in open(path):
-        if line.startswith("#"):
+        if line.startswith("#") and "\t" not in line:
             head.append(line)
             continue
         c = line.rstrip("\n").split("\t")
@@ -128,6 +130,11 @@ def build(a):
         names.sort(key=lambda k: (not sc[k]["in_lists"], k))
     if a.limit:
         names = names[:a.limit]
+    extra = []
+    if a.also:
+        import batch
+        index = batch.load_index(a.spirv_dir, "library,exe,fspx,bvh")
+        extra = [l.strip() for l in open(a.also) if l.strip() and not l.startswith("#")]
     base_head, base_rows = read_manifest(a.base)
     base_dir = os.path.dirname(os.path.abspath(a.base))
     m = re.search(r"root=(\S+)", base_head[0])
@@ -142,14 +149,21 @@ def build(a):
         for line in open(results_path):
             r = json.loads(line)
             done[r["name"]] = r
+    names = extra + [k for k in names if k not in extra]
     todo = [k for k in names if k not in done or done[k]["status"] != "ok"]
     print("output variants: %d shaders, %d to build" % (len(names), len(todo)), flush=True)
 
     def one(k):
-        opts = {"vs_route": "lane", "output_variants": sc[k]["codes"],
-                "output_signature": out_types.dxbc_targets(os.path.join(dxbc, k + ".dxbc"))}
+        if k in sc:
+            stage = "ps"
+            opts = {"vs_route": "lane", "output_variants": sc[k]["codes"],
+                    "output_signature": out_types.dxbc_targets(S.dxbc_of(os.path.join(a.spirv_dir, k + ".spv")))}
+        else:
+            import batch
+            stage = index[k]["stage"]
+            opts = batch.shader_opts(index, k, {}, dxbc)
         t0 = time.monotonic()
-        r = S.compile_one(os.path.join(a.spirv_dir, k + ".spv"), "ps", cas, tr, opts,
+        r = S.compile_one(os.path.join(a.spirv_dir, k + ".spv"), stage, cas, tr, opts,
                           tmp=os.path.join(a.out, "tmp", str(os.getpid()) + "_" + str(abs(hash(k)) % 10**8)))
         return k, r, time.monotonic() - t0
 
@@ -158,7 +172,8 @@ def build(a):
         for n, f in enumerate(as_completed(futs), 1):
             k, r, dt = f.result()
             row = {"name": k, "status": r.get("status"), "key": r.get("key"), "error": r.get("error"),
-                   "codes": sc[k]["codes"], "seconds": round(dt, 1),
+                   "codes": sc[k]["codes"] if k in sc else [], "seconds": round(dt, 1),
+                   "passes": [p["pass"] for p in r.get("passes", [])], "plan": r.get("plan"),
                    "variants": {c: {kk: v.get(kk) for kk in ("status", "report", "colors", "error")}
                                 for c, v in (r.get("output_variants") or {}).items()}}
             done[k] = row
@@ -173,18 +188,29 @@ def build(a):
         c = list(base_rows[k])
         c[1] = r["key"]
         c[4] = "%s/%s/%s.metallib" % (rel_cas, r["key"][:2], r["key"])
-        passes = c[8].split(",") if c[8] not in ("", "-") else []
-        if "output_variants" not in passes:
-            passes.append("output_variants")
-        c[8] = ",".join(passes)
+        plan = r.get("plan") or {}
+        if plan.get("entry"):
+            import batch
+            sets = plan.get("sets") or {}
+            c[5] = str(plan["push"]) if plan.get("push") is not None else "-"
+            c[6] = ",".join("%d:%s" % (int(s) - 1, i) for s, i in sorted(sets.items(), key=lambda kv: int(kv[0]))) or "-"
+            c[8] = ",".join(r["passes"]) or "-"
+            c[9] = ",".join("%d:%s" % (int(kk) - 1, v) for kk, v in sorted(batch.discrete_of(plan).items(),
+                                                                         key=lambda kv: int(kv[0]))) or "-"
         new_rows[k] = c
     hdr = re.sub(r"root=\S+", "root=" + os.path.relpath(root, os.path.abspath(a.out)), base_head[0])
-    with open(os.path.join(a.out, "manifest.tsv.part"), "w") as f:
+    for k in a.rows or []:
+        c = open(k).read().rstrip("\n").split("\t")
+        new_rows[c[0]] = c
+    mname = a.manifest_name
+    with open(os.path.join(a.out, mname + ".part"), "w") as f:
         f.write(hdr)
         f.writelines(base_head[1:])
         for k, c in base_rows.items():
             f.write("\t".join(new_rows.get(k, c)) + "\n")
-    os.replace(os.path.join(a.out, "manifest.tsv.part"), os.path.join(a.out, "manifest.tsv"))
+        for k in sorted(set(new_rows) - set(base_rows)):
+            f.write("\t".join(new_rows[k]) + "\n")
+    os.replace(os.path.join(a.out, mname + ".part"), os.path.join(a.out, mname))
     with open(os.path.join(a.out, "overlay.tsv"), "w") as f:
         f.write(hdr)
         f.writelines(base_head[1:])
@@ -213,7 +239,11 @@ def main():
     ap.add_argument("--lists", nargs="*", default=[])
     ap.add_argument("--out", required=True)
     ap.add_argument("--base", default=os.path.join(MODULE, "..", "build/shaderc_msl/runs/main/manifest.tsv"))
+    ap.add_argument("--manifest-name", default="manifest.tsv")
+    ap.add_argument("--rows", nargs="*", help="files holding one ready manifest row each (shaders the base lacks)")
     ap.add_argument("--names")
+    ap.add_argument("--also", help="file of further shader names (any stage) rebuilt with the batch's options, "
+                                   "e.g. library compute shaders that now take shrink_lds")
     ap.add_argument("--first-lists", action="store_true")
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--jobs", type=int, default=2)

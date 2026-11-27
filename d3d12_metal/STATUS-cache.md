@@ -1,5 +1,86 @@
 # port/d3d12_metal/cache: pipeline cache for the native Metal path (status)
 
+## Round 8 (2026-11-27 02:10 - 04:30): world tier complete, lookups on by default, what a warm start costs in memory
+
+Host as below. Load was 3-9 after the 03:33 kernel panic and reboot (14-50 before it). I rebuilt the tree
+`build/pc7-x86_64` from the live shared sources at 03:57. Runs used `cache/tools/pc7_run.sh` with
+`cache/tools/fault_stop.sh` beside it, which kills the run at the first `[metal]` command-buffer failure or FAULTED
+encoder (lead's rule 3). Settings for both runs: 13 GiB footprint cap, `GTA6RT_METAL_INDIRECT_GUARD=window` (the
+narrowed default produced page faults in gates-d), no audio, hidden window.
+
+### 1. World tier (done; refreshed as new draw classes appear)
+
+- Lists: `cache/tools/tier_refresh.sh 300` merges every recorder file under `build/` (d3m-s7-*, up7-*, pc7-*, gates-*,
+  d3m-s8-*, pc8-*), aligned by time since each run's world start. It writes `build/pc7/lists/world-r8-300.{tsv,specs}`,
+  the tier's `pcache-tier.txt`, and `world-new.specs` (pipelines no earlier list had). The build catalog is the store
+  plus the mesh overlay plus the uint overlay (`cache/tools/catalog_merge.py` -> `build/pc7/catalog-r8.tsv`), so
+  overlay shaders are built at the keys a first use asks for.
+- Builds into `build/pc7/arch-world` (nice 10, `--jobs 3 --title-jobs 2`), in order:
+  - the rest of the 60 s list;
+  - the 2,121-pipeline 300 s list: 70 min, done at 03:32, one minute before the panic. 879 new; 14,438 s in flight;
+    2,982 s waiting for a running gta6rt;
+  - after the reboot: all 87 shards passed their size + content-hash check;
+  - the 2,429-pipeline refresh over the merged catalog: 2,394 ok, 35 refused, 93 new in 7 min (load 5-7);
+  - the uint worker's 7 `arch-int` shards, copied in as `uintint-*`;
+  - the 327 pipelines the two pc8 runs recorded that no list had: 180 tiled-lighting rect-list pipelines (reachable
+    since the uint fix), 30 `vs_classfied_fullScreen`, and cascade-shadow mesh variants. 255 were already in the
+    archive, 69 built, 3 refused (8 min, `prep-world-g`).
+- Now: **2,756 world pipelines in the list, about 2,718 in the tier, 38 refused; 95 shards, 2.65 GB.**
+- The 38 refusals: 37 are mesh shaders over 32 KiB of threadgroup memory (34,008 / 36,056 bytes), including the
+  overlay's `MS_VS_PedTransformPreSkinD_Packed_6a40bffd` (names in the requests file). 1 is a vertex input in DXGI
+  format 17, which has no Metal vertex format.
+
+### 2. Lookups on by default (port/metal `PipelineCacheDesc::read_only`, `open_pipeline_cache`; pcache)
+
+A Metal run opens its own archive directory, also looks up `build/pc7/arch-world` read-only, and prebuilds the tier's
+manifest. Nothing needs to be passed. Options: `GTA6RT_METAL_ARCHIVE_TIERS=off` or `=dirA:dirB`. A recorded pipeline
+whose shader now has another content key (overlays) is re-keyed at start.
+
+### 3. Memory: what a warm start costs (measured offline, x86_64, load 5-7)
+
+| `prepare_shaders` over the 2,429 list, all archive hits | footprint after |
+|---|---|
+| pipelines released after build | 1,880 MiB |
+| all 2,394 pipelines held (`--hold`) | 1,891 MiB |
+| libraries only: 1,758 metallibs (689 MiB on disk) loaded, no pipelines (`cache/tools/lib_footprint.mm`) | +1,388 MiB |
+
+- Held and released end at the same footprint. That is not because pipelines are free: releasing a Metal pipeline
+  state returns no memory (the Metal memory worker measured it, 04:05 note; 0.47 MiB per archive-served compute
+  pipeline).
+- All the libraries plus all 2,394 pipelines cost about 1.75 GiB. Libraries alone, for 72% of the metallibs, cost
+  1.39 GiB (an MTLLibrary is about twice its metallib's size), and the shader store keeps a library once it is loaded.
+  So libraries are most of the cost. The exact split is not measured.
+- Round 7's "+270-370 MiB of prebuilt pipelines" was the prebuilt set's libraries and pipelines, made earlier than a
+  cold run makes them. A warm start costs extra only for what the run would not have used, or would have used later.
+- So releasing an unused pipeline saves nothing; only not making it early does. The bound is now:
+  - `GTA6RT_METAL_PCACHE_AHEAD_S=10` (default): a recorded pipeline is prebuilt at most 10 s before its recorded first
+    use (for a later phase, counted from that phase's start). 0 = old behaviour.
+  - `GTA6RT_METAL_PCACHE_RELEASE_S=30` (was 60).
+- Also fixed: the prebuild thread spun on its condition variable while nothing in the queue could start; it now waits
+  250 ms.
+- Tests: `pcache_runtime_test` checks that a tier entry recorded 1,000 s into its phase stays queued: PASS. Codec and
+  archive tests: PASS.
+- Opening 2.5-2.6 GB of shards costs +66 MiB footprint and 7.7-8.9 s.
+
+### 4. Warm vs cold title runs (13 GiB cap)
+
+| run | tier | before the world | world+1 s: first uses / ready / not ready | world+5 s | longest first-use stall | end |
+|---|---|---|---|---|---|---|
+| pc8-warm-c (world at 75.5 s, load 5-7) | on (2,464 entries then) | 1,538 prebuilt (all archive hits, 142.6 s); footprint 11,561 MiB at loading-screen end | 23 / 18 / 0 | - | 13 ms | footprint cap, 14,505 MiB at world+2 s |
+| pc8-cold-d (world at 73.8 s, load 5-6) | off | footprint 10,404 MiB | 285 / 0 / 258 | 1,441 / 0 / 1,394 | 35.5 s (at world+40 s, 1,337 still not ready) | watchdog, world+41 s |
+
+- 0 new gpuEvent reports (9 before and after both runs). 0 command-buffer failures.
+- Why the warm run hit the cap: at world+2 s Metal held **2,986 MiB of buffers in 552 allocations** (layer "other"
+  3,564 MiB); the cold run at world+41 s held 385 MiB in 51. These are the blocks `external_window` sets aside, kept
+  resident (Metal memory worker, 04:05-04:20 notes). The tier makes the world ask for its buffers sooner. The fix is in
+  trees built from 04:05; mine was built at 03:57, so it did not have it.
+- What the tier removes, shown by the cold run: at world+40 s, 1,337 of its 1,517 first-used pipelines were still
+  compiling.
+- The "backend NotReady skips" counter reads 0 in both runs, so it does not count draws skipped as compiling (the
+  backend line is not wired up).
+- **Not done:** world+10 and +60 s counts and the "zero still-compiling skips after the first second" check for a warm
+  run. They need a run that stays under the cap.
+
 ## Round 7 (2026-11-26 22:35 - 11-27 02:00): shards, the world recorded, a half-built world tier, why pipelines are slow
 
 Host as below; load average 6-50 during this round (other workers' titles and compiles; noted per number). Trees:

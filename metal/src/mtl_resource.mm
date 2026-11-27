@@ -44,14 +44,20 @@ bool VaSpace::resolve(std::uint64_t va, MetalBuffer** buffer, std::uint64_t* off
 }
 
 MetalBuffer::MetalBuffer(MetalDevice* device, id<MTLBuffer> buffer, std::uint64_t va, std::uint64_t size, bool placed,
-                         bool tracked, MemoryCategory category)
+                         bool tracked, MemoryCategory category, bool resident)
     : device_(device), buffer_(buffer), va_(va), size_(size), placed_(placed), tracked_(tracked), category_(category) {
     if (va_) device_->va_space().add(va_, size_, this);
     if (!placed_) {
-        device_->make_resident(buffer_);
+        resident_ = resident;
+        if (resident) device_->make_resident(buffer_);
         accounted_ = category_ == MemoryCategory::host_window ? size_ : buffer_.allocatedSize;
         device_->ledger().add(category_, accounted_);
     }
+}
+
+void MetalBuffer::make_resident() {
+    if (placed_ || resident_.exchange(true)) return;
+    device_->make_resident(buffer_);
 }
 
 MetalBuffer::~MetalBuffer() {

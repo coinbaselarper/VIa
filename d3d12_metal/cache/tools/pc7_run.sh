@@ -16,7 +16,8 @@ tool="$port/build/macos/tools/screen_text"
 mkdir -p "$(dirname "$bin")"
 cp -p "${PC7_BIN:-$port/build/pc7-x86_64/gta6rt}" "$bin.tmp" && mv -f "$bin.tmp" "$bin" || exit 2
 "$port/io_bench/scripts/ensure_bcpack_history.sh" >/dev/null || exit 2
-script="$(python3 -I -c 'import sys; s=int(sys.argv[1]); print(",".join("a@%d" % t for t in range(40, s - 19, 5)))' "$secs")"
+# PC7_B_AFTER=T: B ("GOT IT" on COULDN'T AUTOSAVE) instead of A every 5 s from T s on (s7_world_run.sh's S7_B_AFTER).
+script="$(python3 -I -c 'import sys; s, b = int(sys.argv[1]), int(sys.argv[2]); print(",".join(("b@%d" if t >= b else "a@%d") % t for t in range(40, s - 19, 5)))' "$secs" "${PC7_B_AFTER:-100}")"
 busy() { ps -axo comm= | awk '{ n = $1; sub(/.*\//, "", n); if (n == "gta6rt" || n ~ /^gta6rt_/) f = 1 } END { exit !f }'; }
 others() { ps -axo pid=,comm= | awk -v me="$bin" '{ n = $2; sub(/.*\//, "", n); if ((n == "gta6rt" || n ~ /^gta6rt_/) && $2 != me) print $1 }'; }
 for attempt in $(seq 1 200); do

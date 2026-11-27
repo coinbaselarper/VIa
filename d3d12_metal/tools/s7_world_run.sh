@@ -37,7 +37,7 @@ for attempt in $(seq 1 400); do
   cp -p ${S4_BIN:-$tree/gta6rt} $tree/run/gta6rt
   rm -rf "$present"; mkdir -p "$present"; rm -f "$shapes"
   start=$(date +%s)
-  env GTA6RT_BIN=$tree/run/gta6rt GTA6RT_GPU=metal LEONIDA_PRESENT_FIRST_LIT="$present" \
+  env GTA6RT_METAL_FOOTPRINT_CAP_MB=13312 GTA6RT_BIN=$tree/run/gta6rt GTA6RT_GPU=metal LEONIDA_PRESENT_FIRST_LIT="$present" \
       LEONIDA_SAVE_DIR="$rd/saves" GTA6RT_METAL_ARCHIVE_DIR="$rd/pipeline-archive" \
       LEONIDA_DSTORAGE_SHAPES="$shapes" "$@" "$port/host/tools/run.sh" "$((secs + 15))" "$name" --hidden-window \
       --run-dir "$rd" --trace=0 --trace-match BinkOpenWithOptions,BinkClose --watchdog "$secs" --memory-report 30 \

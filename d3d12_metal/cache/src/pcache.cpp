@@ -93,7 +93,7 @@ struct State {
     std::vector<Watch> watch;
     Phase phase = Phase::boot;
     double phase_t0[8] = {};
-    double release_s = 60;
+    double release_s = 30, ahead_s = 10;
     bool movie = false;
     double quiet_until = 0, quiet_s = 10;
     double world_t0 = 0, world_next = 0;
@@ -152,10 +152,14 @@ void enqueue_locked(State& s, Held& h) {
 }
 
 // The first seconds of the world (its opening cutscene) and of a movie: only pipelines recorded for the phase so
-// far are prebuilt, no guesses and nothing of a later phase.
+// far are prebuilt, no guesses and nothing of a later phase. Otherwise a recorded pipeline is prebuilt at most
+// ahead_s before its recorded first use (a later phase counts from that phase's start), which bounds what is held.
 bool startable_locked(const State& s, const Held& h) {
-    if (process_age_s() >= s.quiet_until) return true;
-    return !h.bootstrap && int(h.phase) <= int(s.phase);
+    const double now = process_age_s();
+    if (now < s.quiet_until && (h.bootstrap || int(h.phase) > int(s.phase))) return false;
+    if (s.ahead_s <= 0 || h.bootstrap || int(h.phase) < int(s.phase)) return true;
+    const double rel = int(h.phase) == int(s.phase) ? now - s.phase_t0[int(s.phase)] : 0;
+    return h.expect_rel <= rel + s.ahead_s;
 }
 
 Held& add_locked(State& s, const std::string& key, const std::string& text, const Spec& spec, Phase phase, bool bootstrap) {
@@ -348,7 +352,10 @@ void worker_main() {
             if (t == s.table.end() || startable_locked(s, *t->second)) break;
             ++qi;
         }
-        if (qi == s.queue.end()) continue;
+        if (qi == s.queue.end()) {
+            s.cv.wait_for(lock, std::chrono::milliseconds(250));
+            continue;
+        }
         const auto key = std::get<3>(*qi);
         s.queue.erase(qi);
         auto it = s.table.find(key);
@@ -760,6 +767,7 @@ void start(const StartConfig& config) {
     if (const char* v = std::getenv("GTA6RT_METAL_PCACHE_HOLD")) s.max_hold = std::size_t(std::atol(v));
     if (const char* v = std::getenv("GTA6RT_METAL_PCACHE_QUIET_S")) s.quiet_s = std::atof(v);
     if (const char* v = std::getenv("GTA6RT_METAL_PCACHE_RELEASE_S")) s.release_s = std::atof(v);
+    if (const char* v = std::getenv("GTA6RT_METAL_PCACHE_AHEAD_S")) s.ahead_s = std::atof(v);
     ::mkdir(config.directory.c_str(), 0755);
     s.manifest_path = config.directory + "/pcache-manifest.txt";
     {
@@ -780,17 +788,32 @@ void start(const StartConfig& config) {
             s.prior = Manifest{};
         }
     }
-    std::size_t bad = 0;
+    std::size_t bad = 0, rekeyed = 0;
     auto add_all = [&](std::vector<Entry> entries) {
         std::vector<Entry> rel = entries;
         set_expected_rel(rel);
         std::size_t added = 0;
         for (std::size_t i = 0; i < entries.size(); ++i) {
-            const Entry& e = entries[i];
+            Entry& e = entries[i];
             Spec spec;
             if (!decode(e.text, spec, &error)) {
                 ++bad;
                 continue;
+            }
+            // A shader the store (or an overlay) now has at another content key: prebuild what a first use will ask for.
+            bool changed = false;
+            for (int k = 0; k < 2; ++k) {
+                if (spec.names[k].empty() || !s.cfg.content_key) continue;
+                const std::string ck = s.cfg.content_key(spec.names[k]).substr(0, 16);
+                if (!ck.empty() && ck != "-" && ck != spec.content[k]) {
+                    spec.content[k] = ck;
+                    changed = true;
+                }
+            }
+            if (changed) {
+                e.text = encode(spec);
+                e.key = key_of(e.text);
+                ++rekeyed;
             }
             const bool fresh = !s.table.count(e.key);
             Held& h = add_locked(s, e.key, e.text, spec, e.phase, false);
@@ -824,9 +847,11 @@ void start(const StartConfig& config) {
     s.queue.clear();
     for (auto& [k, h] : s.table) s.queue.emplace(queue_key(*h));
     load_bootstrap(s, config.directory + "/pcache-bootstrap.txt");
-    log_line("manifest %s: %zu pipelines%s; prebuilding in phase order, %u at a time, holding up to %zu", s.manifest_path.c_str(),
+    if (rekeyed) log_line("%zu recorded pipelines re-keyed to the shaders' current content keys", rekeyed);
+    log_line("manifest %s: %zu pipelines%s; prebuilding in phase order, %u at a time, holding up to %zu, %.0f s ahead of "
+             "recorded first use, released %.0f s after it unused", s.manifest_path.c_str(),
              s.prior.size(), bad ? (" (" + std::to_string(bad) + " unreadable)").c_str() : "", s.cfg.max_in_flight,
-             s.max_hold);
+             s.max_hold, s.ahead_s, s.release_s);
     if (gta6rt_governor_register) gta6rt_governor_register(GTA6RT_GOV_COMPILE_SHRINK, "pcache prebuild", governor_reclaim, nullptr);
     s.worker = std::thread(worker_main);
     s.monitor = std::thread(monitor_main);

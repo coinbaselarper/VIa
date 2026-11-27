@@ -97,6 +97,10 @@ public:
     void add(std::uint64_t va, std::uint64_t size, MetalBuffer* buffer);
     void remove(std::uint64_t va, MetalBuffer* buffer);
     bool resolve(std::uint64_t va, MetalBuffer** buffer, std::uint64_t* offset) const;
+    template <class F> void visit(F&& f) const {
+        std::lock_guard lock(mutex_);
+        for (const auto& [va, e] : ranges_) f(e.buffer);
+    }
 
 private:
     struct Entry {
@@ -111,8 +115,11 @@ private:
 class MetalBuffer final : public gpu::Buffer {
 public:
     MetalBuffer(MetalDevice* device, id<MTLBuffer> buffer, std::uint64_t va, std::uint64_t size, bool placed,
-                bool tracked, MemoryCategory category = MemoryCategory::buffer);
+                bool tracked, MemoryCategory category = MemoryCategory::buffer, bool resident = true);
     ~MetalBuffer() override;
+    bool resident() const { return resident_; }
+    void make_resident();
+    MemoryCategory category() const { return category_; }
     std::uint64_t gpu_va() const override { return va_; }
     std::uint64_t host_gpu_address() const override { return buffer_.gpuAddress; }
     void* cpu_pointer() override;
@@ -128,6 +135,7 @@ private:
     bool placed_, tracked_;
     MemoryCategory category_;
     std::uint64_t accounted_ = 0;
+    std::atomic<bool> resident_{true};
 };
 
 class MetalTexture final : public gpu::Texture {

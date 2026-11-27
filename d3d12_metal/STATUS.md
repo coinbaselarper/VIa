@@ -1,5 +1,116 @@
 # port/d3d12_metal status (round 7)
 
+## Round 8, gates worker (2026-11-27 02:15-03:10): no command buffer waits on the GPU any more — 0 GPU timeouts in 313 s of world; the pool-node fault did not recur; frame time is GPU-bound
+
+Tree `build/gates-x86_64` (new; attach.cmake super-build, `-build1..4.log`), launcher `build/gates-x86_64/run_world.sh`
+(s7_world_run.sh with this tree's private run directory). Runs `gates-a..d`, each alone on the machine (slot polled),
+load 11-18, swap 3.2-4.5 of 4-5 GiB. Measured = printed by a log or tool; inferred = reasoning.
+
+| run | settings (besides defaults) | in the world | end | GPU timeouts |
+|---|---|---:|---|---:|
+| gates-a | tail watch; pipeline tier on (cache worker's new default) | 23 s | footprint cap (exit 4) | 0 |
+| gates-b | tail watch, `GTA6RT_METAL_ARCHIVE_TIERS=off` | 257 s | footprint cap (exit 4): hash table 6 x 160 MiB | 0 (0 failed command buffers) |
+| gates-c | as b + scene probe (present + dumps) | 125 s | footprint cap (exit 4) | 0 |
+| gates-d | as c + `GTA6RT_METAL_TABLE_GENERATIONS=4`; sources now record indirect mesh draws (draw/mesh worker) | **313 s** | watchdog, rc 124 | **0** (9 command buffers failed with GPU *page faults*, below) |
+
+### 1. GPU timeout: removed by design (measured)
+
+- **Cause** (d3m-s7-k, read from its log): the command buffer Metal killed had GPU time 0: it was waiting at an
+  `encodeWaitForEvent` for another queue's progress. The direct queue was 1.5 s+ behind (command buffer 36383 with 225
+  behind it), and four compute queues' command buffers waited on it on the GPU for longer than the watchdog. Every
+  cross-queue wait the adapter encodes (`MetalQueue::consume_waits`: D3D12 fence waits whose Signal is submitted but
+  not done), the presenter's wait for every queue, and `wait_value` (the upscale stage's CPU-released gate) were GPU
+  waits of unbounded length.
+- **Fix** (port/metal `mtl_queue.mm`, announced in run/requests): a **commit gate**. A command buffer whose event waits
+  are not met when it is closed is `enqueue`d but not committed; a listener of its own commits it once every event has
+  reached its value. Metal keeps the queue's later command buffers on the CPU behind it (measured offline,
+  `build/gates-x86_64/tests/enq.mm`: a later command buffer stays "committed", not scheduled, for 1.5 s until the
+  earlier one is committed). So no command buffer waits on the GPU for anything but its own queue. `wait_value` uses
+  the same path (its CPU-released event is a commit condition). `GTA6RT_METAL_COMMIT_GATE=0` restores GPU waits.
+  Offline test `build/gates-x86_64/tests/test_commit_gate.cpp` (links the tree's `libgta6rt_metal.a`): cross-queue,
+  CPU-signalled, wait_value and a 40-deep cross-queue chain: PASS.
+- **Result**: 0 GPU timeouts and 0 waiting command buffers in gates-b (257 s in the world, default settings) and gates-d
+  (313 s, probe on); before: d3m-s7-h and -k timed out 153 / 115 s in. Command buffers held on the CPU: 100-240 per
+  10 s in the world, held p50 45-700 ms, longest 3.3 s (gates-b) — waits that were GPU waits before; 1-2 a run were
+  held past 1.5 s (the upscale gate, a present).
+- **Gate latency before / after** (list-value gates, `[rt] d3d12_xs: list values so far`): d3m-s7-k: 1,789 gates, 95%
+  timed out, releaser 20.6 ms a signal on average, longest 1,401 ms; gates-b: 5,189 gates, 75% timed out, 38.2 ms,
+  longest 2,391 ms; gates-d: 7,145 gates, 91% timed out, 29.0 ms, longest 2,015 ms. The GPU part of every wait is now
+  0 by construction; the releaser is not faster, because its Signal runs the held submissions' replay on its own thread
+  (including `MetalBindless::flush` waiting up to 2 s for a free hash-table generation). Next: run released batches on a
+  per-queue worker so the releaser's Signal returns at once (needs a re-pump rule when `release_ready` cannot take the
+  queue lock; not done).
+- New 10 s lines (port/metal): `[metal] GPU time last 10 s, N presents: ...` (busy time per queue, union of
+  GPUStartTime..GPUEndTime, and per presented frame; `GTA6RT_METAL_GPU_REPORT_S`), `[metal] commit gate: ...`,
+  `[metal] command buffer N (queue) has been held on the CPU for X ms ...` (past `GTA6RT_METAL_CB_BUDGET_MS`).
+- New failures in gates-d, not timeouts: 9 command buffers failed with `kIOGPUCommandBufferCallbackErrorPageFault`
+  (GPU time 12-107 ms; faulted encoders `lib_cs_02860..02099` x4, `lib_cs_03010` x2, `lib_cs_01449`, `lib_cs_02038`,
+  `lib_cs_00897`), from when the draw/mesh worker's sources recorded GPU-driven work (2,600 indirect mesh draws a
+  frame); the device was not lost and the run went on. Reported to that worker (inferred: wild addresses in newly run
+  GPU-driven work, not the commit gate: none of b/c had one).
+
+### 2. The pool-node overwrite at exe+0x4e9b54a: not reproduced; explicit GPU writes ruled out (measured)
+
+- **What the title does** (disassembly, exe+0x4e9b480): it takes a 64 KiB chunk from its allocator and writes the
+  chunk's node into its last 0x18 bytes: `{next 0, object, count}` (`mov [r15+rax-0x18], 0 / rbx / count`), then links
+  it at `[allocator+0x48]`; a later walk (exe+0x4e9b4b2) reads `object` and `count` of each node and calls exe+0x4e9b530,
+  which faults on object -1 (`[rcx+0xc]` = 0xb) or 0. So the node is overwritten after the title wrote it.
+- **Not reproduced**: 0 faults in gates-a..d (718 s in the world, 438 s of it with the scene probe that correlated 4 of
+  6 times in round 7). With so few runs this is not evidence that it is gone (inferred: 0 of 2 probe runs against 4 of
+  6 before, p ~0.1).
+- **Ruled out (measured)**: every GPU write command the backend encodes into title memory (fills / UAV clears,
+  `write_value`, buffer copies, query resolves, texture-to-buffer copies whose destination is a bytesNoCopy title
+  buffer, `TitleWrites` in mtl_queue.mm): 9,070-26,257 a run, all `copy_buffer` into slot-133 windows at
+  0xb8xxxxxxx; **none** in the pool region [0x30000000, 0x70000000) and none over a 64 KiB tail there. So no adapter
+  clear, readback, resolve or copy writes those nodes.
+- **Left**: shader UAV writes through title-written V#s into the placed GPU buffers the title keeps in that region
+  (bounded by the V#s, so a write there is to a range the title handed the GPU, landing after the title reused it:
+  the GPU runs 0.5-3 s behind the CPU in the world), and CPU writers (the list-values pump lands only 4/8-byte values).
+  Diagnostic in place for the next occurrence: `GTA6RT_METAL_TAIL_WATCH=30000000,70000000` (reads every 64 KiB tail
+  there every 20 ms; logs a valid node `{0|title, title object, count < 2^20}` that turns into a clear value, with the
+  command buffers completed since the previous scan, encoders named). In gates-a/d it logged 2 / 38 such changes, all
+  legitimate-looking title reuse (`{0, 0xb0438xxxx, N}` -> `{N+1, 0, 0}` or float data `3f000000 3f733333 3f800000`),
+  none followed by a fault. Faulting nodes of round 7 for comparison: 0x38eaffe8 .. 0x4396ffe8, pc7-warm-b 0x5ca1ffe8.
+- **pc7-warm-a SIGSEGV** (169 s in the world, `addr=0x12d5e8000` page aligned, `pc=0x1000056d2bd`): the gta6rt image
+  is at 0x10000000000 (low page zero), so the pc is image offset 0x56d2bd: `leonida::MetalBindless::flush() + 685` in
+  both the 01:51 d3m-s4 and the 02:18 pc7 binaries (the 23:38 binary that crashed is gone; inferred). `flush` reads
+  `bytes = table_.size_bytes()` once, then (at the generation cap) unlocks and sleeps; a table that doubles meanwhile
+  is written by `write_to_buffer` into a generation picked or made for the old size, running off the end of that
+  shared buffer onto an unmapped page. pc7-warm-a was at the cap (32 flush waits) with the table already doubled once.
+  Request posted to the bindless owner (refresh `bytes` after re-locking; check the size before writing).
+
+### 3. Frame rate: GPU-bound (measured, per presented frame)
+
+| window | frames/s | direct-queue GPU busy | GPU ms a frame | submission CPU ms a frame (heaps / replay) | compute queues |
+|---|---:|---:|---:|---:|---:|
+| gates-b, 14-170 s in the world | 0.6-1.8 | 75-99% | 550-910 | 490-1,690 (240-920 / 50-730) | 1-3 ms a frame |
+| gates-b, 210-257 s in the world | 2.6-3.9 | 23-28% | 70-92 | 240-380 (165-250 / 17-40) | |
+| gates-d (indirect mesh recorded), 60-313 s | 2.0-3.4 | 72-97% | 250-390 | 220-550 (130-400 / 22-210) | |
+
+- In the slow phase the GPU sets the rate: the direct queue is busy nearly all the time and command buffers of
+  0.6-1.1 s all carry `compute x366-1002 library/lib_cs_01035|01064 .. lib_cs_01050` and `compute x78-137
+  lib_cs_01609 .. lib_cs_01728`; the submission CPU numbers in that phase include waiting for the GPU (hash-table
+  generation cap). Run e's 7-19 frames/s was 22-32 s into the world, before those compute passes ran (inferred from
+  gates-b's own curve: 14-18 frames/s at +73 s, then 1 frame/s from +84 s as the pipelines become ready).
+- When those passes stop (gates-b +270 s) the submission CPU sets 3-4 frames/s and `heaps` (the console descriptor heap
+  copy, ~6 ms a submission x 26-45 submissions) is two thirds of it.
+- Gate waits are not the limiting term: held command buffers sit in the shadow of the direct queue's backlog.
+- The largest terms are not mine (title compute as translated; `heaps` in the device shim): requests posted in
+  run/requests/d3d12_metal.md (per-encoder GPU timing of those families; a cheaper console-heap copy). No frame-rate
+  fix of mine this round.
+
+### Scene targets
+
+No 3D geometry yet. gates-d frame 605's alpha-prepass target set (3 targets by `PS_AlphaPrepass`) was the first
+non-empty render-size target I saw: `run/present/gates-d-scene/scene_00605_gbuffer2.png` (R8, 93% non-zero: a vertical
+gradient with dither noise and one black square — a screen-space term, not geometry); the scene colour was NaN/Inf in
+every texel, the G-buffer proper and depth empty (depth 1.0 only in the 48 letterbox rows).
+
+### Switches added this round
+
+port/metal: `GTA6RT_METAL_COMMIT_GATE` (default on), `GTA6RT_METAL_GPU_REPORT_S` (10), `GTA6RT_METAL_TITLE_WRITES`
+(default on), `GTA6RT_METAL_TAIL_WATCH=<lo>,<hi>` (off).
+
 ## Round 7 (2026-11-26 22:35 - 11-27 02:10): stability and the first world frame on Metal — the heap damage is gone, a title-side fault and an empty G-buffer remain; no world frame yet
 
 Tree `build/d3m-s4-x86_64` (`-build19..29.log`). Launcher `tools/s7_world_run.sh` (new): s4_world_run.sh with a private

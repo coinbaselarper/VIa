@@ -231,6 +231,19 @@ int main() {
               std::strcmp(out[1].info.name, "profile/main") == 0 &&
               std::memcmp(out[1].data, profile.data(), profile.size()) == 0,
           "ReadBlobData returns both blobs, byte for byte, pointing into the buffer");
+    const size_t exact = 2 * sizeof(Blob) + std::strlen("story") + 1 + story.size() + std::strlen("profile/main") + 1 +
+                         profile.size();
+    std::vector<uint8_t> tight(exact);
+    count = 2;
+    auto* tout = reinterpret_cast<Blob*>(tight.data());
+    check(at<Read>(save, 20)(save, container, names, &count, exact, tout) == S_OK && count == 2 &&
+              std::strcmp(tout[0].info.name, "story") == 0 && std::memcmp(tout[0].data, story.data(), story.size()) == 0 &&
+              std::strcmp(tout[1].info.name, "profile/main") == 0 &&
+              std::memcmp(tout[1].data, profile.data(), profile.size()) == 0,
+          "ReadBlobData fits a buffer of sizeof(XGameSaveBlob) + name + NUL + size per blob, the size titles pass");
+    count = 2;
+    check(at<Read>(save, 20)(save, container, names, &count, exact - 1, tout) == E_GS_PROVIDED_BUFFER_TOO_SMALL,
+          "one byte less is too small");
     const char* absent[] = {"nope"};
     count = 1;
     check(at<Read>(save, 20)(save, container, absent, &count, buffer.size() * 8, out) == E_GS_BLOB_NOT_FOUND,
