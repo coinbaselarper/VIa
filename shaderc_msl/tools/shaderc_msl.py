@@ -151,6 +151,10 @@ def prepare(words, stage, opts):
         if hot:
             passes.append({"pass": "noinline_hot_helpers", "level": "msl", "min_calls": NOINLINE_MIN_CALLS,
                            "callees": len(hot)})
+    if opts.get("merge_typed_reads"):
+        passes.append({"pass": "merge_typed_reads", "level": "msl", "version": 1})
+    if opts.get("loop_cap"):
+        passes.append({"pass": "loop_cap", "level": "msl", "cap": int(opts["loop_cap"]), "version": 1})
     caps = spv.Module(w).caps
     if caps & {10}:
         passes.append({"pass": "soft_f64", "level": "msl"})
@@ -404,6 +408,17 @@ def msl_fixups(text, passes):
         text, c = noinline_hot(text, NOINLINE_MIN_CALLS)
         info["noinline_helpers"] = c
         changed |= bool(c)
+    if "merge_typed_reads" in names:
+        import tmem
+        text, c = tmem.merge_typed_reads(text)
+        info["typed_ops_merged"] = c
+        changed |= bool(c)
+    if "loop_cap" in names:
+        import tmem
+        cap = next(p["cap"] for p in passes if p["pass"] == "loop_cap")
+        text, c = tmem.loop_cap(text, cap)
+        info["loops_capped"] = c
+        changed |= bool(c)
     if "pack_mesh_struct" in names:
         text, c = pack_mesh_struct(text)
         info["mesh_struct_sorted"] = c
@@ -624,8 +639,12 @@ def main():
     ap.add_argument("--output-variants", default="",
                     help="ps: comma-separated output-type codes (f/u/i per colour location, tools/out_types.py); the "
                          "library gets an entry main0_o<code> for each that needs one")
+    ap.add_argument("--merge-typed-reads", action="store_true",
+                    help="typed-view read diamonds -> one noinline helper call (thread-private memory, tools/tmem.py)")
+    ap.add_argument("--loop-cap", type=int, default=0, help="a lane leaves any loop after this many iterations (0 = off)")
     a = ap.parse_args()
-    opts = {"vs_route": a.vs_route, "force": a.force, "dual_source": a.dual_source}
+    opts = {"vs_route": a.vs_route, "force": a.force, "dual_source": a.dual_source,
+            "merge_typed_reads": a.merge_typed_reads, "loop_cap": a.loop_cap}
     if a.output_variants:
         import out_types
         opts["output_variants"] = [c for c in a.output_variants.split(",") if c]

@@ -1073,6 +1073,158 @@ struct ActiveQuery {
     std::uint32_t index = 0;
 };
 
+// GTA6RT_METAL_DISPATCH_TIMING=<pipeline label substrings, comma-separated, or "all"> (off by default): for a window of
+// GTA6RT_METAL_DISPATCH_TIMING_WINDOW_S (2) seconds every GTA6RT_METAL_DISPATCH_TIMING_S (30), each compute dispatch
+// whose pipeline label matches gets an encoder of its own that waits for the encoders before it and takes timestamps
+// at its start and end (this GPU samples at encoder boundaries only), and once the window's command buffers are done
+// one table goes to the log: per pipeline, dispatches, GPU time (sum, largest), threadgroups (an indirect dispatch's
+// read back from its pre-pass record) and threads a group. It serializes the timed dispatches.
+class DispatchTiming {
+public:
+    struct Entry {
+        std::string label;
+        std::uint32_t sample = 0;
+        std::uint64_t groups = 0;
+        std::uint32_t group_threads = 0;
+        id<MTLBuffer> records = nil;
+        std::uint64_t record_offset = 0;
+        std::uint32_t record_count = 0;
+    };
+
+    static DispatchTiming& get() {
+        static DispatchTiming* t = new DispatchTiming;
+        return *t;
+    }
+    bool on() const { return !patterns_.empty(); }
+    bool matches(const std::string& label) const {
+        for (const std::string& p : patterns_)
+            if (p == "all" || label.find(p) != std::string::npos) return true;
+        return false;
+    }
+    // A command buffer being encoded now times its dispatches: the window is open. Counts it as outstanding.
+    bool begin_command_buffer() {
+        const double now = CACurrentMediaTime();
+        std::lock_guard lock(mutex_);
+        if (start_ == 0) start_ = now + period_;
+        if (now < start_) return false;
+        if (now >= start_ + window_) {
+            while (now >= start_ + window_) start_ += period_;
+            if (now < start_) return false;
+        }
+        if (!open_) {
+            open_ = true;
+            window_start_ = start_;
+        }
+        ++outstanding_;
+        ++command_buffers_;
+        return true;
+    }
+    void completed(std::vector<Entry>& entries, id<MTLCounterSampleBuffer> samples, std::uint32_t used, double tick_ns,
+                   double gpu_ms) {
+        NSData* data = used ? [samples resolveCounterRange:NSMakeRange(0, used)] : nil;
+        const auto* stamps = data ? static_cast<const MTLCounterResultTimestamp*>(data.bytes) : nullptr;
+        const std::size_t n = data ? data.length / sizeof(MTLCounterResultTimestamp) : 0;
+        std::lock_guard lock(mutex_);
+        for (Entry& e : entries) {
+            Agg& a = agg_[e.label];
+            ++a.dispatches;
+            std::uint64_t groups = e.groups;
+            if (e.records) {
+                groups = 0;
+                const auto* w = reinterpret_cast<const std::uint32_t*>(static_cast<const std::uint8_t*>(e.records.contents) +
+                                                                       e.record_offset);
+                for (std::uint32_t i = 0; i < e.record_count; ++i) {
+                    const std::uint64_t g = std::uint64_t(w[i * 3]) * w[i * 3 + 1] * w[i * 3 + 2];
+                    groups += g;
+                    a.empty_records += g == 0;
+                }
+                a.records += e.record_count;
+                ++a.indirect;
+            }
+            a.groups += groups;
+            a.threads += groups * e.group_threads;
+            a.group_threads = e.group_threads;
+            if (e.sample + 1 < n && stamps[e.sample].timestamp != MTLCounterErrorValue &&
+                stamps[e.sample + 1].timestamp != MTLCounterErrorValue &&
+                stamps[e.sample + 1].timestamp >= stamps[e.sample].timestamp) {
+                const double ns = double(stamps[e.sample + 1].timestamp - stamps[e.sample].timestamp) * tick_ns;
+                a.ns += ns;
+                a.max_ns = std::max(a.max_ns, ns);
+                timed_ns_ += ns;
+            } else {
+                ++a.unsampled;
+            }
+            e.records = nil;
+        }
+        gpu_ms_ += gpu_ms;
+        if (outstanding_) --outstanding_;
+        const double now = CACurrentMediaTime();
+        if (!open_ || outstanding_ || now < window_start_ + window_) return;
+        report(now);
+    }
+    void abandoned() {
+        std::lock_guard lock(mutex_);
+        if (outstanding_) --outstanding_;
+    }
+
+private:
+    struct Agg {
+        std::uint64_t dispatches = 0, indirect = 0, records = 0, empty_records = 0, groups = 0, threads = 0, unsampled = 0;
+        std::uint32_t group_threads = 0;
+        double ns = 0, max_ns = 0;
+    };
+    DispatchTiming() {
+        const char* v = std::getenv("GTA6RT_METAL_DISPATCH_TIMING");
+        if (v && *v && std::strcmp(v, "0") != 0) {
+            std::string all(v);
+            std::size_t at = 0;
+            while (at <= all.size()) {
+                const std::size_t comma = all.find(',', at);
+                const std::string part = all.substr(at, comma == std::string::npos ? std::string::npos : comma - at);
+                if (!part.empty()) patterns_.push_back(part);
+                if (comma == std::string::npos) break;
+                at = comma + 1;
+            }
+        }
+        if (const char* p = std::getenv("GTA6RT_METAL_DISPATCH_TIMING_S")) period_ = std::max(1.0, std::atof(p));
+        if (const char* w = std::getenv("GTA6RT_METAL_DISPATCH_TIMING_WINDOW_S")) window_ = std::max(0.1, std::atof(w));
+    }
+    void report(double now) {
+        std::vector<std::pair<std::string, Agg>> rows(agg_.begin(), agg_.end());
+        std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) { return a.second.ns > b.second.ns; });
+        std::fprintf(stderr, "[metal] dispatch timing: window of %.1f s (%.1f s after it), %llu command buffers, GPU "
+                             "time of those %.1f ms, timed dispatches %.1f ms, %zu pipelines:\n",
+                     window_, now - window_start_ - window_, (unsigned long long)command_buffers_, gpu_ms_,
+                     timed_ns_ / 1e6, rows.size());
+        std::size_t shown = 0;
+        for (const auto& [label, a] : rows) {
+            if (++shown > 40) break;
+            std::fprintf(stderr, "[metal]   %-48s x%-5llu %9.2f ms (max %7.2f) groups %llu (%.0f a dispatch) x %u "
+                                 "threads%s",
+                         label.substr(0, 48).c_str(), (unsigned long long)a.dispatches, a.ns / 1e6, a.max_ns / 1e6,
+                         (unsigned long long)a.groups, a.dispatches ? double(a.groups) / double(a.dispatches) : 0.0,
+                         a.group_threads, a.unsampled ? " (some unsampled)" : "");
+            if (a.indirect)
+                std::fprintf(stderr, "; indirect x%llu, %llu records, %llu empty", (unsigned long long)a.indirect,
+                             (unsigned long long)a.records, (unsigned long long)a.empty_records);
+            std::fprintf(stderr, "\n");
+        }
+        agg_.clear();
+        open_ = false;
+        command_buffers_ = 0;
+        gpu_ms_ = timed_ns_ = 0;
+    }
+
+    std::vector<std::string> patterns_;
+    double period_ = 30, window_ = 2;
+    std::mutex mutex_;
+    double start_ = 0, window_start_ = 0;
+    bool open_ = false;
+    std::uint64_t outstanding_ = 0, command_buffers_ = 0;
+    double gpu_ms_ = 0, timed_ns_ = 0;
+    std::unordered_map<std::string, Agg> agg_;
+};
+
 class Encoder {
 public:
     Encoder(MetalQueue* queue) : q_(queue), d_(queue->device()) {}
@@ -1202,6 +1354,27 @@ private:
     id<MTLFence> prepass_fence_ = nil;
     std::vector<const void*> rp_targets_;
     std::vector<MetalDescriptorHeap*> cb_tables_;
+    std::vector<id<MTLResource>> named_;
+    std::uint64_t named_version_ = UINT64_MAX;
+    bool refresh_named() {
+        if (d_->encoder_resource_version() != named_version_) d_->encoder_resources(named_, named_version_);
+        if (named_.empty()) return false;
+        d_->encoder_resource_uses.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+    void declare_named(id<MTLComputeCommandEncoder> enc) {
+        if (!refresh_named()) return;
+        std::vector<__unsafe_unretained id<MTLResource>> list(named_.begin(), named_.end());
+        [enc useResources:list.data() count:list.size() usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+    }
+    void declare_named(id<MTLRenderCommandEncoder> enc) {
+        if (!refresh_named()) return;
+        std::vector<__unsafe_unretained id<MTLResource>> list(named_.begin(), named_.end());
+        [enc useResources:list.data()
+                    count:list.size()
+                    usage:MTLResourceUsageRead | MTLResourceUsageWrite
+                   stages:MTLRenderStageVertex | MTLRenderStageFragment | MTLRenderStageObject | MTLRenderStageMesh];
+    }
     NSMutableArray* kept_ = [NSMutableArray new];
     id<MTLBuffer> constants_ = nil;
     std::uint32_t next_constant_ = 0;
@@ -1219,6 +1392,12 @@ private:
     std::size_t pos_ = 0;
     std::vector<bool> event_on_cb_;
     Status status_ = Status::ok;
+    int timing_cb_ = -1;
+    std::vector<DispatchTiming::Entry> timed_;
+    id<MTLCounterSampleBuffer> timing_samples_ = nil;
+    std::uint32_t timing_used_ = 0;
+    bool timed_compute(const PipelineCore* p);
+    void finish_timing();
 };
 
 Status Encoder::run(std::span<gpu::CommandList* const> lists) {
@@ -1315,6 +1494,7 @@ void Encoder::close_command_buffer() {
     }
     scratch_total_ = prepass_records_ = 0;
     prepass_largest_ = 0;
+    finish_timing();
     q_->end_command_buffer(cb_, {}, std::move(summary_));
     summary_.clear();
     label_index_ = 0;
@@ -1585,6 +1765,7 @@ id<MTLComputeCommandEncoder> Encoder::compute() {
     if (render_ || blit_) end_encoder();
     if (!compute_) {
         compute_ = [cb_ computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
+        declare_named(compute_);
         const EncoderFences f = q_->open_encoder(join_ ? MetalQueue::Join::join : MetalQueue::Join::none, {});
         join_ = false;
         for (std::uint32_t i = 0; i < f.wait_count; ++i) [compute_ waitForFence:f.wait[i]];
@@ -1684,6 +1865,7 @@ void Encoder::begin_render(MTLRenderPassDescriptor* rp, std::uint32_t w, std::ui
     }
     id<MTLFence> extra = prepass_fence_;
     render_ = [cb_ renderCommandEncoderWithDescriptor:rp];
+    declare_named(render_);
     pass_vis_ = vis;
     pass_w_ = w;
     pass_h_ = h;
@@ -2492,10 +2674,20 @@ void Encoder::dispatch(const CmdDispatch& c) {
         }
         return;
     }
-    compute();
+    const bool timed = timed_compute(p);
+    if (!timed) compute();
     if (!bind_compute(s, p)) {
         status_ = Status::invalid_argument;
         return;
+    }
+    if (timed) {
+        const MTLSize g = p->group_size();
+        DispatchTiming::Entry& e = timed_.back();
+        e.group_threads = std::uint32_t(g.width * g.height * g.depth);
+        e.groups = (c.flags & dispatch_flag::thread_counts)
+                       ? std::uint64_t((c.x + g.width - 1) / g.width) * ((c.y + g.height - 1) / g.height) *
+                             ((c.z + g.depth - 1) / g.depth)
+                       : std::uint64_t(c.x) * c.y * c.z;
     }
     if (c.flags & dispatch_flag::thread_counts) {
         [compute_ dispatchThreads:MTLSizeMake(c.x, c.y, c.z) threadsPerThreadgroup:p->group_size()];
@@ -2505,6 +2697,7 @@ void Encoder::dispatch(const CmdDispatch& c) {
     }
     d_->counters().dispatches++;
     gta6rt_hud_add_dispatches(1);
+    if (timed) end_encoder();
 }
 
 bool Encoder::bind_mesh(const DrawState& s, MetalMeshPipeline* p) {
@@ -2609,10 +2802,21 @@ void Encoder::indirect(const CmdIndirect& c) {
             base = pr.offset;
             stride = packed;
         }
-        compute();
+        const bool timed = timed_compute(p);
+        if (!timed) compute();
         if (!bind_compute(s, p)) {
             status_ = Status::invalid_argument;
             return;
+        }
+        if (timed) {
+            const MTLSize g = p->group_size();
+            DispatchTiming::Entry& e = timed_.back();
+            e.group_threads = std::uint32_t(g.width * g.height * g.depth);
+            if (stride == packed && src != args->mtl()) {
+                e.records = src;
+                e.record_offset = base;
+                e.record_count = d.max_count;
+            }
         }
         for (std::uint32_t i = 0; i < d.max_count; ++i)
             [compute_ dispatchThreadgroupsWithIndirectBuffer:src
@@ -2621,6 +2825,7 @@ void Encoder::indirect(const CmdIndirect& c) {
         d_->counters().indirect_commands += d.max_count;
         d_->counters().dispatches += d.max_count;
         gta6rt_hud_add_dispatches(d.max_count);
+        if (timed) end_encoder();
         return;
     }
     const Cmd* self = &(*cmds_)[pos_];
@@ -2794,6 +2999,72 @@ void Encoder::resolve(const CmdResolveQueries& c) {
         [blit() fillBuffer:c.dst->mtl() range:NSMakeRange(c.offset, std::size_t(c.count) * 88) value:0];
         break;
     }
+}
+
+// DispatchTiming: opens the timed encoder for one dispatch of `p` (true), or leaves the dispatch to compute() (false).
+bool Encoder::timed_compute(const PipelineCore* p) {
+    DispatchTiming& t = DispatchTiming::get();
+    if (!t.on() || !p || !d_->timestamp_counters()) return false;
+    if (timing_cb_ < 0) timing_cb_ = t.begin_command_buffer() ? 1 : 0;
+    if (!timing_cb_ || !t.matches(p->label_text)) return false;
+    constexpr std::uint32_t kSamples = 4096;
+    if (!timing_samples_) {
+        MTLCounterSampleBufferDescriptor* sd = [MTLCounterSampleBufferDescriptor new];
+        sd.counterSet = d_->timestamp_counters();
+        sd.sampleCount = kSamples;
+        sd.storageMode = MTLStorageModeShared;
+        NSError* e = nil;
+        timing_samples_ = [d_->mtl() newCounterSampleBufferWithDescriptor:sd error:&e];
+        if (!timing_samples_) {
+            log("dispatch timing: %s", e.localizedDescription.UTF8String);
+            timing_cb_ = 0;
+            return false;
+        }
+    }
+    if (timing_used_ + 2 > kSamples) return false;
+    end_encoder();
+    flush_clears();
+    MTLComputePassDescriptor* cpd = [MTLComputePassDescriptor computePassDescriptor];
+    cpd.dispatchType = MTLDispatchTypeConcurrent;
+    cpd.sampleBufferAttachments[0].sampleBuffer = timing_samples_;
+    cpd.sampleBufferAttachments[0].startOfEncoderSampleIndex = timing_used_;
+    cpd.sampleBufferAttachments[0].endOfEncoderSampleIndex = timing_used_ + 1;
+    compute_ = [cb_ computeCommandEncoderWithDescriptor:cpd];
+    const EncoderFences f = q_->open_encoder(join_ ? MetalQueue::Join::join : MetalQueue::Join::observe, {});
+    join_ = false;
+    for (std::uint32_t i = 0; i < f.wait_count; ++i) [compute_ waitForFence:f.wait[i]];
+    update_ = f.update;
+    compute_joined_ = f.joined;
+    d_->counters().compute_encoders++;
+    begin_label("compute");
+    declare_named(compute_);
+    DispatchTiming::Entry e;
+    e.label = p->label_text.empty() ? std::string("(unlabelled)") : p->label_text;
+    e.sample = timing_used_;
+    timing_used_ += 2;
+    timed_.push_back(std::move(e));
+    return true;
+}
+
+void Encoder::finish_timing() {
+    const bool counted = timing_cb_ == 1;
+    timing_cb_ = -1;
+    if (!counted) return;
+    if (timed_.empty()) {
+        DispatchTiming::get().abandoned();
+        return;
+    }
+    auto entries = std::make_shared<std::vector<DispatchTiming::Entry>>(std::move(timed_));
+    timed_.clear();
+    id<MTLCounterSampleBuffer> samples = timing_samples_;
+    const std::uint32_t used = timing_used_;
+    const double tick_ns = d_->caps().timestamp_frequency ? 1e9 / double(d_->caps().timestamp_frequency) : 1.0;
+    [cb_ addCompletedHandler:^(id<MTLCommandBuffer> done) {
+      const double gpu_ms = done.GPUEndTime > done.GPUStartTime ? (done.GPUEndTime - done.GPUStartTime) * 1e3 : 0;
+      DispatchTiming::get().completed(*entries, samples, used, tick_ns, gpu_ms);
+    }];
+    timing_samples_ = nil;
+    timing_used_ = 0;
 }
 
 // A timestamp is the end of a one-thread compute encoder that waits for every earlier encoder of the queue:

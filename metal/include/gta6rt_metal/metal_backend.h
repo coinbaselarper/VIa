@@ -61,6 +61,15 @@ bool set_debug_buffer(gpu::Device* device, gpu::Buffer* buffer);
 // A buffer made with BufferDesc::resident = false joins the device residency set. False for another backend.
 bool make_resident(gpu::Device* device, gpu::Buffer* buffer);
 
+// From now on (on) or no more (off), every compute and render encoder declares `buffer` with useResource (read and
+// write, every render stage) when it opens: memory shaders reach only by address, kept out of the device residency
+// set (HostBufferDesc::resident = false). The buffer must outlive the command buffers encoded meanwhile. False for
+// another backend.
+bool set_encoder_resource(gpu::Device* device, gpu::Buffer* buffer, bool on);
+// How many buffers set_encoder_resource names now, and the useResource calls made with them so far.
+std::uint64_t encoder_resource_count(gpu::Device* device);
+std::uint64_t encoder_resource_uses(gpu::Device* device);
+
 // Diagnostics: live buffers outside heaps by label (MiB and count, resident or not, largest first), and Metal's
 // allocated size that no backend category holds (pipeline code, libraries, encoder memory).
 std::string memory_detail(gpu::Device* device, unsigned max_labels = 12);

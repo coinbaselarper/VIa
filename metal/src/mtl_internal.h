@@ -841,6 +841,12 @@ public:
     void make_resident(id<MTLAllocation> allocation);
     void evict(id<MTLAllocation> allocation);
     void commit_residency();
+    // metal::set_encoder_resource: the buffers every compute and render encoder names with useResource.
+    void set_encoder_resource(id<MTLResource> resource, bool on);
+    std::uint64_t encoder_resource_version() const { return encoder_resource_version_.load(std::memory_order_acquire); }
+    void encoder_resources(std::vector<id<MTLResource>>& out, std::uint64_t& version);
+    std::uint64_t encoder_resource_count();
+    std::atomic<std::uint64_t> encoder_resource_uses{0};
     bool table_residency() const { return table_residency_; }
 
     // Releases wait for the GPU (spike/r7-device-loss): Metal fails a command buffer with InvalidResource when an
@@ -888,6 +894,9 @@ private:
     std::mutex residency_mutex_;
     id<MTLResidencySet> resident_ = nil;
     bool resident_dirty_ = false;
+    std::mutex encoder_resource_mutex_;
+    std::vector<id<MTLResource>> encoder_resources_;
+    std::atomic<std::uint64_t> encoder_resource_version_{0};
     struct Retired {
         id object = nil;
         id<MTLAllocation> evict = nil;

@@ -9,9 +9,15 @@
 #include "metal_context.h"
 
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cstdint>
+#include <cstring>
+#include <deque>
+#include <iterator>
 #include <memory>
 #include <mutex>
+#include <unordered_map>
 #include <vector>
 
 namespace leonida {
@@ -45,6 +51,99 @@ constexpr std::uint32_t storage_binding(ImageDimension d, std::uint32_t componen
 constexpr std::uint32_t r32ui_binding(ImageDimension d) {
     return d == ImageDimension::dim_2d ? 4 : d == ImageDimension::dim_3d ? 7 : no_binding;
 }
+
+// The descriptor hash table written in place, into the buffer the GPU may be reading (MetalBindless::flush). A
+// shader matches a slot's 8 key words and then loads its index, with no order between those loads and no pad check,
+// so it can see any mix of a slot's old and new words. A change is safe when every mix gives an index the key had or
+// 0 (the fallback): a new index for the same key; a key into an empty slot (all zeros); a key removed. One key replaced
+// by another is not (a mix can pair the old key with the new index), nor is a refill of a slot emptied in place while
+// GPU work that may have read it is in flight (its cached old key can pair with the new index): both go to a new
+// generation instead.
+class InPlaceRefills {
+public:
+    void emptied(std::uint32_t slot, std::uint64_t record) { emptied_[slot] = record; }
+    bool blocked(std::uint32_t slot, std::uint64_t first_unreleased) const {
+        const auto it = emptied_.find(slot);
+        return it != emptied_.end() && it->second >= first_unreleased;
+    }
+    void prune(std::uint64_t first_unreleased) {
+        if (emptied_.empty() || first_unreleased == pruned_) return;
+        pruned_ = first_unreleased;
+        for (auto it = emptied_.begin(); it != emptied_.end();)
+            it = it->second < first_unreleased ? emptied_.erase(it) : std::next(it);
+    }
+    void clear() { emptied_.clear(); }
+    std::size_t size() const { return emptied_.size(); }
+
+private:
+    std::unordered_map<std::uint32_t, std::uint64_t> emptied_;
+    std::uint64_t pruned_ = 0;
+};
+
+struct InPlaceResult {
+    bool written = false;
+    bool emptied = false;  // some slot was emptied: the caller records `record`
+    bool rekeyed = false;  // refused: a slot changes from one key to another
+};
+
+// `gpu` is the table buffer (word 0 the mask, then 10 words a slot) holding what `table` held before `slots` changed.
+// Writes every changed slot when all are safe; writes nothing otherwise.
+inline InPlaceResult write_in_place(std::uint32_t* gpu, const DescriptorTable& table,
+                                    const std::vector<std::uint32_t>& slots, InPlaceRefills& refills,
+                                    std::uint64_t record, std::uint64_t first_unreleased) {
+    enum Kind : std::uint8_t { same, index, fill, empty };
+    InPlaceResult out;
+    std::vector<std::uint32_t> next(slots.size() * 10);
+    std::vector<std::uint8_t> kinds(slots.size());
+    const std::size_t capacity = table.capacity();
+    const auto zero = [](const std::uint32_t* w) {
+        for (int i = 0; i < 10; ++i)
+            if (w[i]) return false;
+        return true;
+    };
+    for (std::size_t i = 0; i < slots.size(); ++i) {
+        if (slots[i] >= capacity || !table.read_slot(slots[i], &next[i * 10])) return out;
+        const std::uint32_t* now = gpu + 1 + std::size_t(slots[i]) * 10;
+        const std::uint32_t* to = &next[i * 10];
+        if (std::memcmp(now, to, 32) == 0) {
+            kinds[i] = std::memcmp(now + 8, to + 8, 8) == 0 ? same : index;
+        } else if (zero(to)) {
+            kinds[i] = empty;
+        } else if (zero(now)) {
+            if (refills.blocked(slots[i], first_unreleased)) return out;
+            kinds[i] = fill;
+        } else {
+            out.rekeyed = true;
+            return out;
+        }
+    }
+    for (std::size_t i = 0; i < slots.size(); ++i) {
+        volatile std::uint32_t* dst = gpu + 1 + std::size_t(slots[i]) * 10;
+        const std::uint32_t* to = &next[i * 10];
+        switch (kinds[i]) {
+        case same:
+            break;
+        case index:
+            dst[8] = to[8];
+            dst[9] = to[9];
+            break;
+        case fill:
+            for (int w = 9; w >= 1; --w) dst[w] = to[w];
+            dst[0] = to[0];
+            break;
+        case empty:
+            dst[0] = 0;
+            for (int w = 1; w < 10; ++w) dst[w] = 0;
+            refills.emptied(slots[i], record);
+            out.emptied = true;
+            break;
+        }
+    }
+    std::atomic_thread_fence(std::memory_order_release);
+    out.written = true;
+    return out;
+}
+
 }  // namespace bindless
 
 class MetalBindless {
@@ -73,7 +172,8 @@ public:
     struct Stats {
         std::uint64_t generations = 0, table_bytes = 0, images = 0, samplers = 0, full = 0;
         std::uint64_t live_generations = 0, generation_bytes = 0, generations_made = 0, generations_freed = 0;
-        std::uint64_t full_writes = 0, slot_writes = 0;
+        std::uint64_t full_writes = 0, slot_writes = 0, in_place_flushes = 0, in_place_refused_rekey = 0;
+        std::uint64_t in_place_refused_refill = 0;
     };
     Stats stats() const;
 
@@ -111,8 +211,23 @@ private:
     };
     std::vector<std::uint32_t> journal_;  // changed slots, journal_base_ .. journal_seq_
     std::uint64_t journal_base_ = 0, journal_seq_ = 0, table_epoch_ = 0, full_writes_ = 0, slot_writes_ = 0;
-    std::uint64_t throttled_flushes_ = 0, throttled_us_ = 0;
+    std::uint64_t throttled_flushes_ = 0, throttled_us_ = 0, in_place_flushes_ = 0;
+    std::uint64_t in_place_refused_rekey_ = 0, in_place_refused_refill_ = 0;
     bool generation_free(Generation& g, std::chrono::steady_clock::time_point now);
+    DescriptorTable::Changes take_all_changes();
+    std::uint64_t release_empty_records(std::chrono::steady_clock::time_point now);
+    DescriptorTable::Changes carried_;
+    struct EmptyRecord {
+        std::uint64_t id = 0;
+        std::chrono::steady_clock::time_point time{};
+        std::vector<std::pair<gpu::Fence*, std::uint64_t>> marks, settle_marks;
+        bool settled = false;
+    };
+    std::deque<EmptyRecord> empty_records_;
+    std::uint64_t next_record_ = 1;
+    bindless::InPlaceRefills refills_;
+    std::chrono::steady_clock::time_point last_report_{};
+    void report_in_place(std::chrono::steady_clock::time_point now);
     std::vector<Generation> generations_;
     std::uint64_t generations_freed_ = 0, generations_made_ = 0, generation_bytes_ = 0;
     std::size_t current_ = SIZE_MAX;

@@ -96,7 +96,7 @@ std::unique_ptr<gpu::Buffer> MetalDevice::create_host_buffer(const HostBufferDes
     if (!b) return fail("newBufferWithBytesNoCopy refused the range");
     if (desc.label) b.label = @(desc.label);
     const std::uint64_t va = desc.va ? desc.va : va_.allocate(desc.size, 1ull << 16);
-    return std::make_unique<MetalBuffer>(this, b, va, desc.size, false, false, MemoryCategory::host_window);
+    return std::make_unique<MetalBuffer>(this, b, va, desc.size, false, false, MemoryCategory::host_window, desc.resident);
 }
 
 std::unique_ptr<gpu::Texture> MetalDevice::create_buffer_texture(gpu::Buffer* buffer, std::uint64_t offset,

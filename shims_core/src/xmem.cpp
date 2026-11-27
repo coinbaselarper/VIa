@@ -14,6 +14,7 @@
 // and XMemResetWriteWatch, the title-memory/label/geometry notifications for the D3D12 layer, and the stream-pool
 // mirror of CopyPageMappingsBatchX. These are listed in STATUS.md.
 #include <mach/mach.h>
+#include <mach/mach_vm.h>
 #include <sys/sysctl.h>
 #include <unistd.h>
 
@@ -24,6 +25,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <limits>
 #include <map>
 #include <mutex>
@@ -185,7 +187,22 @@ uint32_t window_vm_prot(uint32_t protect, const void* base) {
 struct PhysicalPool {
     void* base = nullptr;
     uint64_t size = 0;
+    uint64_t physical = 0;  // the slots physical pages may take: [1, physical / 64 KiB]; above them, virtual runs
+    mach_port_t entry = MACH_PORT_NULL;
 };
+
+// GTA6RT_METAL_TITLE_POOL=1: the pool is one Mach memory entry mapped once over its reservation and never moved,
+// protected or unmapped while the process lives, so a GPU buffer made over the pool's host range stays valid
+// whatever the title does to its own views. Freed slots are zeroed when handed out again instead of decommitted
+// (a decommit maps fresh memory over the host range), and committed XMemVirtualAlloc and MEM_GRAPHICS VirtualAlloc
+// memory is a run of pool slots the title's range is a view of.
+bool entry_pool_wanted() {
+    static const bool on = [] {
+        const char* v = gta6rt_env_get("GTA6RT_METAL_TITLE_POOL");
+        return v && std::strcmp(v, "1") == 0;
+    }();
+    return on;
+}
 
 constexpr uint64_t kPageSlotLimit = uint64_t{1} << 21;
 constexpr uint64_t kFramesPerPage = rt::xmem::kPhysicalPageSize / 0x1000;
@@ -213,6 +230,47 @@ std::vector<LowHold> g_low;
 std::unordered_map<uint64_t, uint64_t> g_held_owner;  // held slot -> page number it backs
 std::map<uintptr_t, uint64_t> g_mapped;      // window page address -> page number
 PhysicalPool g_pool;
+bool g_entry = false;  // the pool is a memory entry (entry_pool_wanted and it could be made)
+
+// Entry pool only: a title range [base, base + size) whose committed pages are views of `slots` consecutive pool
+// slots from `first_slot` (committed XMemVirtualAlloc / VirtualAlloc memory). Per 4 KiB page: whether it is a view
+// now, and whether the title decommitted it since (no access, zeroed when committed again).
+struct VirtualRun {
+    uint64_t size = 0, first_slot = 0, slots = 0;
+    std::vector<uint8_t> state;  // per 4 KiB page: kViewBit | kDecommittedBit
+};
+constexpr uint8_t kViewBit = 1, kDecommittedBit = 2;
+constexpr uint64_t kSmallPage = 0x1000;
+std::map<uintptr_t, VirtualRun> g_runs;                    // by title base
+std::vector<std::pair<uint64_t, uint64_t>> g_free_runs;    // (first slot, slots) released runs, zeroed on reuse
+uint64_t g_next_run_slot = 0;                              // bump allocation above the physical slots
+std::unordered_set<uint64_t> g_dirty_free;                 // free physical slots the title wrote (zeroed on reuse)
+uint64_t g_run_bytes = 0, g_runs_made = 0, g_runs_refused = 0, g_plain_commits = 0, g_plain_commit_bytes = 0;
+
+// Entry pool only: what changed in the title-address -> pool table, for a GPU layer that caches translations.
+// Every change bumps g_generation; a removal (unmap, remap, decommit, release) also records its title range.
+std::atomic<uint64_t> g_generation{0};  // written under g_mutex, read without it
+std::deque<std::pair<uint64_t, std::pair<uint64_t, uint64_t>>> g_removals;  // (generation, [lo, hi))
+constexpr size_t kRemovalLog = 8192;
+uint64_t g_removals_dropped = 0;  // the newest generation whose removal is no longer in g_removals
+
+void note_added() {
+    if (g_entry) g_generation.fetch_add(1, std::memory_order_release);
+}
+void note_removed(uint64_t lo, uint64_t hi) {
+    if (!g_entry || lo >= hi) return;
+    const uint64_t generation = g_generation.fetch_add(1, std::memory_order_release) + 1;
+    if (!g_removals.empty() && g_removals.back().second.second == lo) {
+        g_removals.back().second.second = hi;
+        g_removals.back().first = generation;
+        return;
+    }
+    g_removals.push_back({generation, {lo, hi}});
+    if (g_removals.size() > kRemovalLog) {
+        g_removals_dropped = g_removals.front().first;
+        g_removals.pop_front();
+    }
+}
 
 uint64_t pool_bytes() {
     uint64_t gib = rt::shims::console_profile().pool_gib;
@@ -223,17 +281,75 @@ uint64_t pool_bytes() {
     return gib << 30;
 }
 
+// The entry pool's room for virtual runs above the physical slots (VA only until the title touches it).
+uint64_t virtual_run_bytes() {
+    uint64_t gib = 8;
+    if (const char* v = gta6rt_env_get("GTA6RT_XMEM_POOL_VIRTUAL_GIB")) {
+        const unsigned long long n = std::strtoull(v, nullptr, 10);
+        if (n <= 64) gib = n;
+    }
+    return gib << 30;
+}
+
+bool map_entry_over(void* base, uint64_t size) {
+    memory_object_size_t entry_size = size;
+    mach_port_t entry = MACH_PORT_NULL;
+    kern_return_t kr = mach_make_memory_entry_64(mach_task_self(), &entry_size, 0,
+                                                 MAP_MEM_NAMED_CREATE | VM_PROT_READ | VM_PROT_WRITE, &entry, MACH_PORT_NULL);
+    if (kr != KERN_SUCCESS || entry_size < size) {
+        RTLOG(ERROR, "xmem: title pool: mach_make_memory_entry_64 of %llu bytes failed (%d)", static_cast<unsigned long long>(size), kr);
+        if (entry != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), entry);
+        return false;
+    }
+    mach_vm_address_t at = reinterpret_cast<mach_vm_address_t>(base);
+    kr = mach_vm_map(mach_task_self(), &at, size, 0, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, entry, 0, FALSE,
+                     VM_PROT_READ | VM_PROT_WRITE, VM_PROT_READ | VM_PROT_WRITE, VM_INHERIT_NONE);
+    if (kr != KERN_SUCCESS || at != reinterpret_cast<mach_vm_address_t>(base)) {
+        RTLOG(ERROR, "xmem: title pool: mapping the memory entry over %p failed (%d); the reservation is lost", base, kr);
+        mach_port_deallocate(mach_task_self(), entry);
+        return false;
+    }
+    g_pool.entry = entry;
+    return true;
+}
+
 bool ensure_pool() {
     if (g_pool.base) return true;
-    const uint64_t size = std::min<uint64_t>(pool_bytes(), kPageSlotLimit * rt::xmem::kPhysicalPageSize);
+    const uint64_t physical = std::min<uint64_t>(pool_bytes(), kPageSlotLimit * rt::xmem::kPhysicalPageSize);
+    const bool entry = entry_pool_wanted();
+    const uint64_t size = entry ? std::min<uint64_t>(physical + virtual_run_bytes(), kPageSlotLimit * rt::xmem::kPhysicalPageSize)
+                                : physical;
     void* base = nullptr;
     if (gta6rt_vm_reserve(nullptr, size, 0, &base) != GTA6RT_OK) {
         RTLOG(ERROR, "xmem: cannot reserve the %llu GiB physical pool", static_cast<unsigned long long>(size >> 30));
         return false;
     }
+    if (entry) {
+        if (reinterpret_cast<uintptr_t>(base) & 0x3fff) {
+            RTLOG(ERROR, "xmem: title pool: the reservation at %p is not 16 KiB aligned; GTA6RT_METAL_TITLE_POOL is ignored", base);
+        } else if (map_entry_over(base, size)) {
+            g_entry = true;
+        } else {
+            RTLOG(ERROR, "xmem: title pool: no memory entry; GTA6RT_METAL_TITLE_POOL is ignored, plain pool");
+            gta6rt_vm_release(base);
+            base = nullptr;
+            if (gta6rt_vm_reserve(nullptr, physical, 0, &base) != GTA6RT_OK) {
+                RTLOG(ERROR, "xmem: cannot reserve the %llu GiB physical pool", static_cast<unsigned long long>(physical >> 30));
+                return false;
+            }
+        }
+    }
     g_pool.base = base;
-    g_pool.size = size;
-    RTLOG(INFO, "xmem: physical pool %llu GiB at %p", static_cast<unsigned long long>(size >> 30), base);
+    g_pool.size = g_entry ? size : physical;
+    g_pool.physical = physical;
+    g_next_run_slot = physical / rt::xmem::kPhysicalPageSize + 1;
+    if (g_entry)
+        RTLOG(INFO, "xmem: title pool: one memory entry of %llu GiB at %p (physical pages %llu GiB, virtual runs %llu GiB); "
+                    "title pages are views of it",
+              static_cast<unsigned long long>(size >> 30), base, static_cast<unsigned long long>(physical >> 30),
+              static_cast<unsigned long long>((size - physical) >> 30));
+    else
+        RTLOG(INFO, "xmem: physical pool %llu GiB at %p", static_cast<unsigned long long>(physical >> 30), base);
     return true;
 }
 
@@ -256,16 +372,159 @@ LowHold* hold_of_range(uintptr_t start, uint64_t bytes) {
     return nullptr;
 }
 
-void release_slot(uint64_t slot) {
-    gta6rt_vm_decommit(slot_address(slot), rt::xmem::kPhysicalPageSize);
+void release_slot(uint64_t slot, bool written = true) {
+    if (g_entry) {
+        if (written) g_dirty_free.insert(slot);
+    } else {
+        gta6rt_vm_decommit(slot_address(slot), rt::xmem::kPhysicalPageSize);
+    }
     if (hold_of_slot(slot)) g_held_owner.erase(slot);
     else g_free_slots.push_back(slot);
+}
+
+// Entry pool: a slot taken from the free list holds what its last page held; zero it before it is handed out.
+void zero_if_dirty(uint64_t slot) {
+    if (g_entry && g_dirty_free.erase(slot)) std::memset(slot_address(slot), 0, rt::xmem::kPhysicalPageSize);
+}
+
+// ---- entry pool: committed virtual memory as runs of pool slots
+
+uint64_t take_run_slots(uint64_t slots) {
+    for (auto it = g_free_runs.begin(); it != g_free_runs.end(); ++it) {
+        if (it->second < slots) continue;
+        const uint64_t first = it->first;
+        std::memset(slot_address(first), 0, slots * rt::xmem::kPhysicalPageSize);
+        if (it->second == slots) g_free_runs.erase(it);
+        else *it = {first + slots, it->second - slots};
+        return first;
+    }
+    const uint64_t end = g_pool.size / rt::xmem::kPhysicalPageSize + 1;
+    if (g_next_run_slot + slots > end) return 0;
+    const uint64_t first = g_next_run_slot;
+    g_next_run_slot += slots;
+    return first;
+}
+
+// A pool-backed range for [base, base + size) of a fresh reservation: false (plain memory follows) when the entry
+// pool is off or has no room left for it.
+bool make_run(uintptr_t base, uint64_t size) {
+    if (!g_entry || !size || (base & (kSmallPage - 1)) || (size & (kSmallPage - 1))) return false;
+    const uint64_t slots = (size + kPage64k - 1) / kPage64k;
+    const uint64_t first = take_run_slots(slots);
+    if (!first) {
+        if (!(g_runs_refused++ & 63))
+            RTLOG(WARN, "xmem: title pool: no room for a %llu-byte virtual run (GTA6RT_XMEM_POOL_VIRTUAL_GIB); plain memory "
+                        "(%llu refused so far)",
+                  static_cast<unsigned long long>(size), static_cast<unsigned long long>(g_runs_refused));
+        return false;
+    }
+    VirtualRun run;
+    run.size = size;
+    run.first_slot = first;
+    run.slots = slots;
+    run.state.assign(size / kSmallPage, 0);
+    g_runs[base] = std::move(run);
+    g_run_bytes += slots * kPage64k;
+    const uint64_t n = ++g_runs_made;
+    if (n <= 4 || !(n & (n - 1)))
+        RTLOG(INFO, "xmem: title pool: virtual run %p (%llu bytes) is pool slots %llu..%llu (%llu runs, %llu MiB of pool)",
+              reinterpret_cast<void*>(base), static_cast<unsigned long long>(size), static_cast<unsigned long long>(first),
+              static_cast<unsigned long long>(first + slots - 1), static_cast<unsigned long long>(n),
+              static_cast<unsigned long long>(g_run_bytes >> 20));
+    return true;
+}
+
+VirtualRun* run_of(uintptr_t address, uintptr_t* base_out = nullptr) {
+    if (g_runs.empty()) return nullptr;
+    auto it = g_runs.upper_bound(address);
+    if (it == g_runs.begin()) return nullptr;
+    --it;
+    if (address - it->first >= it->second.size) return nullptr;
+    if (base_out) *base_out = it->first;
+    return &it->second;
+}
+
+// Commits [address, address + size) inside a run as views of its slots: pages the title decommitted are zeroed first
+// (a new commit reads zeros), committed ones keep their bytes. False when the range is not inside one run.
+bool commit_in_run(uintptr_t address, uint64_t size, uint32_t vm_prot) {
+    uintptr_t base = 0;
+    VirtualRun* run = run_of(address, &base);
+    if (!run || address + size > base + run->size) return false;
+    const uintptr_t lo = address & ~(kSmallPage - 1);
+    const uintptr_t hi = std::min<uintptr_t>((address + size + kSmallPage - 1) & ~(kSmallPage - 1), base + run->size);
+    if (lo >= hi) return false;
+    uint8_t* host = slot_address(run->first_slot) + (lo - base);
+    for (uintptr_t p = lo; p < hi; p += kSmallPage) {
+        uint8_t& st = run->state[(p - base) / kSmallPage];
+        if (st & kDecommittedBit) std::memset(host + (p - lo), 0, kSmallPage);
+    }
+    if (gta6rt_vm_alias(reinterpret_cast<void*>(lo), host, hi - lo, vm_prot) != GTA6RT_OK) {
+        RTLOG(ERROR, "xmem: title pool: view of %p (%llu bytes) on its pool slots failed", reinterpret_cast<void*>(lo),
+              static_cast<unsigned long long>(hi - lo));
+        return false;
+    }
+    for (uintptr_t p = lo; p < hi; p += kSmallPage) run->state[(p - base) / kSmallPage] = kViewBit;
+    note_added();
+    return true;
+}
+
+// MEM_DECOMMIT inside a run: the views become no-access and stay views (decommitting would map fresh memory there,
+// and the title would then write memory the GPU's view of the pool does not see). False: not inside one run.
+bool decommit_in_run(uintptr_t address, uint64_t size) {
+    uintptr_t base = 0;
+    VirtualRun* run = run_of(address, &base);
+    if (!run) return false;
+    const uintptr_t lo = address & ~(kSmallPage - 1);
+    const uintptr_t hi = std::min<uintptr_t>((address + size + kSmallPage - 1) & ~(kSmallPage - 1), base + run->size);
+    uintptr_t p = lo;
+    while (p < hi) {
+        const bool view = run->state[(p - base) / kSmallPage] & kViewBit;
+        uintptr_t q = p;
+        while (q < hi && bool(run->state[(q - base) / kSmallPage] & kViewBit) == view) q += kSmallPage;
+        if (view) {
+            uint32_t old = 0;
+            gta6rt_vm_protect(reinterpret_cast<void*>(p), q - p, GTA6RT_PROT_NONE, &old);
+            for (uintptr_t k = p; k < q; k += kSmallPage) run->state[(k - base) / kSmallPage] |= kDecommittedBit;
+        }
+        p = q;
+    }
+    note_removed(lo, hi);
+    return true;
+}
+
+void release_run(uintptr_t base) {
+    auto it = g_runs.find(base);
+    if (it == g_runs.end()) return;
+    note_removed(base, base + it->second.size);
+    g_free_runs.emplace_back(it->second.first_slot, it->second.slots);
+    g_run_bytes -= it->second.slots * kPage64k;
+    g_runs.erase(it);
+}
+
+// Plain decommits over pages of a run (a range that runs past it): those pages are no views any more.
+void forget_views(uintptr_t lo, uintptr_t hi) {
+    for (auto& [base, run] : g_runs) {
+        if (base >= hi || base + run.size <= lo) continue;
+        const uintptr_t from = std::max<uintptr_t>(lo, base) & ~(kSmallPage - 1);
+        const uintptr_t to = std::min<uintptr_t>(hi, base + run.size);
+        for (uintptr_t p = from; p < to; p += kSmallPage) run.state[(p - base) / kSmallPage] = 0;
+        note_removed(from, to);
+    }
+}
+
+void note_plain_commit(uint64_t size) {
+    if (!g_entry) return;
+    ++g_plain_commits;
+    g_plain_commit_bytes += size;
+    if (!(g_plain_commits & (g_plain_commits - 1)))
+        RTLOG(INFO, "xmem: title pool: %llu commits (%llu MiB) stay plain memory (not pool-backed)",
+              static_cast<unsigned long long>(g_plain_commits), static_cast<unsigned long long>(g_plain_commit_bytes >> 20));
 }
 
 void hold_low_reservation(uintptr_t base, uint64_t size) {
     if (!ensure_pool()) return;
     const uint64_t slots = (size + kPage64k - 1) / kPage64k;
-    if (g_next_slot + slots > kPageSlotLimit || (g_next_slot - 1 + slots) * rt::xmem::kPhysicalPageSize > g_pool.size) {
+    if (g_next_slot + slots > kPageSlotLimit || (g_next_slot - 1 + slots) * rt::xmem::kPhysicalPageSize > g_pool.physical) {
         RTLOG(WARN, "xmem: 32-bit reservation %p: no room for %llu pool slots in address order; its pages stay where they are",
               reinterpret_cast<void*>(base), static_cast<unsigned long long>(slots));
         return;
@@ -307,7 +566,7 @@ void arrange_low_pages(uintptr_t start, const uint64_t* pages, uint64_t count) {
             h->not_fresh++;
             continue;
         }
-        release_slot(have);
+        release_slot(have, false);
         g_pages[page] = want;
         g_held_owner[want] = page;
         ++moved;
@@ -352,6 +611,7 @@ void forget_range(std::map<uintptr_t, Window>& m, uintptr_t start, uintptr_t end
 
 bool unmap_range_locked(uintptr_t start, uintptr_t end) {
     auto it = g_mapped.lower_bound(start);
+    if (g_entry && it != g_mapped.end() && it->first < end) note_removed(start, end);
     while (it != g_mapped.end() && it->first < end) it = g_mapped.erase(it);
     return gta6rt_vm_decommit(reinterpret_cast<void*>(start), end - start) == GTA6RT_OK;
 }
@@ -505,6 +765,7 @@ void* xmem_virtual_alloc(void* address, uint64_t size, uint32_t allocation_type,
     }
 
     const std::lock_guard lock(g_mutex);
+    if (entry_pool_wanted()) ensure_pool();
     if (replace) {
         const uintptr_t start = reinterpret_cast<uintptr_t>(address);
         bool inside = false;
@@ -521,6 +782,10 @@ void* xmem_virtual_alloc(void* address, uint64_t size, uint32_t allocation_type,
             return address;
         }
         if (host_type & kMemCommit) {
+            if (g_entry && (run_of(start) || (!hold_of_range(start, size) && make_run(start, size))) &&
+                commit_in_run(start, size, vm_prot))
+                return address;
+            note_plain_commit(size);
             if (gta6rt_vm_commit(address, size, vm_prot) != GTA6RT_OK) {
                 gta6rt_last_error_set(kErrNotEnoughMemory);
                 return nullptr;
@@ -546,15 +811,24 @@ void* xmem_virtual_alloc(void* address, uint64_t size, uint32_t allocation_type,
     }
 
     void* base = address;
+    bool fresh = false;
     if (host_type & (kMemReserve) || (!address && (host_type & kMemCommit))) {
         base = reserve_region(address, size, host_type | kMemReserve, page_mode == kXmemLargePages ? kPage2m : base_granularity,
                               page_mode == kXmemLargePages, &range, attributes);
         if (!base) return nullptr;
+        fresh = true;
     }
+    const uintptr_t b = reinterpret_cast<uintptr_t>(base);
+    if (fresh && g_entry) make_run(b, (size + kSmallPage - 1) & ~(kSmallPage - 1));
     if (host_type & kMemCommit) {
+        if (g_entry && commit_in_run(b, size, vm_prot)) return base;
+        note_plain_commit(size);
         if (gta6rt_vm_commit(base, size, vm_prot) != GTA6RT_OK) {
             gta6rt_last_error_set(kErrNotEnoughMemory);
-            if (host_type & kMemReserve) gta6rt_vm_release(base);
+            if (host_type & kMemReserve) {
+                release_run(b);
+                gta6rt_vm_release(base);
+            }
             return nullptr;
         }
     }
@@ -568,6 +842,16 @@ void* WINAPI XMemVirtualAlloc(void* address, size_t size, uint32_t allocation_ty
 
 // ---- kernel32 VirtualAlloc & co, as the title calls them
 
+// Entry pool: which of the title's kernel32 VirtualAllocs become virtual runs: MEM_GRAPHICS ones (GPU memory on the
+// console), or every one with GTA6RT_XMEM_POOL_VIRTUALALLOC=all.
+bool pool_backs_virtualalloc(uint32_t allocation_type) {
+    static const bool all = [] {
+        const char* v = gta6rt_env_get("GTA6RT_XMEM_POOL_VIRTUALALLOC");
+        return v && std::strcmp(v, "all") == 0;
+    }();
+    return all || (allocation_type & kMemGraphics);
+}
+
 void* WINAPI TitleVirtualAlloc(void* address, size_t size, uint32_t allocation_type, uint32_t protect) {
     const uint32_t type = allocation_type & ~(kMemGraphics | kMemTitle);
     if (size == 0 || (type & ~(kHostTypeMask | kMemLargePages | kMemPhysical))) {
@@ -578,6 +862,7 @@ void* WINAPI TitleVirtualAlloc(void* address, size_t size, uint32_t allocation_t
     const bool large = (type & kMemLargePages) != 0;
     const std::lock_guard lock(g_mutex);
     if (type & kMemReset) return address;
+    if (entry_pool_wanted()) ensure_pool();
     void* base = address;
     uint64_t length = size;
     if (address) {
@@ -600,15 +885,24 @@ void* WINAPI TitleVirtualAlloc(void* address, size_t size, uint32_t allocation_t
         }
         length = rounded;
     }
+    bool fresh = false;
     if ((type & kMemReserve) || (!address && (type & kMemCommit))) {
         void* reserved = reserve_region(address ? base : nullptr, length, type | kMemReserve, large ? kPage2m : kPage64k, large);
         if (!reserved) return nullptr;
         base = reserved;
+        fresh = true;
     }
+    const uintptr_t b = reinterpret_cast<uintptr_t>(base);
+    if (fresh && g_entry && pool_backs_virtualalloc(allocation_type)) make_run(b, (length + kSmallPage - 1) & ~(kSmallPage - 1));
     if (type & kMemCommit) {
+        if (g_entry && commit_in_run(b, length, vm_prot)) return address && !(type & kMemReserve) ? address : base;
+        note_plain_commit(length);
         if (gta6rt_vm_commit(base, length, vm_prot) != GTA6RT_OK) {
             gta6rt_last_error_set(kErrNotEnoughMemory);
-            if ((type & kMemReserve) || !address) gta6rt_vm_release(base);
+            if ((type & kMemReserve) || !address) {
+                release_run(b);
+                gta6rt_vm_release(base);
+            }
             return nullptr;
         }
     }
@@ -695,6 +989,7 @@ int title_release(void* address, size_t size, uint32_t free_type) {
         }
         const uintptr_t a = reinterpret_cast<uintptr_t>(address);
         const std::lock_guard lock(g_mutex);
+        if (g_entry) release_run(a);
         uint64_t extent = 0;
         if (auto ph = g_placeholders.find(a); ph != g_placeholders.end()) {
             extent = ph->second;
@@ -703,6 +998,7 @@ int title_release(void* address, size_t size, uint32_t free_type) {
             extent = w->second.size;
         }
         if (extent) {
+            if (g_entry) note_removed(a, a + extent);
             for (auto it = g_mapped.lower_bound(a); it != g_mapped.end() && it->first < a + extent;) it = g_mapped.erase(it);
             forget_range(g_windows, a, a + extent);
         }
@@ -727,6 +1023,16 @@ int title_release(void* address, size_t size, uint32_t free_type) {
         if (size == 0) {
             gta6rt_last_error_set(kErrInvalidParameter);
             return 0;
+        }
+        if (g_entry) {
+            const std::lock_guard lock(g_mutex);
+            const uintptr_t a = reinterpret_cast<uintptr_t>(address);
+            uintptr_t run_base = 0;
+            if (const VirtualRun* run = run_of(a, &run_base); run && a + size <= run_base + run->size) {
+                decommit_in_run(a, size);
+                return 1;
+            }
+            forget_views(a, a + size);
         }
         if (gta6rt_vm_decommit(address, size) != GTA6RT_OK) {
             gta6rt_last_error_set(kErrInvalidAddress);
@@ -889,7 +1195,7 @@ int WINAPI XMemAllocatePhysicalPages(uint64_t attributes, uint64_t* page_count, 
         } else {
             slot = g_next_slot++;
         }
-        if ((slot - 1) * rt::xmem::kPhysicalPageSize + rt::xmem::kPhysicalPageSize > g_pool.size) {
+        if ((slot - 1) * rt::xmem::kPhysicalPageSize + rt::xmem::kPhysicalPageSize > g_pool.physical) {
             g_free_slots.push_back(slot);
             for (uint64_t s : slots) g_free_slots.push_back(s);
             *page_count = 0;
@@ -898,6 +1204,8 @@ int WINAPI XMemAllocatePhysicalPages(uint64_t attributes, uint64_t* page_count, 
         }
         slots.push_back(slot);
     }
+    if (g_entry && !g_dirty_free.empty())
+        for (uint64_t s : slots) zero_if_dirty(s);
     for (uint64_t i = 0; i < count;) {
         uint64_t run = 1;
         while (i + run < count && slots[i + run] == slots[i] + run) ++run;
@@ -974,6 +1282,7 @@ bool map_pages_locked(uintptr_t start, const uint64_t* pages, uint64_t count, ui
     }
     done = count;
     if (!g_low.empty()) note_low_stretch(start, count);
+    note_added();
     return true;
 }
 
@@ -1160,6 +1469,70 @@ size_t window_count() {
 size_t mapped_page_count() {
     const std::lock_guard lock(g_mutex);
     return g_mapped.size();
+}
+
+bool title_pool_view(std::uint64_t va, void** host, std::uint64_t* run_bytes) {
+    constexpr uint64_t kMaxRun = 256ull << 20;
+    const std::lock_guard lock(g_mutex);
+    if (!g_entry) return false;
+    const uintptr_t page = static_cast<uintptr_t>(va) & ~uintptr_t(kPhysicalPageSize - 1);
+    if (auto it = g_mapped.find(page); it != g_mapped.end()) {
+        const uint64_t slot = slot_of(it->second);
+        if (!slot) return false;
+        uint64_t n = 1;
+        for (auto nx = std::next(it); nx != g_mapped.end() && n * kPhysicalPageSize < kMaxRun; ++nx, ++n)
+            if (nx->first != page + n * kPhysicalPageSize || slot_of(nx->second) != slot + n) break;
+        *host = slot_address(slot) + (va - page);
+        *run_bytes = n * kPhysicalPageSize - (va - page);
+        return true;
+    }
+    uintptr_t base = 0;
+    const VirtualRun* run = run_of(static_cast<uintptr_t>(va), &base);
+    if (!run) return false;
+    size_t i = (va - base) / kSmallPage;
+    if (run->state[i] != kViewBit) return false;
+    size_t j = i + 1;
+    while (j < run->state.size() && run->state[j] == kViewBit && (j - i) * kSmallPage < kMaxRun) ++j;
+    *host = slot_address(run->first_slot) + (va - base);
+    *run_bytes = j * kSmallPage - (va - base);
+    return true;
+}
+
+std::uint64_t title_pool_generation() { return g_generation.load(std::memory_order_acquire); }
+
+std::uint64_t title_pool_removals(std::uint64_t since, std::vector<std::pair<std::uint64_t, std::uint64_t>>& out) {
+    const std::lock_guard lock(g_mutex);
+    out.clear();
+    const uint64_t now = g_generation.load(std::memory_order_acquire);
+    if (!g_entry || since >= now) return now;
+    if (since < g_removals_dropped) {
+        out.emplace_back(0, UINT64_MAX);
+        return now;
+    }
+    for (auto it = g_removals.rbegin(); it != g_removals.rend() && it->first > since; ++it) out.push_back(it->second);
+    return now;
+}
+
+bool title_pool_range(void** base, std::uint64_t* size) {
+    const std::lock_guard lock(g_mutex);
+    if (!g_entry) return false;
+    *base = g_pool.base;
+    *size = g_pool.size;
+    return true;
+}
+
+TitlePoolStats title_pool_stats() {
+    const std::lock_guard lock(g_mutex);
+    TitlePoolStats s;
+    s.on = g_entry;
+    s.runs = g_runs.size();
+    s.run_bytes = g_run_bytes;
+    s.runs_refused = g_runs_refused;
+    s.plain_commits = g_plain_commits;
+    s.plain_commit_bytes = g_plain_commit_bytes;
+    s.generation = g_generation.load(std::memory_order_relaxed);
+    s.removals = g_removals.size();
+    return s;
 }
 
 }  // namespace rt::xmem

@@ -265,6 +265,8 @@ struct HostBufferDesc {
     std::uint64_t size = 0;
     std::uint64_t va = 0;  // console VA to register for resolve_va; 0 = allocate one
     const char* label = nullptr;
+    // false: never in the device residency set; metal::set_encoder_resource names it in each encoder instead
+    bool resident = true;
 };
 
 enum class ResourceKind : std::uint32_t { buffer, texture };

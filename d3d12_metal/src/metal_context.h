@@ -21,6 +21,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <deque>
 #include <functional>
@@ -499,13 +500,22 @@ private:
         std::shared_ptr<void> pin;
     };
 
-    ReplayResult execute_now(std::span<const CommandList* const> lists);
-    bool submit_signal(gpu::Fence* fence, std::uint64_t value);
-    void consume_waits();
+    struct Waits {
+        std::vector<gpu::Fence*> fences;
+        std::vector<std::uint64_t> values;
+        std::vector<std::shared_ptr<void>> pins;
+    };
+
+    ReplayResult execute_now(std::span<const CommandList* const> lists, Waits& waits, std::uint64_t* ticket);
+    bool submit_signal(gpu::Fence* fence, std::uint64_t value, Waits& waits, std::uint64_t* ticket);
+    void consume_waits(Waits& waits);
     bool must_hold() const;
     bool waits_pending(const std::vector<gpu::Fence*>& fences, const std::vector<std::uint64_t>& values) const;
+    Waits take_waits();
+    void settle_waits(Waits& waits, std::uint64_t ticket);
     void hold(Deferred&& op);
-    void run(Deferred& op);
+    std::uint64_t run(Deferred& op, Waits& waits);
+    void worker_main();
     void retire_pins(std::vector<std::shared_ptr<void>>& pins, std::uint64_t ticket);
     void drain_pins(std::vector<std::shared_ptr<void>>& out);
     std::uint64_t mark_progress();
@@ -520,8 +530,20 @@ private:
     std::unique_ptr<gpu::Queue> queue_;
     std::unique_ptr<gpu::Fence> progress_;
     std::uint64_t submitted_ = 0;
+    // exec_mutex_: replay and submission to queue_ (lists_, submitted_), one at a time in queue order. state_mutex_:
+    // everything below; never held while replaying when the release worker runs, so a Signal that releases held work
+    // returns without waiting for it.
+    std::mutex exec_mutex_;
     std::mutex state_mutex_;
     std::deque<Deferred> held_;
+    std::deque<Deferred> ready_;
+    std::size_t running_ = 0;
+    std::uint64_t running_seq_ = 0;
+    bool stop_worker_ = false;
+    bool use_worker_ = false;
+    std::condition_variable work_cv_, done_cv_;
+    void* worker_ = nullptr;
+    void* worker_stack_ = nullptr;
     std::vector<gpu::Fence*> waits_;
     std::vector<std::uint64_t> wait_values_;
     std::vector<std::shared_ptr<void>> wait_pins_;

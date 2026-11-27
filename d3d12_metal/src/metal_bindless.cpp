@@ -216,9 +216,83 @@ bool MetalBindless::generation_free(Generation& g, std::chrono::steady_clock::ti
     return context_.reached(g.retired_marks) && context_.reached(g.settle_marks);
 }
 
+// The table's changes since the last take, with any an in-place attempt took and left to the generation path.
+DescriptorTable::Changes MetalBindless::take_all_changes() {
+    DescriptorTable::Changes changes = table_.take_changes();
+    if (carried_.all || !carried_.slots.empty()) {
+        changes.all |= carried_.all;
+        changes.slots.insert(changes.slots.begin(), carried_.slots.begin(), carried_.slots.end());
+        carried_ = {};
+    }
+    return changes;
+}
+
+// Records of in-place flushes that emptied slots: released once the queues passed what they had submitted then and,
+// 100 ms later, again (as generation_free). The first record not released yet.
+std::uint64_t MetalBindless::release_empty_records(std::chrono::steady_clock::time_point now) {
+    while (!empty_records_.empty()) {
+        EmptyRecord& r = empty_records_.front();
+        if (!r.settled) {
+            if (now - r.time < std::chrono::milliseconds(100)) break;
+            r.settle_marks = context_.submitted();
+            r.settled = true;
+        }
+        if (!context_.reached(r.marks) || !context_.reached(r.settle_marks)) break;
+        empty_records_.pop_front();
+    }
+    const std::uint64_t first = empty_records_.empty() ? next_record_ : empty_records_.front().id;
+    refills_.prune(first);
+    return first;
+}
+
+void MetalBindless::report_in_place(std::chrono::steady_clock::time_point now) {
+    if (now - last_report_ < std::chrono::seconds(10)) return;
+    last_report_ = now;
+    std::fprintf(stderr, "[rt] d3d12-metal: descriptor hash table: %llu flushes in place, %llu to a generation (%llu "
+                         "rekeyed, %llu refills too soon), %zu live generations, %zu slots emptied in flight\n",
+                 static_cast<unsigned long long>(in_place_flushes_),
+                 static_cast<unsigned long long>(serial_),
+                 static_cast<unsigned long long>(in_place_refused_rekey_),
+                 static_cast<unsigned long long>(in_place_refused_refill_), generations_.size(), refills_.size());
+}
+
 bool MetalBindless::flush() {
     std::unique_lock lock(mutex_);
     if (!table_dirty_ && current_ != SIZE_MAX) return true;
+    // GTA6RT_METAL_TABLE_IN_PLACE (default on, 0: off): while the table keeps its size, changed slots are written into
+    // the generation the GPU reads when bindless::write_in_place finds every change safe for a racing reader; else
+    // the generation path below takes the same changes.
+    static const bool in_place = [] {
+        const char* v = std::getenv("GTA6RT_METAL_TABLE_IN_PLACE");
+        return !v || std::strcmp(v, "0") != 0;
+    }();
+    if (in_place && current_ != SIZE_MAX) {
+        Generation& g = generations_[current_];
+        auto* gpu_words = static_cast<std::uint32_t*>(g.buffer->cpu_pointer());
+        if (gpu_words && g.written && g.epoch == table_epoch_ && g.synced == journal_seq_ &&
+            g.buffer->size() >= table_.size_bytes()) {
+            DescriptorTable::Changes changes = take_all_changes();
+            if (!changes.all) {
+                const auto now = std::chrono::steady_clock::now();
+                const std::uint64_t first = release_empty_records(now);
+                const bindless::InPlaceResult r =
+                    bindless::write_in_place(gpu_words, table_, changes.slots, refills_, next_record_, first);
+                if (r.written) {
+                    if (r.emptied) empty_records_.push_back({next_record_++, now, context_.submitted()});
+                    journal_.insert(journal_.end(), changes.slots.begin(), changes.slots.end());
+                    journal_seq_ += changes.slots.size();
+                    g.synced = journal_seq_;
+                    slot_writes_ += changes.slots.size();
+                    ++in_place_flushes_;
+                    table_dirty_ = false;
+                    report_in_place(now);
+                    return true;
+                }
+                ++(r.rekeyed ? in_place_refused_rekey_ : in_place_refused_refill_);
+            }
+            carried_ = std::move(changes);
+        }
+    }
     std::size_t bytes = table_.size_bytes();
     auto now = std::chrono::steady_clock::now();
     std::size_t pick = SIZE_MAX;
@@ -237,7 +311,7 @@ bool MetalBindless::flush() {
                 ++i;
                 continue;
             }
-            if (g.buffer && g.buffer->size() >= bytes) {
+            if (g.buffer && g.buffer->size() >= bytes && (pick == SIZE_MAX || !in_place)) {
                 if (pick == SIZE_MAX) pick = i;
                 ++i;
                 continue;
@@ -270,6 +344,8 @@ bool MetalBindless::flush() {
                          static_cast<unsigned long long>(throttled_flushes_), double(throttled_us_) / 1e6);
     }
     if (current_ != SIZE_MAX && pick != current_) {
+        refills_.clear();
+        empty_records_.clear();
         Generation& old = generations_[current_];
         old.retired = true;
         old.settled = false;
@@ -304,7 +380,7 @@ bool MetalBindless::flush() {
     }
     // The slots changed since a reused generation was last written are rewritten in it (the change journal), the
     // whole table only for a new generation, after the table grew, or when the journal no longer reaches back.
-    DescriptorTable::Changes changes = table_.take_changes();
+    DescriptorTable::Changes changes = take_all_changes();
     if (changes.all) {
         ++table_epoch_;
         journal_.clear();
@@ -343,6 +419,7 @@ bool MetalBindless::flush() {
         journal_base_ = oldest;
     }
     g.serial = ++serial_;
+    if (in_place) report_in_place(now);
     current_ = pick;
     table_dirty_ = false;
     context_.set_table(bindless::table_binding, g.binding.get());
@@ -363,6 +440,9 @@ MetalBindless::Stats MetalBindless::stats() const {
     s.generations_freed = generations_freed_;
     s.full_writes = full_writes_;
     s.slot_writes = slot_writes_;
+    s.in_place_flushes = in_place_flushes_;
+    s.in_place_refused_rekey = in_place_refused_rekey_;
+    s.in_place_refused_refill = in_place_refused_refill_;
     return s;
 }
 

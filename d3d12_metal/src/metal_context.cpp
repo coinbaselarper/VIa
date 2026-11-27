@@ -12,6 +12,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iterator>
+#include <pthread.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 
 namespace leonida {
@@ -437,6 +440,47 @@ bool MetalContext::reached(const std::vector<std::pair<gpu::Fence*, std::uint64_
 
 // ---- MetalQueue ----
 
+namespace {
+
+// GTA6RT_METAL_RELEASE_WORKER (default on): held work that a Signal releases is replayed and submitted by a worker
+// thread of its queue, so the thread whose Signal released it (the list-values releaser, a CPU Signal) returns at
+// once. 0: released work runs inside that Signal, as before.
+bool release_worker_on() {
+    static const bool on = [] {
+        const char* v = std::getenv("GTA6RT_METAL_RELEASE_WORKER");
+        return !v || std::strcmp(v, "0") != 0;
+    }();
+    return on;
+}
+
+static_assert(sizeof(pthread_t) <= sizeof(void*));
+
+pthread_t thread_of(void* handle) {
+    pthread_t t{};
+    std::memcpy(&t, &handle, sizeof t);
+    return t;
+}
+
+constexpr std::size_t kWorkerStack = 8u << 20;
+
+// The worker's stack, above 4 GiB: the image has no 4 GiB page zero, so an anywhere allocation lands in the low 4 GiB
+// and can split the hole the title's 185 MiB 32-bit reservation needs (fr10-c/-d stopped at boot there). Null if
+// none could be placed above 4 GiB.
+void* high_stack() {
+    for (std::uintptr_t hint = 0x300000000000ull; hint < 0x700000000000ull; hint += 0x80000000000ull) {
+        void* p = mmap(reinterpret_cast<void*>(hint), kWorkerStack, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+        if (p == MAP_FAILED) continue;
+        if (reinterpret_cast<std::uintptr_t>(p) >= (std::uintptr_t(1) << 32)) {
+            mprotect(p, 16384, PROT_NONE);
+            return p;
+        }
+        munmap(p, kWorkerStack);
+    }
+    return nullptr;
+}
+
+}  // namespace
+
 MetalQueue::MetalQueue(MetalContext& context, gpu::QueueType type, const char* label)
     : context_(context), type_(type) {
     queue_ = context.gpu().create_queue(type, label);
@@ -445,13 +489,48 @@ MetalQueue::MetalQueue(MetalContext& context, gpu::QueueType type, const char* l
         queue_.reset();
         return;
     }
+    if (release_worker_on() && (worker_stack_ = high_stack())) {
+        pthread_attr_t attr;
+        pthread_attr_init(&attr);
+        pthread_attr_setstack(&attr, worker_stack_, kWorkerStack);
+        pthread_t thread{};
+        const int rc = pthread_create(
+            &thread, &attr,
+            [](void* self) -> void* {
+                static_cast<MetalQueue*>(self)->worker_main();
+                return nullptr;
+            },
+            this);
+        pthread_attr_destroy(&attr);
+        if (rc == 0) {
+            std::memcpy(&worker_, &thread, sizeof thread);
+            use_worker_ = true;
+        } else {
+            munmap(worker_stack_, kWorkerStack);
+            worker_stack_ = nullptr;
+            std::fprintf(stderr, "[rt] d3d12-metal: queue %s: no release worker (error %d); released work runs on the "
+                                 "releasing thread\n", label ? label : "?", rc);
+        }
+    } else if (release_worker_on()) {
+        std::fprintf(stderr, "[rt] d3d12-metal: queue %s: no stack above 4 GiB for a release worker; released work "
+                             "runs on the releasing thread\n", label ? label : "?");
+    }
     context_.holds().attach(this);
 }
 
 MetalQueue::~MetalQueue() {
     if (!queue_) return;
-    context_.forget_queue(progress_.get());
     context_.holds().detach(this);
+    if (use_worker_) {
+        {
+            std::lock_guard state(state_mutex_);
+            stop_worker_ = true;
+        }
+        work_cv_.notify_all();
+        pthread_join(thread_of(worker_), nullptr);
+        munmap(worker_stack_, kWorkerStack);
+    }
+    context_.forget_queue(progress_.get());
     {
         std::lock_guard state(state_mutex_);
         if (!held_.empty()) {
@@ -468,6 +547,12 @@ MetalQueue::~MetalQueue() {
 std::uint64_t MetalQueue::completed() const { return progress_ ? progress_->completed_value() : 0; }
 
 bool MetalQueue::idle(std::uint64_t timeout_ns) {
+    if (use_worker_ && !pthread_equal(pthread_self(), thread_of(worker_))) {
+        std::unique_lock state(state_mutex_);
+        if (!done_cv_.wait_for(state, std::chrono::nanoseconds(timeout_ns),
+                               [this] { return ready_.empty() && !running_; }))
+            return false;
+    }
     const gpu::Status s = queue_->wait_idle(timeout_ns);
     if (s == gpu::Status::device_lost) context_.mark_device_lost("wait_idle");
     return s == gpu::Status::ok;
@@ -479,7 +564,9 @@ bool MetalQueue::waits_pending(const std::vector<gpu::Fence*>& fences, const std
     return false;
 }
 
-bool MetalQueue::must_hold() const { return !held_.empty() || waits_pending(waits_, wait_values_); }
+bool MetalQueue::must_hold() const {
+    return !held_.empty() || !ready_.empty() || running_ || waits_pending(waits_, wait_values_);
+}
 
 void MetalQueue::retire_pins(std::vector<std::shared_ptr<void>>& pins, std::uint64_t ticket) {
     for (auto& pin : pins) {
@@ -514,10 +601,32 @@ void MetalQueue::hold(Deferred&& op) {
     context_.stats().holds.fetch_add(1, std::memory_order_relaxed);
 }
 
-void MetalQueue::consume_waits() {
-    for (std::size_t i = 0; i < waits_.size(); ++i) queue_->wait(waits_[i], wait_values_[i]);
+MetalQueue::Waits MetalQueue::take_waits() {
+    Waits w{std::move(waits_), std::move(wait_values_), std::move(wait_pins_)};
     waits_.clear();
     wait_values_.clear();
+    wait_pins_.clear();
+    return w;
+}
+
+// Waits an operation did not reach the queue with (it failed before its submission) go to the next one, ahead of
+// any recorded since; the pins of consumed waits are kept until the submission that carried them is done.
+void MetalQueue::settle_waits(Waits& waits, std::uint64_t ticket) {
+    if (!waits.fences.empty()) {
+        waits_.insert(waits_.begin(), waits.fences.begin(), waits.fences.end());
+        wait_values_.insert(wait_values_.begin(), waits.values.begin(), waits.values.end());
+        wait_pins_.insert(wait_pins_.begin(), std::make_move_iterator(waits.pins.begin()),
+                          std::make_move_iterator(waits.pins.end()));
+        waits = {};
+        return;
+    }
+    retire_pins(waits.pins, ticket);
+}
+
+void MetalQueue::consume_waits(Waits& waits) {
+    for (std::size_t i = 0; i < waits.fences.size(); ++i) queue_->wait(waits.fences[i], waits.values[i]);
+    waits.fences.clear();
+    waits.values.clear();
 }
 
 std::uint64_t MetalQueue::mark_progress() {
@@ -528,13 +637,13 @@ std::uint64_t MetalQueue::mark_progress() {
     return submitted_;
 }
 
-bool MetalQueue::submit_signal(gpu::Fence* fence, std::uint64_t value) {
+bool MetalQueue::submit_signal(gpu::Fence* fence, std::uint64_t value, Waits& waits, std::uint64_t* ticket) {
     if (!context_.holds().would_signal(fence, value)) return true;
-    consume_waits();
+    consume_waits(waits);
+    *ticket = submitted_ + 1;
     const gpu::Status s = queue_->signal(fence, value);
     if (s != gpu::Status::ok) return false;
-    const std::uint64_t ticket = mark_progress();
-    retire_pins(wait_pins_, ticket);
+    *ticket = mark_progress();
     context_.holds().signaled(fence, value);
     return true;
 }
@@ -546,7 +655,7 @@ gpu::CommandList* MetalQueue::list_slot(std::size_t index) {
     return list;
 }
 
-ReplayResult MetalQueue::execute_now(std::span<const CommandList* const> lists) {
+ReplayResult MetalQueue::execute_now(std::span<const CommandList* const> lists, Waits& waits, std::uint64_t* ticket) {
     using clock = std::chrono::steady_clock;
     auto& st = context_.stats();
     const auto t0 = clock::now();
@@ -576,7 +685,8 @@ ReplayResult MetalQueue::execute_now(std::span<const CommandList* const> lists) 
         recorded.push_back(out);
     }
     const auto t2 = clock::now();
-    consume_waits();
+    consume_waits(waits);
+    *ticket = submitted_ + 1;
     const gpu::Status s = queue_->execute(recorded);
     if (s == gpu::Status::device_lost) context_.mark_device_lost("execute");
     if (s != gpu::Status::ok) {
@@ -587,11 +697,10 @@ ReplayResult MetalQueue::execute_now(std::span<const CommandList* const> lists) 
                          gpu::status_name(s), static_cast<unsigned long long>(n));
         return ReplayResult::unsupported;
     }
-    const std::uint64_t ticket = mark_progress();
-    retire_pins(wait_pins_, ticket);
+    *ticket = mark_progress();
     if (!labels.empty()) {
         const gpu::ClockCalibration cal = queue_->clock_calibration();
-        progress_->on_completion(ticket, [labels = std::move(labels), cal] {
+        progress_->on_completion(*ticket, [labels = std::move(labels), cal] {
             for (const label::Write& w : labels) {
                 std::uint64_t value = w.value;
                 if (w.clock == 1) {
@@ -620,27 +729,39 @@ ReplayResult MetalQueue::execute(std::span<const CommandList* const> lists, cons
     ReplayResult result = ReplayResult::success;
     bool held = false;
     std::vector<std::shared_ptr<void>> retired;
-    {
-        std::lock_guard state(state_mutex_);
-        if (context_.is_device_lost()) {
-            result = ReplayResult::unsupported;
-        } else if (!must_hold()) {
-            result = execute_now(lists);
-            if (result == ReplayResult::success && pin) {
-                std::vector<std::shared_ptr<void>> pins{pin()};
-                retire_pins(pins, submitted_);
-            }
-        } else {
-            Deferred op;
-            op.kind = Deferred::Kind::batch;
-            op.lists.reserve(lists.size());
-            for (const CommandList* list : lists) op.lists.push_back(*list);
-            if (pin) op.pins.push_back(pin());
-            hold(std::move(op));
-            held = true;
+    std::unique_lock state(state_mutex_);
+    if (context_.is_device_lost()) {
+        result = ReplayResult::unsupported;
+    } else if (!must_hold()) {
+        Waits waits = take_waits();
+        ++running_;
+        state.unlock();
+        std::uint64_t ticket = 0, after = 0;
+        {
+            std::lock_guard exec(exec_mutex_);
+            result = execute_now(lists, waits, &ticket);
+            after = submitted_;
         }
-        drain_pins(retired);
+        state.lock();
+        settle_waits(waits, ticket);
+        if (result == ReplayResult::success && pin) {
+            std::vector<std::shared_ptr<void>> pins{pin()};
+            retire_pins(pins, after);
+        }
+        --running_;
+        held = !held_.empty();
+        done_cv_.notify_all();
+    } else {
+        Deferred op;
+        op.kind = Deferred::Kind::batch;
+        op.lists.reserve(lists.size());
+        for (const CommandList* list : lists) op.lists.push_back(*list);
+        if (pin) op.pins.push_back(pin());
+        hold(std::move(op));
+        held = true;
     }
+    drain_pins(retired);
+    state.unlock();
     retired.clear();
     if (held) context_.holds().pump_ready();
     return result;
@@ -649,20 +770,30 @@ ReplayResult MetalQueue::execute(std::span<const CommandList* const> lists, cons
 bool MetalQueue::signal(gpu::Fence* fence, std::uint64_t value, const PinFn& pin) {
     bool ok = true;
     std::vector<std::shared_ptr<void>> retired;
-    {
-        std::lock_guard state(state_mutex_);
-        if (must_hold()) {
-            Deferred op;
-            op.kind = Deferred::Kind::signal;
-            op.fence = fence;
-            op.value = value;
-            if (pin) op.pins.push_back(pin());
-            hold(std::move(op));
-        } else {
-            ok = submit_signal(fence, value);
+    std::unique_lock state(state_mutex_);
+    if (must_hold()) {
+        Deferred op;
+        op.kind = Deferred::Kind::signal;
+        op.fence = fence;
+        op.value = value;
+        if (pin) op.pins.push_back(pin());
+        hold(std::move(op));
+    } else {
+        Waits waits = take_waits();
+        ++running_;
+        state.unlock();
+        std::uint64_t ticket = 0;
+        {
+            std::lock_guard exec(exec_mutex_);
+            ok = submit_signal(fence, value, waits, &ticket);
         }
-        drain_pins(retired);
+        state.lock();
+        settle_waits(waits, ticket);
+        --running_;
+        done_cv_.notify_all();
     }
+    drain_pins(retired);
+    state.unlock();
     retired.clear();
     context_.holds().pump_ready();
     return ok;
@@ -681,18 +812,14 @@ void MetalQueue::marker(DebugMarker::Kind kind, const char*) {
     (void)kind;
 }
 
-void MetalQueue::run(Deferred& op) {
-    auto later_waits = std::move(waits_);
-    auto later_values = std::move(wait_values_);
-    auto later_pins = std::move(wait_pins_);
-    waits_ = std::move(op.waits);
-    wait_values_ = std::move(op.wait_values);
-    wait_pins_ = std::move(op.wait_pins);
+// With exec_mutex_ held. Returns the queue's last submission after the operation (its pins are kept until then).
+std::uint64_t MetalQueue::run(Deferred& op, Waits& waits) {
+    std::uint64_t ticket = 0;
     switch (op.kind) {
     case Deferred::Kind::batch: {
         std::vector<const CommandList*> lists;
         for (const CommandList& list : op.lists) lists.push_back(&list);
-        const ReplayResult result = execute_now(lists);
+        const ReplayResult result = execute_now(lists, waits, &ticket);
         if (result != ReplayResult::success) {
             int none = static_cast<int>(ReplayResult::success);
             held_failure_.compare_exchange_strong(none, static_cast<int>(result));
@@ -702,16 +829,56 @@ void MetalQueue::run(Deferred& op) {
         break;
     }
     case Deferred::Kind::signal:
-        if (!submit_signal(op.fence, op.value))
+        if (!submit_signal(op.fence, op.value, waits, &ticket))
             std::fprintf(stderr, "[rt] d3d12-metal: a held Signal failed when it was released\n");
         break;
     case Deferred::Kind::marker:
         break;
     }
-    retire_pins(op.pins, submitted_);
-    waits_.insert(waits_.end(), later_waits.begin(), later_waits.end());
-    wait_values_.insert(wait_values_.end(), later_values.begin(), later_values.end());
-    for (auto& p : later_pins) wait_pins_.push_back(std::move(p));
+    return std::max(ticket, submitted_);
+}
+
+// Runs what release_ready handed over, in order. An operation counts as held (QueueHolds' count, oldest_held_seq for
+// after_held) until it has run; then the worker pumps, since a Signal it submitted may release other queues' work.
+void MetalQueue::worker_main() {
+    pthread_setname_np("gta6rt metal release");
+    for (;;) {
+        Deferred op;
+        {
+            std::unique_lock state(state_mutex_);
+            work_cv_.wait(state, [this] { return stop_worker_ || !ready_.empty(); });
+            if (ready_.empty()) return;
+            op = std::move(ready_.front());
+            ready_.pop_front();
+            ++running_;
+            running_seq_ = op.seq;
+        }
+        Waits waits{std::move(op.waits), std::move(op.wait_values), std::move(op.wait_pins)};
+        std::uint64_t after = 0;
+        bool ran = false;
+        {
+            std::lock_guard exec(exec_mutex_);
+            if (!context_.is_device_lost()) {
+                after = run(op, waits);
+                ran = true;
+            }
+        }
+        std::vector<std::shared_ptr<void>> retired;
+        {
+            std::lock_guard state(state_mutex_);
+            if (ran) settle_waits(waits, after);
+            else retire_pins(waits.pins, 0);
+            retire_pins(op.pins, after);
+            --running_;
+            running_seq_ = 0;
+            context_.holds().held_changed(-1);
+            drain_pins(retired);
+        }
+        done_cv_.notify_all();
+        retired.clear();
+        op = Deferred{};
+        context_.holds().pump_ready();
+    }
 }
 
 bool MetalQueue::release_ready() {
@@ -723,12 +890,25 @@ bool MetalQueue::release_ready() {
                (context_.is_device_lost() || !waits_pending(held_.front().waits, held_.front().wait_values))) {
             Deferred op = std::move(held_.front());
             held_.pop_front();
-            context_.holds().held_changed(-1);
-            if (!context_.is_device_lost()) run(op);
             released = true;
+            if (use_worker_) {
+                ready_.push_back(std::move(op));
+                continue;
+            }
+            context_.holds().held_changed(-1);
+            if (context_.is_device_lost()) continue;
+            Waits waits{std::move(op.waits), std::move(op.wait_values), std::move(op.wait_pins)};
+            std::uint64_t after = 0;
+            {
+                std::lock_guard exec(exec_mutex_);
+                after = run(op, waits);
+            }
+            settle_waits(waits, after);
+            retire_pins(op.pins, after);
         }
         drain_pins(retired);
     }
+    if (released && use_worker_) work_cv_.notify_one();
     return released;
 }
 
@@ -750,6 +930,8 @@ void MetalQueue::discard_waiting_on(gpu::Fence* fence) {
 
 std::uint64_t MetalQueue::oldest_held_seq() {
     std::lock_guard state(state_mutex_);
+    if (running_seq_) return running_seq_;
+    if (!ready_.empty()) return ready_.front().seq;
     return held_.empty() ? 0 : held_.front().seq;
 }
 
@@ -1375,6 +1557,10 @@ std::string GpuDebug::take_report() {
                     std::snprintf(t, sizeof t, "\n      Create*View wrote it with no records for title 0x%llx (%llu bytes): ",
                                   static_cast<unsigned long long>(target), static_cast<unsigned long long>(bytes));
                     out += t + describe_va(target);
+                } else if (v && base && !b.num_records && context_->view_source(b.address, target, bytes)) {
+                    std::snprintf(t, sizeof t, "\n      a copy of a view Create*View wrote with no records (tagged) for title 0x%llx (%llu bytes)",
+                                  static_cast<unsigned long long>(target), static_cast<unsigned long long>(bytes));
+                    out += t;
                 }
             }
         }
@@ -1408,6 +1594,31 @@ void GpuDebug::note_table_slot(std::uint32_t table, std::uint32_t offset) {
         if (!w[0] && !w[1] && !w[2] && !w[3]) return 2;
         return (w[0] || (w[1] & 0xffff)) && w[2] ? 0 : 1;
     };
+    static std::atomic<int> printed{0};
+    if (s.title_read && printed.load(std::memory_order_relaxed) < 48) {
+        const std::uint64_t base = s.title[0] | (std::uint64_t(s.title[1] & 0xffff) << 32);
+        const bool valid = (s.title[0] || (s.title[1] & 0xffff)) && s.title[2];
+        static std::mutex seen_mutex;
+        static std::uint64_t seen[64];
+        static int seen_count = 0;
+        bool fresh = true;
+        {
+            std::lock_guard seen_lock(seen_mutex);
+            for (int i = 0; i < seen_count; ++i) fresh = fresh && seen[i] != base;
+            if (fresh && seen_count < 64) seen[seen_count++] = base;
+        }
+        if (fresh && printed.fetch_add(1, std::memory_order_relaxed) < 48) {
+            std::fprintf(stderr,
+                         "[rt] d3d12-metal gpu-debug: header slot 0x%llx at record time: title 0x%llx holds %08x %08x %08x "
+                         "%08x (%s), arena %08x %08x %08x %08x\n",
+                         static_cast<unsigned long long>(slot), static_cast<unsigned long long>(title), s.title[0], s.title[1],
+                         s.title[2], s.title[3], valid ? "records" : base ? "no records, tagged base" : "null",
+                         s.arena[0], s.arena[1], s.arena[2], s.arena[3]);
+            std::uint64_t target = 0, bytes = 0;
+            if (base && !s.title[2]) context_->view_source(base, target, bytes);
+            if (valid) std::fprintf(stderr, "    base: %s\n", describe_va(base).c_str());
+        }
+    }
     std::lock_guard lock(mutex_);
     ++slot_kinds_[0][kind(s.arena, arena_read)];
     ++slot_kinds_[1][kind(s.title, s.title_read)];

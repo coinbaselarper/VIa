@@ -298,6 +298,27 @@ void MetalDevice::make_resident(id<MTLAllocation> allocation) {
     resident_dirty_ = true;
 }
 
+void MetalDevice::set_encoder_resource(id<MTLResource> resource, bool on) {
+    if (!resource) return;
+    std::lock_guard lock(encoder_resource_mutex_);
+    auto it = std::find(encoder_resources_.begin(), encoder_resources_.end(), resource);
+    if (on == (it != encoder_resources_.end())) return;
+    if (on) encoder_resources_.push_back(resource);
+    else encoder_resources_.erase(it);
+    encoder_resource_version_.fetch_add(1, std::memory_order_acq_rel);
+}
+
+void MetalDevice::encoder_resources(std::vector<id<MTLResource>>& out, std::uint64_t& version) {
+    std::lock_guard lock(encoder_resource_mutex_);
+    out = encoder_resources_;
+    version = encoder_resource_version_.load(std::memory_order_acquire);
+}
+
+std::uint64_t MetalDevice::encoder_resource_count() {
+    std::lock_guard lock(encoder_resource_mutex_);
+    return encoder_resources_.size();
+}
+
 void MetalDevice::evict(id<MTLAllocation> allocation) {
     if (!resident_ || !allocation) return;
     std::lock_guard lock(residency_mutex_);
@@ -931,6 +952,23 @@ bool make_resident(gpu::Device* device, gpu::Buffer* buffer) {
     if (!dynamic_cast<MetalDevice*>(device) || !buffer) return false;
     static_cast<MetalBuffer*>(buffer)->make_resident();
     return true;
+}
+
+bool set_encoder_resource(gpu::Device* device, gpu::Buffer* buffer, bool on) {
+    auto* d = dynamic_cast<MetalDevice*>(device);
+    if (!d || !buffer) return false;
+    d->set_encoder_resource(static_cast<MetalBuffer*>(buffer)->mtl(), on);
+    return true;
+}
+
+std::uint64_t encoder_resource_count(gpu::Device* device) {
+    auto* d = dynamic_cast<MetalDevice*>(device);
+    return d ? d->encoder_resource_count() : 0;
+}
+
+std::uint64_t encoder_resource_uses(gpu::Device* device) {
+    auto* d = dynamic_cast<MetalDevice*>(device);
+    return d ? d->encoder_resource_uses.load(std::memory_order_relaxed) : 0;
 }
 
 std::string memory_detail(gpu::Device* device, unsigned max_labels) {

@@ -7,6 +7,229 @@ Host: M4 Pro, macOS 27.0.1, Metal compiler 32023.922 (`metal -c`), Homebrew `spi
 also as x86_64 under Rosetta). Numbers are measured in this module unless a spike is named. The machine was shared
 with other workers (load average 10-42 during this round); all timings below are loaded timings.
 
+## Round 10, compiler-crash / mesh-fit worker (2026-11-27 04:58-05:45): the XPC crashes are a debug overlay; every world mesh pipeline builds
+
+Tree `port/build/mcc-x86_64`. Offline only: no title run of mine (single-pipeline probes and prepare_shaders; load
+1.3-10, another worker's title ran beside the tier rebuild). Measured unless marked inferred.
+
+### 1. MTLCompilerService crashes (59 reports in ~/Library/Logs/DiagnosticReports at 05:00)
+
+| group | reports | responsible process | crash | what was compiling |
+|---|---|---|---|---|
+| A | 37 (02:49-04:39) | gta6rt (d3m-s8-b..l, d3m-s9-a..f) | SIGSEGV/SIGBUS in libLLVM greedy register allocator (`RegAllocBase::allocatePhysRegs`), under `AGCModule<MeshProgramKey>::compileLLVMObject` | a mesh pipeline of the draw/mesh worker's debug overlay (`msl-debug2/3/4`, `msl_instrument.py --regs`) |
+| B | 12 (11-26 00:36-02:32) | vkbench-arm64 | C++ exception in SROA `PromoteMemToReg` -> abort | MoltenVK benchmark, not the Metal path |
+| C | 10 (11-26 05:20-14:55) | metal_test_mesh / none | `llvm::report_fatal_error` in a mesh program compile | round-3 mesh tests, not the title |
+
+- Every pid in group A maps to a d3m run with a `msl-debug*` overlay (unified logs); no run without one logged an
+  XPC error (gates-*, mem9-*, pc8-*, r9hc-*, uintps-*, r9as-*: 0). So "47-59 indirect mesh draws a frame refused,
+  XPC_ERROR_CONNECTION_INTERRUPTED" is a debug-run artefact; production world pipelines never hit it (prepare_shaders
+  built 2,394 + 2,972 world pipelines with 0 XPC errors).
+- Reduced (offline, `d3d12_metal/tools/mesh_pso_probe.mm`): `msl-debug3` `_MS_VS_TransformD_c5fd36bb_Wrapped~17`
+  crashes the service; the same 4,039-line MSL without its one register-dump line
+  `for (k < 64) gta6rt_r[128 + k] = _1356[k];` (64 of the 256-entry emulated VGPR array copied out at one point in the
+  giant PC switch) builds; k < 8 builds, k < 32 crashes, unroll-disabled loop crashes. 4 of 38 `msl-debug3` and 3 of 5
+  `msl-debug6` mesh rows crash; the store's rows build. Not reduced further (the trigger is register pressure in a
+  ~10k-value function, not one construct). Workaround for the debug tool (draw/mesh worker's file, request filed):
+  dump at most 8 VGPRs a sample.
+- Side effect to know: macOS keeps about 25 MTLCompilerService reports; my 10 offline crash probes made it evict 34
+  older ones (one report of mine, `MTLCompilerService-2026-11-27-050219.ips`, responsible `mesh_pso_probe`, same
+  signature). The full summary of all 59 is in my scratch notes only; the table above is it.
+
+### 2. Mesh shaders over 32 KiB of threadgroup memory: outputs staged in thread variables (`tools/mesh_out_private.py`)
+
+- Cause (MSL read): SPIRV-Cross stages every mesh output in a 128-entry threadgroup array (16 B per float4), e.g.
+  `_MS_VS_TransformD_7095f810`: 16 float4 outputs x 128 = 32 KiB + uint3 indices 2 KiB + cull flags + the LDS
+  emulation (275 uints) = 36,056 B; the ped shaders 15 outputs = 34,008 B. Packing vec3s (round 7) cannot fit them.
+- In these translated shaders every staged output is written as `X[gl_LocalInvocationIndex]` and read back only in
+  main0's copy as `X[spvVI]` / `X[spvPI]` (both `= gl_LocalInvocationIndex`), so no thread touches another thread's
+  element. The pass turns each such array into one thread variable (`threadgroup spvUnsafeArray<float4,128>& X` ->
+  `thread float4& X`, subscripts dropped, zero-initialised), after accounting for every use of the name (declaration,
+  parameter, own-index subscript, bare argument, struct member; anything else: the shader is left alone). Threadgroup
+  memory after: **1,112 B** (mesh sizes, `_6`, the LDS array) for 974 of 976 rows (2 keep 17,496 B of other shared arrays).
+- Store-wide: 2,047 rows over the limits -> **976 hw-route rows privatised**, 1,071 not (all store `split64` rows: their
+  split recipe writes vertices at computed indices). Overlay `build/mcc-x86_64/overlay.tsv` (976 rows, route `hw`,
+  split columns cleared, pass list `+private_mesh_outputs`), 251 MB of libraries in `build/mcc-x86_64/cas`.
+- Metal accepts them: the 38 world pipelines prep-world-f/-g refused, rebuilt with the overlay (`prep-test-a`):
+  **37 mesh ok, 1 refused** (the vertex shader with DXGI format 17, not a mesh shader). All 608 distinct libraries of the
+  976 rows through `mesh_pso_probe` (rasterisation off, one at a time, nice 15, 05:37-06:00): **608 ok, 0 failed, 0
+  compiler-service crashes** (`build/mcc-x86_64/probe-all.tsv`).
+- Not verified on the GPU: output equality against the original (the original cannot be built; no harness for these
+  bindings). The argument is per-use accounting in the MSL; checked again on all 976 outputs (0 subscripts left on a
+  privatised name). Risk (inferred): 16-18 float4 more live per thread at the copy; the values were already live in
+  registers there, but a spill would be thread scratch (the memory worker's 04:50 note) — not measured.
+
+### 3. World tier and refusals (build logs)
+
+- Catalog `build/pc7/catalog-r9-mcc.tsv` = store + uint overlay + msl-overrides + this overlay (last wins, as the
+  runtime's first-listed rule with this overlay first). `cache/tools/tier_refresh.sh 300`: 2,973 world pipelines
+  (217 new from round-9/10 runs). prepare_shaders into `build/pc7/arch-world` (`prep-world-mcc-a`, 6.0 min, 343 s of it
+  waiting for another worker's gta6rt, load 3.5-5.8): **2,972 ok, 1 refused** (DXGI format 17); 59 new builds, 98 shards,
+  2.73 GB. All 762 world mesh pipelines build; 99 of them use a privatised shader.
+
+| refusals (world list, build logs) | before (prep-world-f+g, 2,429 + 327 built) | after (prep-world-mcc-a, 2,973) |
+|---|---|---|
+| mesh: threadgroup 36,056 B | 20 | 0 |
+| mesh: threadgroup 34,008 B | 17 | 0 |
+| vertex input DXGI format 17 | 1 | 1 |
+| XPC_ERROR_CONNECTION_INTERRUPTED | 0 (debug runs only, census 26-59 a frame) | 0 |
+
+- Per frame in title censuses before (other workers' logs): hw mesh threadgroup 5.4-14.2 (d3m-s9-d/-k), 34,008-B class
+  3.2, msl-overrides split64 rows 2.4-15.1 a frame (36,336 B / 29,888 + 31,968 B; those 6 rows are replaced by hw rows
+  here). **After: not measured in the title** — the overlay is not in the adapter's default list yet (patch below), and
+  no world run has used it.
+- To use it now: `GTA6RT_METAL_SHADER_OVERLAY=$PORT/build/mcc-x86_64/overlay.tsv:$PORT/build/d3d12_metal-msl-overrides/manifest.tsv:$PORT/build/uintps-x86_64/overlay.tsv`.
+  Default: `build/mcc-x86_64/patches/01-default-overlay-mesh-out-private.patch` (shims/d3d12_metal_device.cpp, the
+  overlay default string only; dry-run applies to the 05:20 file).
+
+Reproduce: `python3 -I port/shaderc_msl/tools/mesh_out_private.py port/build/mcc-x86_64 --list port/build/mcc-x86_64/scan-names.txt --jobs 2`
+(names = rows `mesh_tg_pack.jsonl` marks still_over / split / error), then the catalog_merge and prepare_shaders lines above.
+
+## Round 9 (2026-11-27, 05:00-): thread-private memory (driver scratch) and the loop cap
+
+Tree `port/build/tmem-x86_64` (offline: no title run). **M** = measured here, **I** = inferred. Every GPU job ran
+through `tools/tmem_slot.sh` (waits until no `gta6rt*` process exists and no other probe holds its lock; the probe
+binaries are named `gta6rt_tmem_*`, so the world-run scripts that poll the slot wait for them).
+
+### 1. What allocates the scratch, and how it was measured (M)
+
+- `tools/tmem_probe.mm`: one fresh device, one pipeline (or a list of them on one device), then an **indirect**
+  dispatch/draw whose argument buffer holds **0 groups / 0 vertices**: no thread runs, so nothing a title shader does
+  can fault or spin, yet the driver allocates the per-thread private memory exactly as for a real dispatch
+  (calibration on own kernels: indirect-zero +1,048.6 MiB = direct 1-group +1,044.6 MiB for 16 KiB a thread).
+  Graphics ledger delta (`task_vm_info.ledger_tag_graphics_footprint`) = phys_footprint delta in every row.
+- Calibration (own kernel, dynamically indexed array, compute): 0 / 1 / 4 / 8 / 16 / 24 / 32 KiB a thread ->
+  80.6 / 140.6 / 320.6 / 564.6 / 1,048.6 / 1,532.6 / 2,016.6 MiB. So **delta = 80.6 MiB + 60.5 MiB per KiB a thread**
+  (80.6 MiB is what any first dispatch adds).
+- **Compute and render pools are separate and add up** (M): 00968 (compute) then a 16 KiB fragment shader on the same
+  device: +1,524.8 then +1,083.2 MiB; in the other order +1,083.6 then +1,524.3. A vertex shader after the fragment
+  added 0. Within compute, the largest kernel decides (staircase: once 00968 is in, later kernels add only 16 MiB
+  code-heap steps).
+
+### 2. Ranking of the world list (`build/pc7/lists/world-r8-300.specs`, catalog `build/pc7/catalog-r8.tsv`)
+
+Static (`tools/tmem_rank.py`, all 2,861 shaders of the list, SPIR-V Function/Private aggregates, `rank.tsv/json`):
+the largest declared thread aggregates are **3.0 KiB** (the emulated register files: `s[256]` + `v[128]` uint arrays
+plus small Private arrays), of which at most **1.4 KiB** is indexed with a run-time value. No world shader declares a
+large indexable temp; the constant tables are already `constant` in the MSL. So the 24 KiB below is **compiler spill**,
+not a declared array (M for the SPIR-V, I for "spill": the AIR of 00968 has 0 allocas).
+
+Measured, compute (all 1,098 world compute kernels on one device from `build/pc7/arch-world`, 1,098 archive hits,
+then the step-makers each alone on a fresh device; `cs_pass1.txt`, `cs_pass2.txt`):
+
+| kernel | fresh-device delta (MiB) | per thread (KiB) |
+|---|---:|---:|
+| **library/lib_cs_00968** (8x8, a 441-texel min/max gather) | **1,524.8** | **23.9** |
+| library/lib_cs_00977 | 349.6 | 4.4 |
+| library/lib_cs_00974 | 301.5 | 3.6 |
+| library/lib_cs_02912 | 252.8 | 2.8 |
+| library/lib_cs_03417 | 192.7 | 1.9 |
+| library/lib_cs_00872 | 168.6 | 1.5 |
+| 01940 / 03216 / 01189 / 03413 / 01720 | 132.6 / 124.6 / 108.7 / 108.6 / 100.6 | <= 0.9 |
+| the families named by the gates worker: 01449, 01452, 01460-01462, 01467, 01468 | 88.6-92.7 | ~0.1 |
+
+The whole list on one device without 00968 peaks at the 00977 step; with it, 00968 is the step (+1,272 MiB on top of
+266). **00968 alone (1.44 GiB above the first-dispatch 80 MiB) matches the memory worker's +1.4-1.8 GiB in one second at
+world+3-5 s** (I: same size, same ledger; the kernel's first dispatch time in the world is not known).
+
+Measured, render (`tools/tmem_render.py` + probe `rlist`: pixel shaders with a generated vertex function writing every
+user input, mesh shaders with their object stage for split64, vertex shaders; `render_pass1.txt`, `render_ps1.txt`,
+`psrest/`): the render pool is led by pixel shaders: `%PS_DeferredTextured_4dbafe93_Wrapped~23` **580.2 MiB alone
+(~8.3 KiB a thread)**, `~24` 520.2, `~19` 376.0, `(PS_ResolveWaterSurface_a0e5e558` 232.2, `%PS_TexturedDeferred_34f92402`
+184.3; vertex/mesh peak at ~200 (`VS_RasterizeWaterIndirectHW_WithLODStitching_81fb48ad` 214.5,
+`&MS_VS_TransformSkinD_34f92402` 198.5, per-row values on a shared device).
+All 1,149 world pixel shaders created and probed (0 failures); the 259 largest (TL_PS_*, PS_MIRROR_*) peak at 306 MiB on
+a shared device.
+
+### 3. Cause in 00968 and the transform (M)
+
+- The translator lowers a typeless image load to a three-way branch on the V# format bits with one typed read per arm
+  (int / uint / float view of the same descriptor), each arm followed by the same register writes. 00968 has 441
+  such diamonds (1,323 reads). Diagnostics on the MSL (not shipped): dropping the float arm's reads -> 17 KiB; reading
+  through one view in all arms (LLVM merges the arms) -> 0.7 KiB; `-Os`, `make_uniform` on the conditions, a
+  `simdgroup_barrier`/`threadgroup_barrier`/thread fence (mem_texture) before every diamond, SSA-promoting the register
+  arrays (`spirv-opt --scalar-replacement --ssa-rewrite`): all unchanged at 1,524.8. So the Apple compiler speculates
+  all three reads of every diamond and keeps their results: ~16 B a read (I: from the per-read slope).
+- **`merge_typed_reads`** (`tools/tmem.py`, recipe pass `--merge-typed-reads`, MSL level): a diamond whose three arms
+  are identical except for the typed op (`read`/`sample`/`gather`/`*_compare`, same descriptor index and arguments,
+  same result type), and whose conditions use no variable the arms assign, becomes one copy of the arm body in which
+  each op is a call of a `noinline` template helper `spvTypedOpN(c1, c2, viewA[i], viewB[i], viewC[i], args...)` that
+  holds the branch: `if (c1) return wrapA(viewA.op(args)); if (c2) return wrapB(...); return wrapC(...)`.
+  **Why equivalent:** the helper evaluates exactly the read the original's taken arm evaluates, with the same
+  arguments and the same conversion (`uint4(int4)`, bit cast, ...), at the same point of the same statement; the
+  conditions are pure (constant tables, uniform bools) and not assigned in the arm, so evaluating them per call gives
+  the original's choice; the rest of the arm is the same text. The inline (`always_inline`) form gives 1,524.8 again:
+  the call boundary is what stops the speculation.
+- Per-thread memory, recipe-built metallibs (`try3/res.txt`, fresh device each):
+
+| kernel | before (MiB / KiB a thread) | after | ops merged |
+|---|---:|---:|---:|
+| **00968** | **1,524.8 / 23.9** | **100.7 / 0.33** | 441 |
+| 02912 | 252.8 / 2.8 | 124.8 / 0.73 | 58 |
+| 00977 (built, not in the overlay) | 349.6 / 4.4 | 197.6 / 1.9 | 200 |
+| 00974 (built, not in the overlay) | 301.5 / 3.6 | 181.5 / 1.7 | 150 |
+| top pixel shaders (MSL probe only) | 580.2 / 520.2 / 376.0 / 232.2 / 184.3 | 560.2 / 492.2 / 352.0 / 188.2 / 184.3 | 34-79 |
+
+  Pixel shaders gain little: their spill has another cause (not found; `%PS_DeferredTextured_4dbafe93~23` has no
+  dynamically indexed array, 381 `simd_any`, 215 typed ops). Not in the overlay.
+- **A/B on random inputs** (`tools/tmem_ab.mm` + `tools/tmem_abcfg.py`; the contract bindings: a bindless table with an
+  entry for every 8-word heap window, typed textures per slot matching the arm that reads it, write views, push block,
+  heap at the push address; inputs from the kernel's own format tables so all three arms are taken; old store metallib
+  vs new, bit-for-bit over every writable texture, the heap and the table):
+  - 00968: 5 seeds, 4x4 groups of 8x8: **0 of 221,195 words differ**; 5,184-6,144 words written by the kernel per seed.
+    GPU time for 20 dispatches (best of 5, loaded GPU): A 2.79-4.57 ms, B 1.79-3.37 ms (no slowdown measured).
+  - 02912: 5 seeds "small" + 3 "safe" layout: 0 differ; 4,096 words written. A 0.77-1.84 ms, B 0.48-0.75 ms.
+  - 00977 / 00974: no input I could build safely made them write anything (0 words changed, validation layer on),
+    so they are **not verified and not in the overlay**.
+  - Safety: 00968's raw loads sit at the heap base + push word 5 + constants, so its "small" layout stays in the heap;
+    kernels that chase buffer V#s ran first with `MTL_SHADER_VALIDATION=1` (no report), with the "safe" layout (every
+    heap/push word with its low 16 bits clear, texture data masked to 16 bits, 32 MiB heap).
+
+### 4. Loop cap (`--loop-cap N`, recipe pass `loop_cap`, off by default)
+
+- Every `for (;;)` (how SPIRV-Cross prints each loop of the translation) gets a counter declared at the top of its
+  function (so re-entries of an inner loop count too); a lane leaves the loop once that header has run N trips
+  (overlay: N = 2^14). Translator loops are wave-uniform (exec-mask control), so the lanes of a wave leave together
+  and barriers in the loop stay matched (I). The translator's own guard (65,536 per entry) stays.
+- Applied (overlay): 01449 (2 loops), 01452 (1), 01461 (3), 01462 (1), 01464 (1), 01467 (2). **01460, 01463, 01465,
+  01466, 01468 have no loop at all** (0 `for`/`while`/`do` in their MSL), so a GPU timeout there is not a loop spin
+  (I: long straight-line work or a large dispatch); no row for them (a row would only cost an archive miss).
+- Checks (M): capped vs store on random "safe" inputs, 1 group, validation on: 0 differ for all six (3 seeds each;
+  weak: these inputs exercise 0-2 written words). The mechanism on an own kernel (`capt/`): a loop ending after 100
+  trips gives 100 trips capped and uncapped; a loop whose exit is never reached ends at 16,384 trips, 1.76 ms.
+  **Incident:** my uncapped control of that test spun one lane for 2.76e9 trips: a 62 s command buffer (status
+  completed, no error, 0 new gpuEvent reports, still 9 gpuEvent-gta6rt in DiagnosticReports at 05:43); it held the GPU
+  while it ran. Earlier, one synthetic calibration probe started while a gta6rt was running (my first slot check only
+  counted processes); every later job went through `tmem_slot.sh`.
+
+### 5. Overlay (delivered)
+
+`build/tmem-x86_64/overlay.tsv` (8 rows, format of the uint overlay, libraries in `build/tmem-x86_64/cas`, report
+`overlay.json`): merge_typed_reads: `library/lib_cs_00968`, `library/lib_cs_02912`; loop_cap 16384: `01449 01452
+01461 01462 01464 01467`. Built by `tools/tmem_overlay.py` from each shader's current catalog row (rebuilding without
+the new passes reproduced the catalog key for all 8: `--check-key`); binding plans equal to the store's rows.
+Load (first listed wins): `GTA6RT_METAL_SHADER_OVERLAY=<port>/build/tmem-x86_64/overlay.tsv:<port>/build/d3d12_metal-msl-overrides/manifest.tsv:<port>/build/uintps-x86_64/overlay.tsv`.
+
+Expected saving (I, from the per-kernel M values and the "largest kernel decides" staircase): the compute pool goes
+from 1,524.8 MiB (00968) to the next kernel, 00977 at 349.6 MiB: **-1,175 MiB**; with 00977/00974 verified and added
+it would be 197.6 MiB (-1,327 MiB). The render pool (~580 MiB, a pixel shader) is unchanged. Not confirmed in a world
+run (left to the memory worker: request in run/requests/d3d12_metal.md, 06:xx).
+
+### Files
+
+`tools/tmem.py` (passes), `tools/tmem_rank.py` (static ranking), `tools/tmem_render.py` (render probe rows),
+`tools/tmem_probe.mm` (scratch probe: `synth`, `list`, `rlist`; `TMEM_KEEP=1` keeps pipelines alive),
+`tools/tmem_ab.mm` + `tools/tmem_abcfg.py` (A/B), `tools/tmem_overlay.py` (overlay), `tools/tmem_slot.sh` (slot).
+`tools/shaderc_msl.py`: options `merge_typed_reads`, `loop_cap` (CLI `--merge-typed-reads`, `--loop-cap N`), MSL
+fix-ups, in the cache key. Outputs: `build/tmem-x86_64/{rank.tsv,cs_pass*.txt,alone/,render_*.txt,psrest/,ab/,try3/}`.
+
+### Next
+
+1. Real-data A/B for 00977/00974 (needs buffer V#s that point into the test heap), then add them (-150 MiB more).
+2. The pixel spill (`PS_DeferredTextured_4dbafe93` ~8 KiB a thread, 580 MiB render pool): find the construct the way
+   section 3 did (truncation is useless: the outputs are at the end, so DCE removes everything).
+3. World confirmation (memory worker): the graphics ledger step at world+3-5 s should drop from +1.4-1.8 GiB to
+   ~+0.3 GiB with the overlay.
+
 ## Round 8 (2026-11-27, 02:15-): pixel output-type variants, library compute shrink, FSR4 03/18
 
 Tree `port/build/uintps-x86_64`. Offline unless a run is named. Load average 6-13 throughout (another worker's title

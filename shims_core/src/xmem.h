@@ -64,4 +64,27 @@ size_t live_physical_pages();
 size_t window_count();
 size_t mapped_page_count();
 
+// GTA6RT_METAL_TITLE_POOL=1 (the title pool): the pool is one Mach memory entry mapped once at a 16 KiB-aligned
+// host range that is never moved, protected or unmapped, title pages are views of it (physical pages in windows,
+// and committed XMemVirtualAlloc / MEM_GRAPHICS VirtualAlloc memory as runs of slots), so a GPU buffer made over the
+// host range reaches title memory with no copy. False / empty everywhere while it is off (the default).
+//
+// The pool bytes behind title address `va`: `host` is va's byte in the host range, `run_bytes` how many bytes from
+// va on are the same consecutive pool bytes (at most 256 MiB). False when no pool page backs va now (not title
+// pool memory, unmapped, decommitted).
+bool title_pool_view(std::uint64_t va, void** host, std::uint64_t* run_bytes);
+// Bumped by every change of what title addresses the pool backs.
+std::uint64_t title_pool_generation();
+// The title ranges whose backing went or changed (unmapped, remapped, decommitted, released) after generation
+// `since`, into `out` ({0, UINT64_MAX} when the log no longer reaches back that far); returns the generation now.
+std::uint64_t title_pool_removals(std::uint64_t since, std::vector<std::pair<std::uint64_t, std::uint64_t>>& out);
+// The pool's host range, false when the title pool is off.
+bool title_pool_range(void** base, std::uint64_t* size);
+struct TitlePoolStats {
+    bool on = false;
+    std::uint64_t runs = 0, run_bytes = 0, runs_refused = 0, plain_commits = 0, plain_commit_bytes = 0;
+    std::uint64_t generation = 0, removals = 0;
+};
+TitlePoolStats title_pool_stats();
+
 }  // namespace rt::xmem
