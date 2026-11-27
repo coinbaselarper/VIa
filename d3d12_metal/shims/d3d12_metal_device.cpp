@@ -3770,6 +3770,18 @@ struct DeviceState {
                 return Landing::landed;
             }
         }
+        // A live title-pool page is a guest allocation and never a malloc region: the answer the two probes below give
+        // for it, without their 2-9 mach_vm_region(_recurse) calls (the list-value pump spent 58-75% of a core in the
+        // kernel on them in the world, cp-b). GTA6RT_METAL_VALUE_POOL_FAST=0: always probe.
+        static const bool pool_fast = [] {
+            const char* e = std::getenv("GTA6RT_METAL_VALUE_POOL_FAST");
+            return !(e && *e == '0');
+        }();
+        if (pool_fast) {
+            void* host = nullptr;
+            std::uint64_t run = 0;
+            if (rt::xmem::title_pool_view(va, &host, &run) && run >= size) return Landing::elsewhere;
+        }
         if (malloc_region(va)) {
             static const bool drop = [] {
                 const char* e = std::getenv("GTA6RT_METAL_DROP_HEAP_WRITES");
