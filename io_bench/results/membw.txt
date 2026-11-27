@@ -1,0 +1,6 @@
+RESULT arch=arm64 bench=membw mib=16 memcpy_mibs=44781 memset_mibs=83369 vector_resize_mibs=137832
+RESULT arch=x86_64 bench=membw mib=16 memcpy_mibs=20702 memset_mibs=28021 vector_resize_mibs=24984
+RESULT arch=arm64 bench=membw mib=16 memcpy_mibs=39702 memset_mibs=91450 vector_resize_mibs=122254
+RESULT arch=x86_64 bench=membw mib=16 memcpy_mibs=20246 memset_mibs=24842 vector_resize_mibs=24581
+RESULT arch=arm64 bench=membw mib=16 memcpy_mibs=39665 memset_mibs=124635 vector_resize_mibs=121827
+RESULT arch=x86_64 bench=membw mib=16 memcpy_mibs=20616 memset_mibs=25149 vector_resize_mibs=25106

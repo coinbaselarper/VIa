@@ -1,0 +1,16 @@
+# Kept for build trees configured with -DCMAKE_PROJECT_TOP_LEVEL_INCLUDES=<port>/host/src/win/host_overlay.cmake before
+# host/CMakeLists.txt included win.cmake itself (round 3). It now adds nothing when the target already has the sources.
+set(_gta6rt_overlay_dir "${CMAKE_CURRENT_LIST_DIR}")
+function(_gta6rt_win_attach_deferred)
+  if(NOT TARGET gta6rt)
+    return()
+  endif()
+  get_target_property(_srcs gta6rt SOURCES)
+  foreach(_s IN LISTS _srcs)
+    if(_s MATCHES "win_core\\.cpp$")
+      return()
+    endif()
+  endforeach()
+  include("${_gta6rt_overlay_dir}/win.cmake")
+endfunction()
+cmake_language(DEFER DIRECTORY "${CMAKE_SOURCE_DIR}" CALL _gta6rt_win_attach_deferred)

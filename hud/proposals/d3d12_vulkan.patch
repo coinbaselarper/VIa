@@ -1,0 +1,129 @@
+diff -uN -r a/port/d3d12_vulkan/CMakeLists.txt b/port/d3d12_vulkan/CMakeLists.txt
+--- a/port/d3d12_vulkan/CMakeLists.txt	2026-11-26 13:56:51
++++ b/port/d3d12_vulkan/CMakeLists.txt	2026-11-26 13:57:24
+@@ -31,7 +31,8 @@
+ target_include_directories(gta6rt_d3d12_vulkan_headers BEFORE INTERFACE
+   "${D3D12VK_GEN}" "${CMAKE_CURRENT_SOURCE_DIR}/include")
+ target_include_directories(gta6rt_d3d12_vulkan_headers INTERFACE
+-  "${CMAKE_CURRENT_SOURCE_DIR}/shims" "${CMAKE_CURRENT_SOURCE_DIR}/src" "${CMAKE_CURRENT_SOURCE_DIR}/platform")
++  "${CMAKE_CURRENT_SOURCE_DIR}/shims" "${CMAKE_CURRENT_SOURCE_DIR}/src" "${CMAKE_CURRENT_SOURCE_DIR}/platform"
++  "${CMAKE_CURRENT_SOURCE_DIR}/../hud/include")
+ target_compile_definitions(gta6rt_d3d12_vulkan_headers INTERFACE LEONIDA_VULKAN_DEVICE VK_USE_PLATFORM_METAL_EXT)
+ target_link_libraries(gta6rt_d3d12_vulkan_headers INTERFACE
+   gta6rt_d3d12_portable gta6rt_vulkan_headers gta6rt_dxheaders gta6rt_build_options)
+diff -uN -r a/port/d3d12_vulkan/shims/d3d12_pipeline_compile.h b/port/d3d12_vulkan/shims/d3d12_pipeline_compile.h
+--- a/port/d3d12_vulkan/shims/d3d12_pipeline_compile.h	2026-11-26 13:56:52
++++ b/port/d3d12_vulkan/shims/d3d12_pipeline_compile.h	2026-11-26 13:57:24
+@@ -3,6 +3,7 @@
+ 
+ #include "../src/vulkan_replay.h"
+ #include "../src/vk_run_counters.h"
++#include <gta6rt_hud/stats.h>
+ #include <windows.h>
+ #include <algorithm>
+ #include <chrono>
+@@ -141,6 +142,7 @@
+         }
+         jobs_.emplace(priority, Job{owner, device, std::move(work)});
+         ++stats_.submitted;
++        gta6rt_hud_set_pipelines_pending(jobs_.size() + running_.size());
+         wake_.notify_one();
+         return true;
+     }
+@@ -354,6 +356,7 @@
+             running_.erase(std::find_if(running_.begin(), running_.end(), [me](const Running& r) {
+                 return r.thread == me;
+             }));
++            gta6rt_hud_set_pipelines_pending(jobs_.size() + running_.size());
+             done_.notify_all();
+         }
+     }
+diff -uN -r a/port/d3d12_vulkan/shims/d3d12_vulkan_device.cpp b/port/d3d12_vulkan/shims/d3d12_vulkan_device.cpp
+--- a/port/d3d12_vulkan/shims/d3d12_vulkan_device.cpp	2026-11-26 13:56:52
++++ b/port/d3d12_vulkan/shims/d3d12_vulkan_device.cpp	2026-11-26 13:57:24
+@@ -12,6 +12,7 @@
+ #include "d3d12_com.h"
+ #include "d3d12_compile_exit.h"
+ #include "d3d12_pipeline_compile.h"
++#include "../src/hud_feed.h"
+ #include "d3d12_pipeline_checkpoint.h"
+ #include "d3d12_feature_compat.h"
+ 
+@@ -12996,6 +12997,7 @@
+         entry->memory.check(0, check_pages_before_read(),
+                             [&] { return probe_title_memory(entry->cpu, span, false); });
+         title_stats_.unreadable += entry->memory.pending();
++        gta6rt_hud_publish_textures_waiting(title_stats_.unreadable);
+         // The image takes the view's format too when the element is the same size (five-star-recomp does the same);
+         // views in other formats of the same description add theirs (place_title_view).
+         const auto add = [&](DXGI_FORMAT f) {
+diff -uN -r a/port/d3d12_vulkan/shims/d3d12_xs_device.cpp b/port/d3d12_vulkan/shims/d3d12_xs_device.cpp
+--- a/port/d3d12_vulkan/shims/d3d12_xs_device.cpp	2026-11-26 13:56:52
++++ b/port/d3d12_vulkan/shims/d3d12_xs_device.cpp	2026-11-26 13:57:24
+@@ -51,6 +51,7 @@
+ #include "xbox_present.h"
+ #include "title_window.h"
+ #include "title_hud.h"
++#include "../src/hud_feed.h"
+ #include "package_splash.h"
+ #include "startup_trace.h"
+ #endif
+@@ -1699,6 +1700,10 @@
+         static_cast<UINT>(plane_count), reinterpret_cast<const rt::d3d12::XboxPresentPlaneParameters*>(planes),
+         reinterpret_cast<const rt::d3d12::XboxPresentParameters*>(params));
+     if (SUCCEEDED(result) && state->hud) state->hud->note_present();
++    if (SUCCEEDED(result)) {
++        gta6rt_hud_note_present();
++        leonida::hud_feed::publish_run_counters();
++    }
+     return hr_to_u64(result);
+ }
+ 
+diff -uN -r a/port/d3d12_vulkan/src/hud_feed.h b/port/d3d12_vulkan/src/hud_feed.h
+--- a/port/d3d12_vulkan/src/hud_feed.h	1969-12-31 19:00:00
++++ b/port/d3d12_vulkan/src/hud_feed.h	2026-11-26 13:57:24
+@@ -0,0 +1,21 @@
++#pragma once
++// port/hud: feeds the run counters (vk_run_counters.h) into the performance overlay's stats block. Inactive (one
++// relaxed load) unless GTA6RT_HUD / --hud switched the overlay on.
++
++#include <gta6rt_hud/stats.h>
++
++#include "vk_run_counters.h"
++
++namespace leonida::hud_feed {
++
++inline void publish_run_counters() {
++    if (!gta6rt_hud_active()) return;
++    const auto load = [](const std::atomic<std::uint64_t>& a) { return a.load(std::memory_order_relaxed); };
++    const run_counters::Counters& c = run_counters::counters();
++    gta6rt_hud_publish_totals(load(c.draws_emitted), load(c.dispatches_emitted),
++                              load(c.submissions_ok) + load(c.submissions_failed), load(c.submit_wall_us) * 1000);
++    gta6rt_hud_publish_pipelines(load(c.vk_graphics_built) + load(c.vk_compute_built), load(c.vk_cache_hits),
++                                 load(c.pso_graphics_failed) + load(c.pso_compute_failed));
++}
++
++}  // namespace leonida::hud_feed
+diff -uN -r a/port/d3d12_vulkan/src/vk_run_counters.h b/port/d3d12_vulkan/src/vk_run_counters.h
+--- a/port/d3d12_vulkan/src/vk_run_counters.h	2026-11-26 13:56:51
++++ b/port/d3d12_vulkan/src/vk_run_counters.h	2026-11-26 13:57:24
+@@ -29,7 +29,7 @@
+     std::atomic<std::uint64_t> deferred_uses{0}, deferred_waits{0}, deferred_wait_us{0};
+     std::atomic<std::uint64_t> draws_pipeline_pending{0}, worker_builds_null{0};
+     std::atomic<std::uint64_t> cache_loaded_bytes{0}, cache_written_bytes{0}, cache_writes{0}, cache_write_us{0};
+-    std::atomic<std::uint64_t> draws_emitted{0}, draws_skipped{0}, draws_in_failed_submissions{0};
++    std::atomic<std::uint64_t> draws_emitted{0}, draws_skipped{0}, draws_in_failed_submissions{0}, dispatches_emitted{0};
+     std::atomic<std::uint64_t> dispatches_in_failed_submissions{0}, submissions_ok{0}, submissions_failed{0};
+     std::atomic<std::uint64_t> float_control_refusals{0};
+ };
+diff -uN -r a/port/d3d12_vulkan/src/vulkan_replay.h b/port/d3d12_vulkan/src/vulkan_replay.h
+--- a/port/d3d12_vulkan/src/vulkan_replay.h	2026-11-26 13:56:51
++++ b/port/d3d12_vulkan/src/vulkan_replay.h	2026-11-26 13:57:24
+@@ -5262,6 +5262,7 @@
+                                         &set0, 0, nullptr);
+             }
+             vk.push_constants(command_buffer, p.pipeline.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(data), &data);
++            run_counters::add(run_counters::counters().dispatches_emitted);
+             vk.dispatch(command_buffer, dispatch->x, dispatch->y, dispatch->z);
+         } else if (raster.state) {
+             const Draw* draw = raster.state;

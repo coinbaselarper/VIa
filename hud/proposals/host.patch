@@ -1,0 +1,110 @@
+diff -u -r a/port/host/CMakeLists.txt b/port/host/CMakeLists.txt
+--- a/port/host/CMakeLists.txt	2026-11-26 13:56:51
++++ b/port/host/CMakeLists.txt	2026-11-26 13:57:01
+@@ -28,3 +28,6 @@
+ endif()
+ 
+ include(src/win/win.cmake)
++
++add_subdirectory("${GTA6RT_ROOT}/hud" "${CMAKE_BINARY_DIR}/hud")
++target_link_libraries(gta6rt PRIVATE gta6rt_hud)
+diff -u -r a/port/host/src/main.cpp b/port/host/src/main.cpp
+--- a/port/host/src/main.cpp	2026-11-26 13:56:51
++++ b/port/host/src/main.cpp	2026-11-26 13:57:01
+@@ -5,6 +5,7 @@
+ #include <gta6rt/os.h>
+ #include <gta6rt/seh.h>
+ #include <gta6rt/shims.h>
++#include <gta6rt_hud/hud.h>
+ 
+ #include "guest_address.h"
+ #include "host_cpu.h"
+@@ -66,6 +67,7 @@
+     bool map_only = false;
+     bool reexec = true;
+     bool hidden_window = false;
++    std::string hud;
+     bool no_zen_fixup = false;
+     std::string vk_driver;
+     std::string console_profile;
+@@ -147,6 +149,7 @@
+                  "  --no-zen-fixup      leave CLWB/CLZERO/MONITORX/MWAITX to the SIGILL emulator\n"
+                  "  --trace-d3d12       log every D3D12 call the layer records, with its result\n"
+                  "  --hidden-window     the title's window is a layer only, nothing on screen\n"
++                 "  --hud MODE          performance overlay: off (default), min, full or title (GTA6RT_HUD; F1 cycles, F2 on/off)\n"
+                  "  --vk-driver X       moltenvk, kosmickrisp or a dylib path (GTA6RT_VK_DRIVER); x86_64 default: the\n"
+                  "                      spike/s1-vulkan-x86 MoltenVK 1.4.2 build when GTA6RT_VK_DRIVER is unset\n"
+                  "  --console-profile P series-s, series-x or auto (LEONIDA_CONSOLE_PROFILE; default auto, series-x\n"
+@@ -255,6 +258,14 @@
+             host::enable_d3d12_trace();
+         } else if (a == "--hidden-window") {
+             g_args.hidden_window = true;
++        } else if (a == "--hud") {
++            const char* v = next("--hud");
++            gta6rt_hud_mode hud_mode;
++            if (!v || !gta6rt_hud_parse_mode(v, &hud_mode)) {
++                std::fprintf(stderr, "--hud needs off, min, full or title\n");
++                return false;
++            }
++            g_args.hud = v;
+         } else if (a == "-h" || a == "--help") {
+             usage();
+             std::exit(0);
+@@ -845,6 +856,13 @@
+     logf("seh exports bound through the shim table: %u", register_seh_exports());
+     hook_get_proc_address();
+     host::window::set_hidden(g_args.hidden_window);
++    if (!g_args.hud.empty()) setenv("GTA6RT_HUD", g_args.hud.c_str(), 1);
++    if (!g_args.hidden_window) {
++        gta6rt_hud_init_from_env();
++        if (const char* profile = std::getenv("LEONIDA_CONSOLE_PROFILE")) gta6rt_hud_set_profile(profile);
++        if (!g_args.vk_driver.empty()) gta6rt_hud_set_driver(g_args.vk_driver.c_str());
++        if (host::trace::enabled()) gta6rt_hud_set_import_counter([](void*) { return host::trace::total_calls(); }, nullptr);
++    }
+     rt::shims::add_module_lookup(&g_args, &lookup_module);
+     rt::shims::add_bundled_loader(&g_args, &kBundledOps);
+ 
+@@ -1007,5 +1025,6 @@
+     logf("title exited with code %d (%#x) after %.2f s", code, static_cast<unsigned>(code), secs);
+     report_unimplemented_and_trace("title exit");
+     finish_run("title exit");
++    gta6rt_hud_shutdown();
+     _exit(code);
+ }
+diff -u -r a/port/host/src/win/appkit_window.mm b/port/host/src/win/appkit_window.mm
+--- a/port/host/src/win/appkit_window.mm	2026-11-26 13:56:51
++++ b/port/host/src/win/appkit_window.mm	2026-11-26 13:57:01
+@@ -10,6 +10,7 @@
+ #include <mutex>
+ #include <vector>
+ 
++#include "gta6rt_hud/hud.h"
+ #include "win_core.h"
+ 
+ namespace {
+@@ -240,6 +241,9 @@
+         addLocalMonitorForEventsMatchingMask:NSEventMaskKeyDown | NSEventMaskKeyUp | NSEventMaskFlagsChanged
+                                      handler:^NSEvent*(NSEvent* event) {
+                                          if (!is_host_window(event.window)) return event;
++                                         if (event.type == NSEventTypeKeyDown &&
++                                             gta6rt_hud_handle_key(event.keyCode, event.modifierFlags, event.isARepeat))
++                                             return nil;
+                                          if (event.type == NSEventTypeKeyDown && [NSApp.mainMenu performKeyEquivalent:event])
+                                              return nil;
+                                          if (event.modifierFlags & NSEventModifierFlagCommand) return event;
+@@ -343,6 +347,7 @@
+                     emit(x, HOST_WIN_EV_FULLSCREEN, 0);
+                     emit_size(x);
+                 }));
++        gta6rt_hud_attach((__bridge void*)ns);
+         *result = 1;
+     });
+     if (!answered) std::fprintf(stderr, "[rt] host_win: the main queue did not answer attaching window %p\n", (void*)window);
+@@ -357,6 +362,7 @@
+         g_entries.erase(std::remove(g_entries.begin(), g_entries.end(), e), g_entries.end());
+     }
+     run_on_main(^{
++        gta6rt_hud_detach((__bridge void*)e->ns);
+         for (id token in e->tokens) [NSNotificationCenter.defaultCenter removeObserver:token];
+         [e->tokens removeAllObjects];
+     });

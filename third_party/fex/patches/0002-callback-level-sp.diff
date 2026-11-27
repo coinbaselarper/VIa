@@ -1,0 +1,16 @@
+--- a/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp
++++ b/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp
+@@ -467,6 +467,13 @@
+     // First thing we need to move the thread state pointer back in to our register
+     mov(STATE, ARMEmitter::XReg::x0);
+ 
++#ifdef __APPLE__
++    // gta6rt: the embedder re-enters this callback level at AbsoluteLoopTopAddressFillSRA after a guest exception,
++    // which needs the stack pointer of this level. The embedder saves and restores the field around nested calls.
++    add(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r2, ARMEmitter::Reg::rsp, 0);
++    str(ARMEmitter::XReg::x2, STATE_PTR(CpuStateFrame, ReturningStackLocation));
++#endif
++
+     // Make sure to adjust the refcounter so we don't clear the cache now
+     ldr(ARMEmitter::WReg::w2, STATE_PTR(CpuStateFrame, SignalHandlerRefCounter));
+     add(ARMEmitter::Size::i32Bit, ARMEmitter::Reg::r2, ARMEmitter::Reg::r2, 1);

@@ -1,0 +1,66 @@
+#pragma once
+#include <minwinbase.h>
+
+/* NLS subset. Implemented by os/ (one en-US locale; CP_ACP is UTF-8, see stringapiset.h). */
+
+#define MAX_LEADBYTES 12
+#define MAX_DEFAULTCHAR 2
+
+typedef DWORD LCTYPE;
+typedef DWORD CALTYPE;
+
+typedef struct _cpinfo {
+    UINT MaxCharSize;
+    BYTE DefaultChar[MAX_DEFAULTCHAR];
+    BYTE LeadByte[MAX_LEADBYTES];
+} CPINFO, *LPCPINFO;
+
+typedef struct _nlsversioninfo NLSVERSIONINFO, *LPNLSVERSIONINFO;
+
+#define LCMAP_LOWERCASE 0x00000100
+#define LCMAP_UPPERCASE 0x00000200
+#define LCMAP_SORTKEY 0x00000400
+#define LCMAP_BYTEREV 0x00000800
+#define LCMAP_LINGUISTIC_CASING 0x01000000
+
+#define CT_CTYPE1 0x00000001
+#define CT_CTYPE2 0x00000002
+#define CT_CTYPE3 0x00000004
+#define C1_UPPER 0x0001
+#define C1_LOWER 0x0002
+#define C1_DIGIT 0x0004
+#define C1_SPACE 0x0008
+#define C1_PUNCT 0x0010
+#define C1_CNTRL 0x0020
+#define C1_BLANK 0x0040
+#define C1_XDIGIT 0x0080
+#define C1_ALPHA 0x0100
+#define C1_DEFINED 0x0200
+
+#define LOCALE_NOUSEROVERRIDE 0x80000000
+#define LOCALE_SDECIMAL 0x0000000E
+#define LOCALE_STHOUSAND 0x0000000F
+#define LOCALE_IDEFAULTCODEPAGE 0x0000000B
+#define LOCALE_SSHORTDATE 0x0000001F
+#define LOCALE_SLONGDATE 0x00000020
+#define LOCALE_SISO639LANGNAME 0x00000059
+#define LOCALE_SISO3166CTRYNAME 0x0000005A
+#define LOCALE_SNAME 0x0000005C
+#define LOCALE_SENGLISHLANGUAGENAME 0x00001001
+#define LOCALE_SENGLISHCOUNTRYNAME 0x00001002
+#define LOCALE_STIMEFORMAT 0x00001003
+#define LOCALE_IDEFAULTANSICODEPAGE 0x00001004
+#define LOCALE_NAME_USER_DEFAULT NULL
+#define LOCALE_NAME_INVARIANT u""
+#define LOCALE_NAME_SYSTEM_DEFAULT u"!x-sys-default-locale"
+
+GTA6RT_BEGIN_C
+BOOL WINAPI GetCPInfo(UINT CodePage, LPCPINFO lpCPInfo);
+UINT WINAPI GetOEMCP(void);
+int WINAPI LCMapStringEx(LPCWSTR lpLocaleName, DWORD dwMapFlags, LPCWSTR lpSrcStr, int cchSrc, LPWSTR lpDestStr,
+                         int cchDest, LPNLSVERSIONINFO lpVersionInformation, LPVOID lpReserved, LPARAM sortHandle);
+BOOL WINAPI GetStringTypeW(DWORD dwInfoType, LPCWCH lpSrcStr, int cchSrc, LPWORD lpCharType);
+int WINAPI GetLocaleInfoEx(LPCWSTR lpLocaleName, LCTYPE LCType, LPWSTR lpLCData, int cchData);
+LCID WINAPI LocaleNameToLCID(LPCWSTR lpName, DWORD dwFlags);
+int WINAPI GetUserDefaultGeoName(LPWSTR geoName, int geoNameCount);
+GTA6RT_END_C

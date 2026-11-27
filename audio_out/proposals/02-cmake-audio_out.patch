@@ -1,0 +1,38 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -64,6 +64,7 @@
+ 
+ add_subdirectory(compat)
+ add_subdirectory(portable)
++add_subdirectory(audio_out)
+ 
+ # Metal backend (port/metal, its own worker). Not linked into the host yet; built so the tree keeps it compiling.
+ option(GTA6RT_WITH_METAL "Configure port/metal (tests off unless GTA6RT_METAL_TESTS)" ON)
+--- a/shims_gdk/CMakeLists.txt
++++ b/shims_gdk/CMakeLists.txt
+@@ -40,6 +40,10 @@
+ target_link_libraries(gta6rt_shims_gdk PRIVATE "-framework IOKit" "-framework CoreFoundation" "-framework Foundation"
+   "-framework AppKit" "-framework GameController" "-framework CoreHaptics")
+ set_source_files_properties(src/gameinput_gc.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
++if(TARGET gta6rt_audio_out)
++  target_link_libraries(gta6rt_shims_gdk PRIVATE gta6rt_audio_out)
++  target_compile_definitions(gta6rt_shims_gdk PRIVATE GTA6RT_HAVE_AUDIO_OUT=1)
++endif()
+ 
+ option(GTA6RT_GDK_TESTS "Build the shims_gdk tests" ON)
+ option(GTA6RT_GDK_TEST_WIN32_EMUL "Link the tests against tests/support/win32_emul.cpp instead of gta6rt_os Win32 surface" OFF)
+@@ -92,6 +96,14 @@
+     gdk_add_test(${_t}_test SOURCES tests/${_t}_test.cpp LIBS gta6rt_shims_gdk ${GDK_FORCE_LOAD})
+   endforeach()
+   gdk_add_test(gameinput_pad_test SOURCES tests/gameinput_pad_test.cpp INCLUDES src)
++  if(TARGET gta6rt_audio_out)
++    gdk_add_test(audio_out_spatial_test SOURCES tests/audio_out_spatial_test.cpp LIBS gta6rt_shims_gdk gta6rt_audio_out ${GDK_FORCE_LOAD})
++    add_test(NAME gdk_audio_out_spatial COMMAND audio_out_spatial_test)
++    set_tests_properties(gdk_audio_out_spatial PROPERTIES TIMEOUT 60)
++    gdk_add_test(xapu_opus_test SOURCES tests/xapu_opus_test.cpp LIBS gta6rt_shims_gdk gta6rt_audio_out ${GDK_FORCE_LOAD})
++    add_test(NAME gdk_xapu_opus COMMAND xapu_opus_test)
++    set_tests_properties(gdk_xapu_opus PROPERTIES TIMEOUT 60)
++  endif()
+   gdk_add_test(gameinput_probe SOURCES tests/gameinput_probe.cpp LIBS gta6rt_shims_gdk ${GDK_FORCE_LOAD})
+ 
+   set(_gdk_plain_tests api_ref_state api_global_refs context_pinning context_rundown context_reentrant

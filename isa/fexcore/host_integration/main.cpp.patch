@@ -1,0 +1,179 @@
+--- host/src/main.cpp
++++ host/src/main.cpp
+@@ -10,6 +10,7 @@
+ #include "shims.h"
+ #include "trace.h"
+ #include "mac_window.h"
++#include "register.h"
+ #include "window_shim.h"
+ 
+ #include <atomic>
+@@ -379,8 +380,57 @@
+     "RemoveVectoredExceptionHandler", "AddVectoredContinueHandler", "RemoveVectoredContinueHandler",
+     "SetUnhandledExceptionFilter", "UnhandledExceptionFilter",
+ };
++
++#if !defined(__x86_64__)
++// arm64: seh/ has no Win64-ABI exports (gta6rt_seh_native_export returns 0), so the ones the title calls before
++// WinMain are served here as frame handlers over seh/'s public API.
++void seh_pc_to_file_header(gta6rt_guest_frame* f, void*) {
++    const uint64_t base = gta6rt_seh_image_base_of(f->rcx);
++    if (f->rdx) std::memcpy(reinterpret_cast<void*>(f->rdx), &base, 8);
++    f->rax = base;
++}
++
++void seh_set_unhandled_filter(gta6rt_guest_frame* f, void*) { f->rax = gta6rt_seh_set_unhandled_filter(f->rcx); }
++
++void seh_lookup_function_entry(gta6rt_guest_frame* f, void*) {
++    uint64_t base = 0;
++    const gta6rt_runtime_function* fn = gta6rt_seh_lookup(f->rcx, &base);
++    if (f->rdx) std::memcpy(reinterpret_cast<void*>(f->rdx), &base, 8);
++    f->rax = reinterpret_cast<uint64_t>(fn);
++}
++
++unsigned register_seh_frame_exports() {
++    const struct {
++        const char* name;
++        gta6rt_frame_handler fn;
++    } rows[] = {{"RtlPcToFileHeader", &seh_pc_to_file_header},
++                {"SetUnhandledExceptionFilter", &seh_set_unhandled_filter},
++                {"RtlLookupFunctionEntry", &seh_lookup_function_entry}};
++    unsigned n = 0;
++    for (const auto& r : rows) {
++        rt::shims::Found f;
++        f.frame = r.fn;
++        rt::shims::register_entry("kernel32.dll", r.name, f);
++        rt::shims::register_entry("ntdll.dll", r.name, f);
++        ++n;
++    }
++    return n;
++}
+ 
++void d3d12_configure_virtual_memory(gta6rt_gva fn, gta6rt_guest_frame* f) {
++    f->rax = static_cast<uint64_t>(static_cast<int64_t>(reinterpret_cast<int32_t (*)(void*)>(fn)(reinterpret_cast<void*>(f->rcx))));
++}
++
++void d3d12_cvm_frame(gta6rt_guest_frame* f, void*) {
++    static void* fn = rt::d3d12_vulkan::find_export("d3d12_xs.dll", "D3D12ConfigureVirtualMemoryX");
++    d3d12_configure_virtual_memory(reinterpret_cast<gta6rt_gva>(fn), f);
++}
++#endif
++
+ unsigned register_seh_exports() {
++#if !defined(__x86_64__)
++    return register_seh_frame_exports();
++#endif
+     unsigned n = 0;
+     for (const char* name : kSehExports) {
+         const uint64_t a = gta6rt_seh_native_export(name);
+@@ -452,6 +502,26 @@
+ 
+ using GetProcAddressFn = GTA6RT_GUEST_ABI uint64_t (*)(uint64_t, const char*);
+ 
++#if !defined(__x86_64__)
++gta6rt_frame_handler g_get_proc_address_frame = nullptr;
++
++void host_get_proc_address_frame(gta6rt_guest_frame* f, void* user) {
++    g_get_proc_address_frame(f, user);
++    const uint64_t a = f->rax;
++    const auto* name = reinterpret_cast<const char*>(f->rdx);
++    const std::string nm = reinterpret_cast<uintptr_t>(name) < 0x10000 ? "#" + std::to_string(reinterpret_cast<uintptr_t>(name))
++                                                                        : std::string(name ? name : "(null)");
++    if (!a) {
++        char mod[64];
++        std::snprintf(mod, sizeof mod, "%#" PRIx64, f->rcx);
++        if (const gta6rt_module* m = gta6rt_module_find_by_base(f->rcx)) std::snprintf(mod, sizeof mod, "%s", gta6rt_module_info(m)->name);
++        host::trace::note_missing_proc(mod, nm.c_str());
++        return;
++    }
++    if (host::trace::enabled() && address_is_code(a)) f->rax = host::trace::wrap(a, ("GetProcAddress:" + nm).c_str(), false);
++}
++#endif
++
+ #if defined(__x86_64__)
+ GetProcAddressFn g_get_proc_address = nullptr;
+ 
+@@ -473,6 +543,15 @@
+ #endif
+ 
+ void hook_get_proc_address() {
++#if !defined(__x86_64__)
++    const rt::shims::Found found = rt::shims::find_entry("kernel32.dll", "GetProcAddress");
++    if (!found.frame) return;
++    g_get_proc_address_frame = found.frame;
++    rt::shims::Found f;
++    f.frame = &host_get_proc_address_frame;
++    rt::shims::register_entry("kernel32.dll", "GetProcAddress", f);
++    return;
++#endif
+     auto* orig = reinterpret_cast<GetProcAddressFn>(rt::shims::find("kernel32.dll", "GetProcAddress"));
+     if (!orig) return;
+ #if defined(__x86_64__)
+@@ -566,6 +645,17 @@
+ }
+ 
+ // ---- marker -------------------------------------------------------------------------------------------------
++
++#if !defined(__x86_64__)
++void marker_frame(gta6rt_guest_frame* f, void*) {
++    gta6rt_thread* t = gta6rt_thread_current();
++    std::fprintf(stderr, "=== REACHED MARKER: RVA %#x on thread %#x ===\n", g_args.marker_rva, t ? gta6rt_thread_id(t) : 0);
++    std::fprintf(stderr, "args: rcx=%#" PRIx64 " rdx=%#" PRIx64 " r8=%#" PRIx64 " r9=%#" PRIx64 "\n", f->rcx, f->rdx, f->r8, f->r9);
++    if (g_args.marker_rva == kWinMainRva && f->r8) std::fprintf(stderr, "WinMain lpCmdLine=\"%s\"\n", reinterpret_cast<const char*>(f->r8));
++    report_unimplemented_and_trace("marker reached");
++    _exit(0);
++}
++#endif
+ 
+ #if defined(__x86_64__)
+ GTA6RT_GUEST_ABI uint64_t marker_hit(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64_t r9) {
+@@ -590,7 +680,15 @@
+     std::memcpy(code + 2, &thunk, 8);
+     return gta6rt_loader_patch_rva(g_exe, g_args.marker_rva, code, sizeof code);
+ #else
+-    return GTA6RT_E_UNSUPPORTED;
++    gta6rt_thunk_desc d{};
++    d.kind = GTA6RT_THUNK_FRAME;
++    d.fn = reinterpret_cast<const void*>(&marker_frame);
++    d.debug_name = "host!marker";
++    gta6rt_gva thunk = 0;
++    if (gta6rt_status st = gta6rt_isa_make_thunk(&d, &thunk); st != GTA6RT_OK) return st;
++    uint8_t code[12] = {0x48, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xE0};
++    std::memcpy(code + 2, &thunk, 8);
++    return gta6rt_loader_patch_rva(g_exe, g_args.marker_rva, code, sizeof code);
+ #endif
+ }
+ 
+@@ -644,8 +742,16 @@
+         logf("shims_init: %s", gta6rt_status_name(st));
+         return 1;
+     }
+-    logf("shims_gdk_register=%s d3d12_vulkan_register=%s", gta6rt_status_name(gta6rt_shims_gdk_register()),
+-         gta6rt_status_name(gta6rt_d3d12_vulkan_register()));
++    const gta6rt_status gdk_st = gta6rt_shims_gdk_register(), d3d_st = gta6rt_d3d12_vulkan_register();
++    logf("shims_gdk_register=%s d3d12_vulkan_register=%s", gta6rt_status_name(gdk_st), gta6rt_status_name(d3d_st));
++#if !defined(__x86_64__)
++    if (d3d_st != GTA6RT_OK) {
++        rt::shims::Found f;
++        f.frame = &d3d12_cvm_frame;
++        rt::shims::register_entry("d3d12_xs.dll", "D3D12ConfigureVirtualMemoryX", f);
++        logf("arm64: d3d12_xs.dll!D3D12ConfigureVirtualMemoryX served by a host frame handler (d3d12_vulkan has no arm64 table)");
++    }
++#endif
+     logf("seh exports bound through the shim table: %u", register_seh_exports());
+     hook_get_proc_address();
+     host::window::set_hidden(g_args.hidden_window);
+@@ -728,8 +834,13 @@
+          bs.bound, bs.trapped, bs.data, bs.data_zero_storage, g_unimpl_bindings.load());
+     fix_new_images();
+ 
++#if defined(__x86_64__)
+     const uint32_t fix_flags = (advertised == GTA6RT_CPUID_DEFAULT ? (GTA6RT_ISA_FIXUP_ALL & ~GTA6RT_ISA_FIXUP_CPUID) : GTA6RT_ISA_FIXUP_ALL) |
+                                (g_args.no_zen_fixup ? 0u : GTA6RT_ISA_FIXUP_ZEN);
++#else
++    // FEX executes insertq, vpsllvq/vpsrlvq and cpuid itself (isa/fexcore/STATUS.md); MONITORX/MWAITX still need ZEN.
++    const uint32_t fix_flags = GTA6RT_ISA_FIXUP_CHKSTK | (g_args.no_zen_fixup ? 0u : GTA6RT_ISA_FIXUP_ZEN);
++#endif
+     gta6rt_isa_fixup_report rep{};
+     const gta6rt_status fst = gta6rt_isa_apply_image_fixups(g_exe_info.base, g_exe_info.size, fix_flags, &rep);
+     logf("exe fixups (%#x): %s known=%u chkstk=%u sse4a=%u vshift=%u cpuid=%u xgetbv=%u mismatched=%u vshift_safe=%u zen_nop=%u "

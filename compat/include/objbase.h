@@ -1,0 +1,52 @@
+#pragma once
+
+/* Minimal COM base: apartment/allocation entry points. Implemented by shims_core (com_shim). */
+
+#include <windows.h>
+#include <unknwnbase.h>
+
+typedef enum tagCOINIT {
+    COINIT_APARTMENTTHREADED = 0x2,
+    COINIT_MULTITHREADED = 0x0,
+    COINIT_DISABLE_OLE1DDE = 0x4,
+    COINIT_SPEED_OVER_MEMORY = 0x8
+} COINIT;
+
+typedef enum _APTTYPE {
+    APTTYPE_CURRENT = -1,
+    APTTYPE_STA = 0,
+    APTTYPE_MTA = 1,
+    APTTYPE_NA = 2,
+    APTTYPE_MAINSTA = 3
+} APTTYPE;
+
+typedef enum _APTTYPEQUALIFIER {
+    APTTYPEQUALIFIER_NONE = 0,
+    APTTYPEQUALIFIER_IMPLICIT_MTA = 1,
+    APTTYPEQUALIFIER_NA_ON_MTA = 2,
+    APTTYPEQUALIFIER_NA_ON_STA = 3,
+    APTTYPEQUALIFIER_NA_ON_IMPLICIT_MTA = 4,
+    APTTYPEQUALIFIER_NA_ON_MAINSTA = 5,
+    APTTYPEQUALIFIER_APPLICATION_STA = 6,
+    APTTYPEQUALIFIER_RESERVED_1 = 7
+} APTTYPEQUALIFIER;
+
+typedef enum tagCLSCTX {
+    CLSCTX_INPROC_SERVER = 0x1,
+    CLSCTX_INPROC_HANDLER = 0x2,
+    CLSCTX_LOCAL_SERVER = 0x4,
+    CLSCTX_REMOTE_SERVER = 0x10,
+    CLSCTX_ALL = 0x17
+} CLSCTX;
+#define CLSCTX_INPROC (CLSCTX_INPROC_SERVER | CLSCTX_INPROC_HANDLER)
+
+GTA6RT_BEGIN_C
+HRESULT WINAPI CoInitializeEx(LPVOID pvReserved, DWORD dwCoInit);
+void WINAPI CoUninitialize(void);
+HRESULT WINAPI CoGetApartmentType(APTTYPE* pAptType, APTTYPEQUALIFIER* pAptQualifier);
+HRESULT WINAPI CoCreateInstance(REFCLSID rclsid, LPUNKNOWN pUnkOuter, DWORD dwClsContext, REFIID riid, LPVOID* ppv);
+LPVOID WINAPI CoTaskMemAlloc(SIZE_T cb);
+void WINAPI CoTaskMemFree(LPVOID pv);
+HRESULT WINAPI CoCreateGuid(GUID* pguid);
+int WINAPI StringFromGUID2(REFGUID rguid, LPOLESTR lpsz, int cchMax);
+GTA6RT_END_C

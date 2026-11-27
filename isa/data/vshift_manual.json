@@ -1,0 +1,12 @@
+{
+ "about": "Manual review of the 7 sites vshift_analyze.py could not prove (verdict PATCH). Rule: a lane is mis-executed by Rosetta iff (c>>32)!=0 and (c&0xffffffff)<64. All 7 stay patched by default (the stub costs about 2.8 ns per execution); this file records whether the patch is actually needed. Result: all 7 are SAFE, so all 112 sites are provably safe and the patch is defence in depth only.",
+ "sites": [
+  {"rva": "0x930363", "manual": "SAFE", "proof": "ymm3 = vpmovsxbq {0,1,2,3} (rva 0x5f43800, read-only), += broadcast 16 (0x6159e28) per iteration; loop at 0x93035e runs exactly twice (r8 = 0, 0x10; exit at 0x20). Counts in [0,19]."},
+  {"rva": "0x93038d", "manual": "SAFE", "proof": "ymm12 = ymm3 + [rsp], [rsp] = broadcast 4 (0x5fc1608) stored at 0x930359 before the loop; the loop body has no stores. Counts in [4,23]."},
+  {"rva": "0x9303a6", "manual": "SAFE", "proof": "ymm13 = ymm3 + broadcast 8 (0x5fc6ff0). Counts in [8,27]."},
+  {"rva": "0x9303c3", "manual": "SAFE", "proof": "ymm14 = ymm3 + broadcast 12 (0x617e288). Counts in [12,31]."},
+  {"rva": "0x3265efb", "manual": "SAFE", "proof": "n = dword [rsi+0x10c] zero-extended into rdx (0x3265e6a), n >= 1 (je at 0x3265e73). rcx = ((n+3)>>2)<<4 = ceil(n/4)*16; rdx runs 0, 0x10, ... until rdx == rcx, so the loop 0x3265ecc..0x3265f0f runs ceil(n/4) times and its only entry besides the fall-through is the back edge at 0x3265f0f. ymm0 = vpmovsxbq of .rdata 0x5f43800 (00 01 02 03) = lanes {0,1,2,3}; ymm7 = broadcast of .rdata 0x5fc1608 (04 00 ..) = 4. The shift at 0x3265efb reads ymm0 before vpaddq ymm0, ymm0, ymm7 at 0x3265f00, so in iteration k the counts are 4k+{0..3} and the largest is 4*ceil(n/4)-1 <= 4*2^30-1 = 2^32-1 for every 32-bit n. High dword always 0. (An earlier version of this entry said NEEDS_PATCH from the loose bound n+2; that was wrong, found by the independent review.)"},
+  {"rva": "0x517511b", "manual": "SAFE", "proof": "count = vpshufb(xmm4, xmm7). At the loop head 0x5175085 xmm7 is always the constant at 0x61614e0 (00 01 02 03 80 80 80 80 0c 0d 0e 0f 80 80 80 80): loaded at 0x517505a, copied to xmm11 at 0x5175112 and back to xmm7 at 0x517522f before the back edge at 0x5175255. Bytes 4-7 and 12-15 of the control are 0x80, so the high dword of each count lane is 0."},
+  {"rva": "0x517512e", "manual": "SAFE", "proof": "count = vpshufb(xmm8, xmm7) at 0x51750f4, same control register and argument as 0x517511b."}
+ ]
+}

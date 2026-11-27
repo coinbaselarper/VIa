@@ -1,0 +1,514 @@
+diff -ruN a/CMakeLists.txt b/CMakeLists.txt
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -35,7 +35,8 @@
+   src/gdk_platform_darwin.cpp)
+ add_library(gta6rt_shims_gdk STATIC ${GDK_SHIM_SOURCES})
+ target_include_directories(gta6rt_shims_gdk PRIVATE shared support src ../portable/src)
+-target_link_libraries(gta6rt_shims_gdk PRIVATE gta6rt_portable gta6rt_dxheaders)
++find_package(ZLIB REQUIRED)
++target_link_libraries(gta6rt_shims_gdk PRIVATE gta6rt_portable gta6rt_dxheaders ZLIB::ZLIB)
+ target_link_libraries(gta6rt_shims_gdk PUBLIC gta6rt_interfaces gta6rt_xtaskqueue PRIVATE gta6rt_wincompat gta6rt_os)
+ target_link_libraries(gta6rt_shims_gdk PRIVATE "-framework IOKit" "-framework CoreFoundation" "-framework Foundation"
+   "-framework AppKit" "-framework GameController" "-framework CoreHaptics")
+diff -ruN a/src/dstorage.cpp b/src/dstorage.cpp
+--- a/src/dstorage.cpp
++++ b/src/dstorage.cpp
+@@ -18,6 +18,10 @@
+ #include <algorithm>
+ #include <atomic>
+ #include <chrono>
++#include <fcntl.h>
++#include <unistd.h>
++#include <zlib.h>
++#include <functional>
+ #include <filesystem>
+ #include <fstream>
+ #include <iterator>
+@@ -308,9 +312,55 @@
+ 
+ HANDLE open_title_file(const WCHAR* path);
+ 
++// Host file IO policy; the numbers behind it are in port/io_bench/STATUS.md. The environment overrides each field.
++struct IoPolicy {
++    bool nocache = true;
++    int rdahead = -1;
++    int advise = 0;
++    size_t depth = 32;
++    unsigned pool = 0;
++};
++
++long env_long(const char* name, long fallback) {
++    const std::string v = rt::gdk::env_or(name);
++    if (v.empty()) return fallback;
++    char* end = nullptr;
++    const long n = std::strtol(v.c_str(), &end, 10);
++    return end && !*end ? n : fallback;
++}
++
++const IoPolicy& io_policy() {
++    static const IoPolicy policy = [] {
++        IoPolicy p;
++        p.nocache = env_long("LEONIDA_DSTORAGE_NOCACHE", p.nocache) != 0;
++        p.rdahead = static_cast<int>(env_long("LEONIDA_DSTORAGE_RDAHEAD", p.rdahead));
++        p.advise = static_cast<int>(std::max(0l, env_long("LEONIDA_DSTORAGE_ADVISE", p.advise)));
++        p.depth = static_cast<size_t>(std::clamp(env_long("LEONIDA_DSTORAGE_DEPTH", static_cast<long>(p.depth)), 1l, 128l));
++        const long hw = static_cast<long>(std::thread::hardware_concurrency());
++        const long pool = env_long("LEONIDA_DSTORAGE_POOL", std::clamp(std::max(1l, hw) * 3 / 2, 8l, 32l));
++        p.pool = static_cast<unsigned>(std::clamp(pool, 0l, 64l));
++        const std::string workers = rt::gdk::env_or("LEONIDA_DSTORAGE_WORKERS");
++        if (workers == "0" || workers == "1") p.pool = 0;
++        return p;
++    }();
++    return policy;
++}
++
++// Needs the gta6rt.internal!FileNativeFd row from shims_core; without it the descriptor is -1 and reads take the old path.
++int native_fd_of(HANDLE h) {
++    using Fn = int(WINAPI*)(HANDLE);
++    static void* const fn = rt::shims::find("gta6rt.internal", "FileNativeFd");
++    return fn ? reinterpret_cast<Fn>(fn)(h) : -1;
++}
++
+ class File final : public IDStorageFileX {
+ public:
+-    File(HANDLE handle, std::u16string path) : handle_(handle), path_(std::move(path)) {
++    File(HANDLE handle, std::u16string path) : handle_(handle), path_(std::move(path)), fd_(native_fd_of(handle)) {
++        if (fd_ >= 0) {
++            const IoPolicy& p = io_policy();
++            if (p.nocache) fcntl(fd_, F_NOCACHE, 1);
++            if (p.rdahead >= 0) fcntl(fd_, F_RDAHEAD, p.rdahead);
++        }
+         {
+             std::lock_guard lock(live_mutex());
+             live_files().insert(static_cast<IDStorageFileX*>(this));
+@@ -388,6 +438,15 @@
+     HANDLE handle() const { return handle_; }
+     const std::u16string& path() const { return path_; }
+     std::atomic<ULONG>& refs() { return refs_; }
++    int native_fd() const { return fd_; }
++    std::atomic<uint64_t>& size_cache() { return size_; }
++    void advise(uint64_t offset, uint32_t bytes) const {
++        if (fd_ < 0 || !bytes) return;
++        radvisory ra;
++        ra.ra_offset = static_cast<off_t>(offset);
++        ra.ra_count = static_cast<int>((std::min<uint32_t>)(bytes, 0x7fffffffu));
++        fcntl(fd_, F_RDADVISE, &ra);
++    }
+ 
+ private:
+     std::atomic<ULONG> refs_{1};
+@@ -395,6 +454,8 @@
+     std::condition_variable idle_;
+     HANDLE handle_;
+     const std::u16string path_;
++    const int fd_;
++    std::atomic<uint64_t> size_{0};
+     uint32_t pending_ = 0;
+     bool closed_ = false;
+ };
+@@ -556,15 +617,32 @@
+     return got;
+ }
+ 
++// pread on the native descriptor when there is one, else through the kernel32 rows.
++int64_t pread_file(File& file, uint64_t offset, void* buffer, size_t bytes, DWORD& error) {
++    const int fd = file.native_fd();
++    if (fd < 0) return pread_at(file.handle(), offset, buffer, bytes, error);
++    bytes = (std::min<size_t>)(bytes, size_t{1} << 30);
++    for (;;) {
++        const ssize_t n = ::pread(fd, buffer, bytes, static_cast<off_t>(offset));
++        if (n >= 0) return n;
++        if (errno == EINTR) continue;
++        error = errno == EFAULT ? ERROR_NOACCESS : ERROR_READ_FAULT;
++        return -1;
++    }
++}
++
+ // Reads exactly "size" bytes at "offset" of the file into "destination". A Title destination is title memory, which a
+ // kernel write cannot fault in (xmem pages that wait for their first touch): a failed read is retried once after
+ // rt::xmem::commit_physical_range. When the D3D12 layer registered a write hook, the bytes go through a private
+ // chunk and that hook, so pages it keeps read-only are opened and pinned first.
+ enum class ReadTarget { Title, Staging };
+-HRESULT read_file_range(HANDLE handle, uint64_t offset, void* destination, uint32_t size, ReadTarget target) {
+-    uint64_t file_size = 0;
++HRESULT read_file_range(File& file, uint64_t offset, void* destination, uint32_t size, ReadTarget target) {
++    uint64_t file_size = file.size_cache().load(std::memory_order_relaxed);
+     DWORD error = 0;
+-    if (!file_size_of(handle, file_size, error)) return HRESULT_FROM_WIN32(error);
++    if (offset > file_size || size > file_size - offset) {
++        if (!file_size_of(file.handle(), file_size, error)) return HRESULT_FROM_WIN32(error);
++        file.size_cache().store(file_size, std::memory_order_relaxed);
++    }
+     if (offset > file_size || size > file_size - offset) return E_DSTORAGE_END_OF_FILE;
+     auto* out = static_cast<uint8_t*>(destination);
+     const bool bounce = target == ReadTarget::Title && rt::gdk::title_write_hook_installed();
+@@ -573,10 +651,10 @@
+     while (done < size) {
+         const size_t want = bounce ? (std::min<size_t>)(chunk.size(), size - done) : size - done;
+         void* into = bounce ? static_cast<void*>(chunk.data()) : out + done;
+-        int64_t got = pread_at(handle, offset + done, into, want, error);
++        int64_t got = pread_file(file, offset + done, into, want, error);
+         if (got < 0 && error == ERROR_NOACCESS && target == ReadTarget::Title) {
+             rt::gdk::title_commit(out + done, size - done);
+-            got = pread_at(handle, offset + done, into, want, error);
++            got = pread_file(file, offset + done, into, want, error);
+         }
+         if (got < 0) return read_error(error);
+         if (got == 0) return E_DSTORAGE_END_OF_FILE;  // the file shrank since the size check
+@@ -609,6 +687,7 @@
+     bool file_counted = false;     // the file's pending count was raised at submit
+     bool cancelled = false;        // CancelRequestsWithTag matched it before it started
+     bool counted = false;          // a request the title passed: counted in the statistics when it is submitted
++    bool advised = false;          // F_RDADVISE issued for its range
+     HRESULT enqueue_error = S_OK;  // found at enqueue: reported when the entry is reached, in order
+     StatusArray* status = nullptr;  // a reference
+     IDStorageStatusArrayX* status_as_given = nullptr;
+@@ -618,60 +697,47 @@
+     HANDLE event = nullptr;  // a duplicate the entry owns
+ };
+ 
+-// Runs one callback per submit on a thread of its own, one at a time; wait() returns when every submitted run is done.
+-class PrepareHelper {
++// Shared by every queue: the read and decode half of a request. Publishing and notifying stay on the queue thread.
++class PreparePool {
+ public:
+-    PrepareHelper() = default;
+-    PrepareHelper(const PrepareHelper&) = delete;
+-    PrepareHelper& operator=(const PrepareHelper&) = delete;
+-    ~PrepareHelper() { stop(); }
+-
+-    bool start(void (*fn)(void*), void* context) {
+-        fn_ = fn;
+-        context_ = context;
+-        return rt::gdk::Thread::start(thread_, [this] { loop(); }, "dstorage prepare");
++    static PreparePool& get() {
++        static auto* pool = new PreparePool;
++        return *pool;
+     }
+-    bool started() const { return thread_.joinable(); }
+-    void submit() {
+-        std::lock_guard lock(mutex_);
+-        ++submitted_;
+-        work_.notify_one();
+-    }
+-    void wait() {
+-        std::unique_lock lock(mutex_);
+-        done_.wait(lock, [&] { return completed_ == submitted_; });
+-    }
+-    void stop() {
+-        if (!thread_.joinable()) return;
++    bool usable() const { return started_ > 0; }
++    void post(std::function<void()> job) {
+         {
+             std::lock_guard lock(mutex_);
+-            stopping_ = true;
++            jobs_.push_back(std::move(job));
+         }
+-        work_.notify_one();
+-        thread_.join();
++        ready_.notify_one();
+     }
+ 
+ private:
++    PreparePool() {
++        for (unsigned i = 0; i < io_policy().pool; ++i) {
++            rt::gdk::Thread t;
++            if (!rt::gdk::Thread::start(t, [this] { loop(); }, "dstorage prepare")) break;
++            t.detach();
++            ++started_;
++        }
++    }
+     void loop() {
+         std::unique_lock lock(mutex_);
+         for (;;) {
+-            work_.wait(lock, [&] { return stopping_ || completed_ != submitted_; });
+-            if (completed_ == submitted_) return;
++            ready_.wait(lock, [&] { return !jobs_.empty(); });
++            auto job = std::move(jobs_.front());
++            jobs_.pop_front();
+             lock.unlock();
+-            fn_(context_);
++            job();
+             lock.lock();
+-            ++completed_;
+-            done_.notify_all();
+         }
+     }
+ 
+-    void (*fn_)(void*) = nullptr;
+-    void* context_ = nullptr;
+     std::mutex mutex_;
+-    std::condition_variable work_, done_;
+-    uint64_t submitted_ = 0, completed_ = 0;
+-    bool stopping_ = false;
+-    rt::gdk::Thread thread_;
++    std::condition_variable ready_;
++    std::deque<std::function<void()>> jobs_;
++    unsigned started_ = 0;
+ };
+ 
+ class Queue final : public IDStorageQueueX2 {
+@@ -689,13 +755,11 @@
+     // Separate from the constructor so a failure to start the thread can be reported.
+     bool start() {
+         if (!error_event_) return false;
+-        const std::string workers = rt::gdk::env_or("LEONIDA_DSTORAGE_WORKERS");
+-        if (!(workers == "1" || workers == "0")) helper_.start(&prepare_in_background, this);
++        pool_ = io_policy().pool && PreparePool::get().usable();
+         return rt::gdk::Thread::start(worker_, [this] { run(); }, "dstorage queue");
+     }
+     ~Queue() {
+         Close();
+-        helper_.stop();
+         if (error_event_) CloseHandle(error_event_);
+         std::lock_guard lock(stats().mutex);
+         --priority_stats(stats().s, desc_.Priority).CurrentQueueCount;
+@@ -800,6 +864,8 @@
+         std::lock_guard lock(mutex_);
+         for (Entry& e : entries_)
+             if (e.type == Entry::Type::Request && (e.request.CancellationTag & mask) == value) e.cancelled = true;
++        for (auto& s : window_)
++            if (!s->started && s->entry.type == Entry::Type::Request && (s->entry.request.CancellationTag & mask) == value) s->entry.cancelled = true;
+     }
+ 
+     // Submits what is enqueued, waits until the worker has run all of it and stops the worker. Later enqueues are
+@@ -924,64 +990,109 @@
+         HRESULT result = S_OK;
+         std::vector<uint8_t> bytes;
+     };
+-    // Each queue publishes in order. Only an adjacent pair of file transforms can
+-    // overlap. Memory inputs, direct reads, page resolution and notifications remain barriers.
++    // The next requests of a queue are read and decoded ahead on the shared pool and published in order.
++    struct Slot {
++        explicit Slot(Entry&& e) : entry(std::move(e)), prepared{entry, S_OK, {}}, lease(leonida::dstorage::staging_pool()) {}
++        Entry entry;
++        Prepared prepared;
++        leonida::dstorage::StagingPool::Lease lease;
++        bool scheduled = false;
++        bool started = false;  // under the queue mutex; a cancel after this no longer applies
++        std::mutex mutex;
++        std::condition_variable done_cv;
++        bool done = false;
++    };
++
++    static bool transforms(const Entry& e) {
++        const auto o = e.request.Options.AsUINT64;
++        return options::zlib(o) || options::bcpack(o) || options::swizzle(o);
++    }
++    // Bytes a prefetched request holds: its transform buffers, or just the source for a raw read.
++    static uint64_t prefetch_bytes(const Entry& e) {
++        const uint64_t bytes = leonida::dstorage::staging_bytes(e.request);
++        return bytes ? bytes : e.request.SourceSize;
++    }
++    static bool needs_staging(const Entry& e) {
++        if (e.type != Entry::Type::Request || e.cancelled || FAILED(e.enqueue_error)) return false;
++        return e.file || transforms(e) || (e.request.Options.AsUINT64 & (options::kDestinationPages | options::kSourcePages));
++    }
+     static bool can_prepare(const Entry& e) {
+-        const auto& r = e.request;
+-        const auto o = r.Options.AsUINT64;
+-        constexpr uint64_t budget = 16ull << 20;
+         return e.type == Entry::Type::Request && !e.cancelled && SUCCEEDED(e.enqueue_error) && e.file &&
+-               (options::zlib(o) || options::bcpack(o) || options::swizzle(o)) &&
+-               leonida::dstorage::staging_bytes(r) <= budget;
++               prefetch_bytes(e) <= leonida::dstorage::StagingPool::limit / 4;
+     }
+ 
+-    static void prepare_in_background(void* context) {
+-        auto& q = *static_cast<Queue*>(context);
+-        q.set_pending(+1);
+-        auto& job = *q.helper_job_;
+-        job.result = q.validate_request(job.entry);
+-        if (SUCCEEDED(job.result)) job.result = q.prepare(job.entry, job.bytes);
+-        else job.entry.reason = "request-validation";
++    void prepare_in_background(Slot* s) {
++        set_pending(+1);
++        s->prepared.result = validate_request(s->entry);
++        if (SUCCEEDED(s->prepared.result)) s->prepared.result = prepare(s->entry, s->prepared.bytes);
++        else s->entry.reason = "request-validation";
++        std::lock_guard lock(s->mutex);  // the worker may destroy the slot once it wakes
++        s->done = true;
++        s->done_cv.notify_one();
+     }
+ 
++    // Under mutex_. A slot takes staging only after every older slot holds its own or needs none; that keeps the window deadlock-free.
++    void schedule_window_locked() {
++        for (auto& s : window_) {
++            if (s->scheduled || s->started) continue;
++            if (!can_prepare(s->entry)) {
++                if (needs_staging(s->entry)) break;
++                continue;
++            }
++            if (!s->lease.try_take(prefetch_bytes(s->entry))) break;
++            s->scheduled = true;
++            Slot* raw = s.get();
++            PreparePool::get().post([this, raw] { prepare_in_background(raw); });
++        }
++    }
++
++    void advise_locked() {
++        const size_t reach = io_policy().advise;
++        if (!reach) return;
++        size_t seen = 0;
++        auto visit = [&](Entry& e) {
++            if (seen >= reach) return;
++            if (e.type != Entry::Type::Request) return;
++            ++seen;
++            if (e.advised || !e.file || e.cancelled) return;
++            e.advised = true;
++            e.file->advise(e.request.FileOffset, e.request.SourceSize);
++        };
++        for (auto& s : window_) visit(s->entry);
++        for (size_t i = 0; i < submitted_ && seen < reach; ++i) visit(entries_[i]);
++    }
++
+     void run() {
++        const size_t depth = pool_ ? io_policy().depth : 1;
+         for (;;) {
+-            Entry head, next;
+-            leonida::dstorage::StagingPool::Lease reservation(leonida::dstorage::staging_pool());
+-            Prepared prepared{next, S_OK, {}};
+-            bool paired = false;
++            Slot* front = nullptr;
+             {
+                 std::unique_lock lock(mutex_);
+-                work_.wait(lock, [&] { return submitted_ > 0 || closed_; });
+-                if (submitted_ == 0) return;
+-                head = std::move(entries_.front());
+-                entries_.pop_front();
+-                --submitted_;
+-                paired = helper_.started() && submitted_ && can_prepare(head) && can_prepare(entries_.front()) &&
+-                         reservation.try_pair(leonida::dstorage::staging_bytes(head.request) +
+-                                              leonida::dstorage::staging_bytes(entries_.front().request));
+-                if (paired) {
+-                    next = std::move(entries_.front());
++                work_.wait(lock, [&] { return submitted_ > 0 || !window_.empty() || closed_; });
++                if (submitted_ == 0 && window_.empty()) return;
++                while (submitted_ > 0 && window_.size() < depth) {
++                    window_.push_back(std::make_unique<Slot>(std::move(entries_.front())));
+                     entries_.pop_front();
+                     --submitted_;
+-                    helper_job_ = &prepared;
+-                    helper_.submit();
+                 }
+-                in_flight_ = paired ? 2 : 1;
++                in_flight_ = window_.size();
++                advise_locked();
++                if (pool_) schedule_window_locked();
++                front = window_.front().get();
++                front->started = true;
+             }
+-            process(head, nullptr, paired);
+-            release_references(head);
+-            if (paired) {
+-                helper_.wait();
+-                process(next, &prepared);
+-                release_references(next);
+-                helper_job_ = nullptr;
++            if (front->scheduled) {
++                std::unique_lock lock(front->mutex);
++                front->done_cv.wait(lock, [&] { return front->done; });
+             }
++            process(front->entry, front->scheduled ? &front->prepared : nullptr);
++            release_references(front->entry);
+             {
+                 std::lock_guard lock(mutex_);
+-                in_flight_ = 0;
++                window_.pop_front();
++                in_flight_ = window_.size();
+                 space_.notify_all();
+-                if (entries_.empty()) idle_.notify_all();
++                if (entries_.empty() && window_.empty()) idle_.notify_all();
+             }
+         }
+     }
+@@ -998,6 +1109,7 @@
+                 // A cancelled request is a success whatever else is wrong with it (the GDK: not counted as a failure).
+                 if (e.cancelled) {
+                     hr = S_OK;
++                    if (prepared) set_pending(-1);
+                 } else if (SUCCEEDED(hr)) {
+                     // Pending: processing has started and not completed (DSTORAGE_PRIORITY_STATS).
+                     if (prepared) {
+@@ -1156,7 +1268,7 @@
+             return E_DSTORAGE_ACCESS_VIOLATION;
+         }
+         const auto begin = Timing::start();
+-        const auto hr = read_file_range(e.file->handle(), r.FileOffset, destination, r.SourceSize, ReadTarget::Title);
++        const auto hr = read_file_range(*e.file, r.FileOffset, destination, r.SourceSize, ReadTarget::Title);
+         e.timing.read = Timing::elapsed(begin);
+         if (FAILED(hr)) e.reason = "file-read";
+         return written(r, hr);
+@@ -1186,7 +1298,25 @@
+         return HRESULT_FROM_WIN32(GetLastError());
+     }
+ 
++    // Only a clean result is taken from the system zlib; a failure repeats on the leonida path, which owns the typed errors.
++    static bool system_inflate(const std::vector<uint8_t>& src, std::vector<uint8_t>& out, size_t size) {
++        if (!size || size > kMaxRequestBytes || src.size() > 0xffffffffull) return false;
++        out.resize(size);
++        z_stream zs{};
++        if (inflateInit(&zs) != Z_OK) return false;
++        zs.next_in = const_cast<Bytef*>(src.data());
++        zs.avail_in = static_cast<uInt>(src.size());
++        zs.next_out = out.data();
++        zs.avail_out = static_cast<uInt>(size);
++        const int rc = ::inflate(&zs, Z_FINISH);
++        const bool ok = rc == Z_STREAM_END && zs.total_out == size;
++        inflateEnd(&zs);
++        return ok;
++    }
++
+     static HRESULT inflate(const std::vector<uint8_t>& src, std::vector<uint8_t>& out, size_t size) {
++        static const bool system = env_long("LEONIDA_DSTORAGE_SYSTEM_ZLIB", 1) != 0;
++        if (system && system_inflate(src, out, size)) return S_OK;
+         leonida::ZlibError why{};
+         static const bool bulk = [] {
+             return rt::gdk::env_or("LEONIDA_DSTORAGE_FAST_INFLATE") != "0";
+@@ -1253,7 +1383,7 @@
+         data.resize(r.SourceSize);
+         HRESULT hr = S_OK;
+         const auto read_begin = Timing::start();
+-        if (!memory) hr = read_file_range(e.file->handle(), r.FileOffset, data.data(), r.SourceSize, ReadTarget::Staging);
++        if (!memory) hr = read_file_range(*e.file, r.FileOffset, data.data(), r.SourceSize, ReadTarget::Staging);
+         else if (o & options::kSourcePages) hr = page_transfer(r.SourcePageArray, r.SourcePageOffset, data, false);
+         else if (!data.empty() && !guarded_move(data.data(), r.Source, data.size())) hr = E_DSTORAGE_ACCESS_VIOLATION;
+         e.timing.read = Timing::elapsed(read_begin);
+@@ -1405,8 +1535,8 @@
+     bool closing_ = false;
+     bool closed_ = false;
+     rt::gdk::Thread worker_;
+-    PrepareHelper helper_;
+-    Prepared* helper_job_ = nullptr; // Lives on the publisher stack through the callback and ordered write.
++    std::deque<std::unique_ptr<Slot>> window_;  // under mutex_; the worker pops the front
++    bool pool_ = false;
+     HRESULT since_notify_ = S_OK;  // worker only
+     std::mutex error_mutex_;
+     DSTORAGE_ERROR_RECORD record_{};
+diff -ruN a/src/dstorage_staging.h b/src/dstorage_staging.h
+--- a/src/dstorage_staging.h
++++ b/src/dstorage_staging.h
+@@ -34,7 +34,7 @@
+ 
+ class StagingPool {
+ public:
+-    static constexpr uint64_t limit = 64ull << 20;
++    static constexpr uint64_t limit = 256ull << 20;
+     // Requests above the shared window run alone. The validated ABI sizes bound
+     // one transform to two 1 GiB buffers. No payload is allocated by the pool itself.
+     class Lease {
+@@ -49,6 +49,13 @@
+                 bytes > limit || pool_.used_ > limit - bytes) return false;
+             ++pool_.helpers_;
+             pair_ = true;
++            take(bytes);
++            return true;
++        }
++        // Never waits; fails while another acquire is queued.
++        bool try_take(uint64_t bytes) {
++            std::lock_guard lock(pool_.mutex_);
++            if (pool_.next_ != pool_.serving_ || bytes > limit || pool_.used_ > limit - bytes) return false;
+             take(bytes);
+             return true;
+         }

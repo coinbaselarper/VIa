@@ -1,0 +1,46 @@
+cmake_minimum_required(VERSION 3.24)
+
+if(NOT DEFINED PROJECT_NAME)
+  project(gta6rt_hud LANGUAGES C CXX)
+  set(GTA6RT_HUD_STANDALONE ON)
+else()
+  set(GTA6RT_HUD_STANDALONE OFF)
+endif()
+enable_language(OBJCXX)
+
+option(GTA6RT_HUD_BUILD_TESTS "Build the HUD unit test, test app and title benchmark" ${GTA6RT_HUD_STANDALONE})
+
+if(GTA6RT_HUD_STANDALONE)
+  if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE RelWithDebInfo)
+  endif()
+  set(CMAKE_CXX_STANDARD 20)
+  set(CMAKE_CXX_STANDARD_REQUIRED ON)
+  set(CMAKE_OBJCXX_STANDARD 20)
+  set(CMAKE_OBJCXX_STANDARD_REQUIRED ON)
+endif()
+
+add_library(gta6rt_hud STATIC src/hud.mm src/hud_model.cpp)
+target_include_directories(gta6rt_hud PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
+target_include_directories(gta6rt_hud PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+target_compile_features(gta6rt_hud PUBLIC cxx_std_20)
+set_source_files_properties(src/hud.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+target_link_libraries(gta6rt_hud PUBLIC "-framework AppKit" "-framework QuartzCore" "-framework Foundation")
+
+add_library(gta6rt_hud_headers INTERFACE)
+target_include_directories(gta6rt_hud_headers INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+
+if(GTA6RT_HUD_BUILD_TESTS)
+  add_executable(hud_unit_test tests/hud_unit_test.cpp tests/hud_c_part.c)
+  target_link_libraries(hud_unit_test PRIVATE gta6rt_hud)
+  target_include_directories(hud_unit_test PRIVATE src)
+
+  add_executable(hud_test_app tests/hud_test_app.mm)
+  set_source_files_properties(tests/hud_test_app.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+  target_include_directories(hud_test_app PRIVATE src)
+  target_link_libraries(hud_test_app PRIVATE gta6rt_hud "-framework Metal" "-framework ImageIO" "-framework CoreGraphics" "-framework ApplicationServices")
+
+  add_executable(hud_title_bench tests/hud_title_bench.mm)
+  set_source_files_properties(tests/hud_title_bench.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+  target_link_libraries(hud_title_bench PRIVATE gta6rt_hud)
+endif()

@@ -1,0 +1,35 @@
+#pragma once
+
+/* Registry types and constants. The dir-backed registry itself is shims_core/ (registry, console_registry). */
+
+#include <minwinbase.h>
+
+typedef LONG LSTATUS;
+typedef ACCESS_MASK REGSAM;
+
+#define HKEY_CLASSES_ROOT ((HKEY)(ULONG_PTR)((LONG)0x80000000))
+#define HKEY_CURRENT_USER ((HKEY)(ULONG_PTR)((LONG)0x80000001))
+#define HKEY_LOCAL_MACHINE ((HKEY)(ULONG_PTR)((LONG)0x80000002))
+#define HKEY_USERS ((HKEY)(ULONG_PTR)((LONG)0x80000003))
+
+#define REG_NONE 0
+#define REG_SZ 1
+#define REG_EXPAND_SZ 2
+#define REG_BINARY 3
+#define REG_DWORD 4
+#define REG_MULTI_SZ 7
+#define REG_QWORD 11
+#define KEY_QUERY_VALUE 0x0001
+#define KEY_SET_VALUE 0x0002
+#define KEY_CREATE_SUB_KEY 0x0004
+#define KEY_ENUMERATE_SUB_KEYS 0x0008
+#define KEY_NOTIFY 0x0010
+#define KEY_WOW64_64KEY 0x0100
+#define KEY_READ ((STANDARD_RIGHTS_READ | KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS | KEY_NOTIFY) & (~SYNCHRONIZE))
+#define KEY_WRITE ((STANDARD_RIGHTS_WRITE | KEY_SET_VALUE | KEY_CREATE_SUB_KEY) & (~SYNCHRONIZE))
+#define KEY_ALL_ACCESS 0xF003F
+#define RRF_RT_REG_SZ 0x00000002
+#define RRF_RT_REG_DWORD 0x00000010
+#define RRF_RT_REG_QWORD 0x00000040
+#define RRF_RT_ANY 0x0000ffff
+#define REG_OPTION_NON_VOLATILE 0x00000000

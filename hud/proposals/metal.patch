@@ -1,0 +1,199 @@
+diff -uN -r a/port/metal/CMakeLists.txt b/port/metal/CMakeLists.txt
+--- a/port/metal/CMakeLists.txt	2026-11-26 14:36:39
++++ b/port/metal/CMakeLists.txt	2026-11-26 14:36:39
+@@ -43,6 +43,7 @@
+ add_library(gta6rt_metal STATIC ${_metal_mm} src/rect_list.cpp src/msl_rewrite.cpp)
+ set_source_files_properties(${_metal_mm} PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+ target_include_directories(gta6rt_metal PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
++target_include_directories(gta6rt_metal PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../hud/include")
+ target_compile_features(gta6rt_metal PUBLIC cxx_std_20)
+ target_compile_options(gta6rt_metal PRIVATE -Wall -Wextra -Wno-unused-parameter)
+ target_link_libraries(gta6rt_metal PUBLIC
+diff -uN -r a/port/metal/src/mtl_device.mm b/port/metal/src/mtl_device.mm
+--- a/port/metal/src/mtl_device.mm	2026-11-26 14:36:39
++++ b/port/metal/src/mtl_device.mm	2026-11-26 14:36:39
+@@ -1,5 +1,7 @@
+ #include "mtl_internal.h"
+ 
++#include <gta6rt_hud/stats.h>
++
+ #import <AppKit/AppKit.h>
+ 
+ #include <chrono>
+@@ -266,6 +268,7 @@
+     caps_.counters_stage_boundary = [device_ supportsCounterSampling:MTLCounterSamplingPointAtStageBoundary];
+     caps_.counters_draw_boundary = [device_ supportsCounterSampling:MTLCounterSamplingPointAtDrawBoundary];
+     caps_.counters_dispatch_boundary = [device_ supportsCounterSampling:MTLCounterSamplingPointAtDispatchBoundary];
++    gta6rt_hud_set_driver(device_.name.UTF8String ? device_.name.UTF8String : "Metal");
+     caps_.host_page_size = std::uint64_t(getpagesize());
+     caps_.linear_texture_alignment = std::uint32_t([device_ minimumLinearTextureAlignmentForPixelFormat:MTLPixelFormatR32Float]);
+     if (NSScreen* screen = NSScreen.mainScreen) caps_.display_refresh_hz = double(screen.maximumFramesPerSecond);
+diff -uN -r a/port/metal/src/mtl_internal.h b/port/metal/src/mtl_internal.h
+--- a/port/metal/src/mtl_internal.h	2026-11-26 14:36:39
++++ b/port/metal/src/mtl_internal.h	2026-11-26 14:36:51
+@@ -703,6 +703,7 @@
+ private:
+     void run();
+     void erase_locked(PipelineCore* p);
++    void publish_pending_locked() const;
+     std::uint32_t threads_n_ = 3;
+     mutable std::mutex mutex_;
+     std::condition_variable cv_, done_cv_;
+diff -uN -r a/port/metal/src/mtl_pipeline.mm b/port/metal/src/mtl_pipeline.mm
+--- a/port/metal/src/mtl_pipeline.mm	2026-11-26 14:36:39
++++ b/port/metal/src/mtl_pipeline.mm	2026-11-26 14:36:46
+@@ -7,6 +7,8 @@
+ #include <set>
+ #include <sstream>
+ 
++#include <gta6rt_hud/stats.h>
++
+ namespace gta6rt::gpu {
+ 
+ const char* limit_kind_name(PipelineLimit::Kind k) {
+@@ -463,6 +465,10 @@
+     for (auto& t : threads_) t.join();
+ }
+ 
++void CompileQueue::publish_pending_locked() const {
++    gta6rt_hud_set_pipelines_pending(queues_[0].size() + queues_[1].size() + queues_[2].size() + running_.size());
++}
++
+ void CompileQueue::erase_locked(PipelineCore* p) {
+     for (auto& q : queues_) {
+         auto it = std::find(q.begin(), q.end(), p);
+@@ -472,6 +478,7 @@
+         }
+     }
+     p->queued = false;
++    publish_pending_locked();
+ }
+ 
+ void CompileQueue::enqueue(PipelineCore* p, Priority priority) {
+@@ -493,6 +500,7 @@
+             queues_[pr].push_back(p);
+             p->queued = true;
+         }
++        publish_pending_locked();
+         while (threads_.size() < threads_n_) threads_.emplace_back([this] { run(); });
+     }
+     cv_.notify_one();
+@@ -530,10 +538,12 @@
+         p->queued = false;
+         if (!p->claim()) continue;
+         running_.insert(p);
++        publish_pending_locked();
+         lock.unlock();
+         p->run_build();
+         lock.lock();
+         running_.erase(p);
++        publish_pending_locked();
+         completed_[pr]++;
+         done_cv_.notify_all();
+     }
+diff -uN -r a/port/metal/src/mtl_present.mm b/port/metal/src/mtl_present.mm
+--- a/port/metal/src/mtl_present.mm	2026-11-26 14:36:39
++++ b/port/metal/src/mtl_present.mm	2026-11-26 14:36:46
+@@ -5,6 +5,8 @@
+ 
+ #include <chrono>
+ 
++#include <gta6rt_hud/stats.h>
++
+ namespace gta6rt::metal {
+ 
+ // Frame events (console WaitFrameEventX): a display link on a thread of its own, or a timer at the display rate
+@@ -217,7 +219,10 @@
+         }
+         std::weak_ptr<std::atomic<bool>> alive = alive_;
+         MetalSwapchain* self = this;
++        const double hud_present_at = CACurrentMediaTime();
+         [drawable addPresentedHandler:^(id<MTLDrawable> d) {
++          if (d.presentedTime > hud_present_at && gta6rt_hud_active())
++              gta6rt_hud_note_display_latency_ns(std::uint64_t((d.presentedTime - hud_present_at) * 1e9));
+           auto a = alive.lock();
+           if (a && a->load()) self->on_presented(d.presentedTime);
+         }];
+@@ -237,6 +242,11 @@
+             presented_++;
+         }
+         device_->counters().presents++;
++        gta6rt_hud_note_present();
++        if (gta6rt_hud_active()) {
++            AtomicStats& counters = device_->counters();
++            gta6rt_hud_publish_pipelines(counters.pipelines_compiled.load(), counters.archive_hits.load(), 0);
++        }
+         device_->counters().present_planes += desc.plane_count;
+     }
+     return Status::ok;
+diff -uN -r a/port/metal/src/mtl_queue.mm b/port/metal/src/mtl_queue.mm
+--- a/port/metal/src/mtl_queue.mm	2026-11-26 14:36:39
++++ b/port/metal/src/mtl_queue.mm	2026-11-26 14:36:39
+@@ -4,6 +4,8 @@
+ #include <cstring>
+ #include <unordered_set>
+ 
++#include <gta6rt_hud/stats.h>
++
+ namespace gta6rt::metal {
+ 
+ // ---- fences ----
+@@ -187,6 +189,10 @@
+     std::lock_guard lock(mutex_);
+     const std::uint64_t serial = ++serial_;
+     [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
++      if (gta6rt_hud_active()) {
++          const double gpu = done.GPUEndTime - done.GPUStartTime;
++          if (gpu > 0) gta6rt_hud_note_gpu_ns(std::uint64_t(gpu * 1e9));
++      }
+       const bool failed = done.status == MTLCommandBufferStatusError;
+       if (failed) {
+           NSError* e = done.error;
+@@ -1261,6 +1267,7 @@
+ }
+ 
+ void Encoder::draw(const CmdDraw& d) {
++    gta6rt_hud_add_draws(1);
+     const DrawState& s = *d.state;
+     MetalRenderPipeline* p = s.pipeline;
+     const bool quads = s.topology == topology::quad_list;
+@@ -1517,6 +1524,7 @@
+         [compute_ dispatchThreadgroups:MTLSizeMake(c.x, c.y, c.z) threadsPerThreadgroup:p->group_size()];
+     }
+     d_->counters().dispatches++;
++    gta6rt_hud_add_dispatches(1);
+ }
+ 
+ bool Encoder::bind_mesh(const DrawState& s, MetalMeshPipeline* p) {
+@@ -1607,6 +1615,7 @@
+                                        threadsPerThreadgroup:p->group_size()];
+         d_->counters().indirect_commands += d.max_count;
+         d_->counters().dispatches += d.max_count;
++        gta6rt_hud_add_dispatches(d.max_count);
+         return;
+     }
+     const Cmd* self = &(*cmds_)[pos_];
+@@ -1704,6 +1713,7 @@
+             [render_ drawPrimitives:type indirectBuffer:src indirectBufferOffset:base + i * stride];
+     }
+     d_->counters().indirect_commands += d.max_count;
++    gta6rt_hud_add_draws(d.max_count);
+ }
+ 
+ void Encoder::query(const CmdQuery& c) {
+@@ -1807,10 +1817,14 @@
+ Status MetalQueue::execute(std::span<gpu::CommandList* const> lists) {
+     if (lists.empty()) return Status::ok;
+     std::lock_guard submit(submit_mutex_);
++    const std::uint64_t hud_start = gta6rt_hud_active() ? gta6rt_hud_now_ns() : 0;
++    Status result;
+     @autoreleasepool {
+         Encoder e(this);
+-        return e.run(lists);
++        result = e.run(lists);
+     }
++    if (hud_start) gta6rt_hud_note_submission(gta6rt_hud_now_ns() - hud_start);
++    return result;
+ }
+ 
+ }  // namespace gta6rt::metal

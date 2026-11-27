@@ -1,0 +1,82 @@
+--- a/shims_gdk/src/acphal.cpp
++++ b/shims_gdk/src/acphal.cpp
+@@ -47,6 +47,9 @@
+ #if defined(LEONIDA_HAVE_XMA2_DECODER)
+ #include "leonida_xma2_decoder.h"
+ #endif
++#if defined(GTA6RT_HAVE_XMA)
++#include <gta6rt/xma.h>
++#endif
+ 
+ namespace {
+ 
+@@ -791,6 +794,16 @@
+ };
+ 
+ XmaEngine g_xma_engine;
++
++#if defined(GTA6RT_HAVE_XMA)
++// port/xma decodes the contexts when GTA6RT_AUDIO is on or null (or GTA6RT_XMA=1); otherwise XmaEngine above
++// keeps writing silence exactly as before, and port/xma only logs the activity when GTA6RT_XMA_LOG=1.
++std::atomic<bool> g_xma_host{false};
++std::atomic<uint32_t*> g_xma_observed{nullptr};
++std::atomic<uint32_t> g_xma_observed_count{0};
++
++uint8_t* xma_host_span(void*, uint32_t apu, std::size_t len) { return apu_span(apu, len); }
++#endif
+ 
+ // ---- IAcpHal Interface Implementation ----
+ 
+@@ -900,7 +913,16 @@
+             return value;
+         };
+ 
++#if defined(GTA6RT_HAVE_XMA)
++        if (!g_xma_host.load(std::memory_order_acquire)) {
++            gta6rt_xma_observe(cmd, config, g_xma_observed.load(), g_xma_observed_count.load());
++        }
++        const bool handled_xma = g_xma_host.load(std::memory_order_acquire)
++                                     ? gta6rt_xma_command(cmd, config) != 0
++                                     : g_xma_engine.handle_command(cmd, config);
++#else
+         const bool handled_xma = g_xma_engine.handle_command(cmd, config);
++#endif
+         {
+             std::lock_guard lock(mutex_);
+             if (!handled_xma) {
+@@ -1035,7 +1057,23 @@
+         result.apuPcmContextArray = {result.pcmContextArray ? kApuBaseAddress + 0x5000 : 0};
+ 
+         g_shape_allocations.reserve(g_shape_allocations.size() + 1);
++#if defined(GTA6RT_HAVE_XMA)
++        if (result.xmaContextArray && gta6rt_xma_wanted()) {
++            g_xma_engine.unbind();
++            if (gta6rt_xma_bind(reinterpret_cast<uint32_t*>(result.xmaContextArray), result.numXmaContexts,
++                                &xma_host_span, nullptr) != 0) {
++                throw std::bad_alloc();
++            }
++            g_xma_host.store(true, std::memory_order_release);
++        } else if (result.xmaContextArray) {
++            if (g_xma_host.exchange(false)) gta6rt_xma_unbind();
++            g_xma_engine.bind(result.xmaContextArray, result.numXmaContexts);
++            g_xma_observed_count.store(result.numXmaContexts);
++            g_xma_observed.store(reinterpret_cast<uint32_t*>(result.xmaContextArray));
++        }
++#else
+         if (result.xmaContextArray) g_xma_engine.bind(result.xmaContextArray, result.numXmaContexts);
++#endif
+     } catch (const std::bad_alloc&) {
+         return E_OUTOFMEMORY;
+     }
+@@ -1062,6 +1100,11 @@
+     std::lock_guard lock(g_shape_mutex);
+     // Stop and detach the XMA worker before freeing backing arrays.
+     g_xma_engine.unbind();
++#if defined(GTA6RT_HAVE_XMA)
++    if (g_xma_host.exchange(false)) gta6rt_xma_unbind();
++    g_xma_observed.store(nullptr);
++    g_xma_observed_count.store(0);
++#endif
+ 
+     // The export releases the process-wide SHAPE arrays. The argument is an
+     // opaque HAL handle, and allocation descriptors are owned by the caller.

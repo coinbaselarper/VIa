@@ -1,0 +1,23 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -65,6 +65,8 @@
+ add_subdirectory(compat)
+ add_subdirectory(portable)
+ add_subdirectory(audio_out)
++# SHAPE XMA decode on the host (port/xma): Rust decoder built with cargo per arch, linked into shims_gdk.
++add_subdirectory(xma)
+ 
+ # Metal backend (port/metal, its own worker). Not linked into the host yet; built so the tree keeps it compiling.
+ option(GTA6RT_WITH_METAL "Configure port/metal (tests off unless GTA6RT_METAL_TESTS)" ON)
+--- a/shims_gdk/CMakeLists.txt
++++ b/shims_gdk/CMakeLists.txt
+@@ -45,6 +45,9 @@
+   target_link_libraries(gta6rt_shims_gdk PRIVATE gta6rt_audio_out)
+   target_compile_definitions(gta6rt_shims_gdk PRIVATE GTA6RT_HAVE_AUDIO_OUT=1)
+ endif()
++if(TARGET gta6rt_xma)
++  target_link_libraries(gta6rt_shims_gdk PRIVATE gta6rt_xma)
++endif()
+ 
+ option(GTA6RT_GDK_TESTS "Build the shims_gdk tests" ON)
+ option(GTA6RT_GDK_TEST_WIN32_EMUL "Link the tests against tests/support/win32_emul.cpp instead of gta6rt_os Win32 surface" OFF)

@@ -1,0 +1,34 @@
+--- a/shims_gdk/src/acphal.cpp
++++ b/shims_gdk/src/acphal.cpp
+@@ -585,11 +585,20 @@
+     // Offsets and loop points are used per packet: a loop plays its end packet in full and
+     // restarts at the start of the packet holding the loop start.
+     static bool decode_one_packet(XmaContextView ctx, XmaVoice& voice) {
+-        if (voice.ended) return false;
++        const uint32_t valid = ctx.field(0, 20, 2);
++        if (voice.ended) {
++            // The title refills an input while the context stays enabled after the voice ran dry: resume on the
++            // first valid input instead of staying ended until the next ENABLE_XMA.
++            if (valid == 0) return false;
++            voice.ended = false;
++            if (ctx.field(2, 26, 5) == kXmaErrorInputInvalid) ctx.set_field(2, 26, 6, 0);
++#if defined(LEONIDA_HAVE_XMA2_DECODER)
++            voice.decoder.reset();
++#endif
++        }
+ 
+         const std::size_t channels = voice.channels();
+         uint32_t current = ctx.field(4, 31, 1);
+-        const uint32_t valid = ctx.field(0, 20, 2);
+ 
+         if (valid == 0) {
+             voice.ended = true;
+@@ -680,6 +689,8 @@
+                 if (!decode_one_packet(ctx, voice)) break;
+             }
+             if (voice.queued_samples() == 0) return;
++            // Publish whole blocks only; a zero-padded block is the stream's final tail, never a stall.
++            if (voice.queued_samples() < kXmaSamplesPerBlock && !voice.ended) return;
+ 
+             const uint32_t write = ctx.field(0, 27, 5) % size;
+             uint8_t* out = ring + write * kXmaBlockBytes;

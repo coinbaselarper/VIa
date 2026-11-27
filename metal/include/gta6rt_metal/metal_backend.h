@@ -1,0 +1,47 @@
+#pragma once
+
+#include "gta6rt_metal/gpu.h"
+
+#include <cstdint>
+#include <memory>
+
+namespace gta6rt::metal {
+
+inline constexpr std::uint32_t api_version = 2;
+
+struct DeviceOptions {
+    bool validation_labels = false;
+    std::uint64_t va_base = 0x0000'0001'0000'0000ull;  // first console VA the backend hands out
+    std::uint64_t va_size = 0x0000'0010'0000'0000ull;
+    std::uint32_t compile_threads = 3;                  // pipeline compile workers (CompileMode::async, NotReady::skip)
+};
+
+std::unique_ptr<gpu::Device> create_device(const DeviceOptions& options = {});
+
+// A window whose content view is a CAMetalLayer, for tests and for hosts without their own window layer.
+// Created on the main thread; visible=false gives a layer without a window.
+class Window {
+public:
+    virtual ~Window() = default;
+    virtual void* layer() = 0;  // CAMetalLayer*
+    virtual bool visible() const = 0;
+    virtual std::uint32_t width() const = 0;
+    virtual std::uint32_t height() const = 0;
+    virtual int pump_events(double seconds) = 0;
+};
+
+std::unique_ptr<Window> create_window(const char* title, std::uint32_t width, std::uint32_t height, bool visible);
+
+// Test hook: the next command buffer the queue begins fails in Metal (InvalidResource, raised by the kernel driver for
+// this process only) and nothing recorded into it runs, as when Metal discards a command buffer to recover from
+// another process's GPU error. wait_idle then reports device_lost once (DESIGN.md 3.12). as_victim counts it in
+// DeviceStats::command_buffer_victims as such a discard. The submitting thread waits for the queue to drain before
+// and for the command buffer after. Not under MTL_DEBUG_LAYER, which aborts on the released buffer. A command buffer
+// that samples GPU counters or copies a texture to a buffer completes without the error (measured).
+void inject_command_buffer_failure(gpu::Queue* queue, bool as_victim = false);
+
+// MSL of the D24 depth quantiser the fragment wrapper uses, for an exhaustive GPU-against-CPU check: kernel
+// gta6rt_d24_probe writes out[i] = quantise(in[i]) for i < user[2], in at heap_base + user[0], out at heap_base + user[1].
+std::string d24_quantize_probe_msl();
+
+}  // namespace gta6rt::metal

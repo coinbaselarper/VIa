@@ -1,0 +1,72 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_spirv_intrinsics : require
+
+spirv_instruction(id = 116) float quantize_to_f16(float x);
+
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) readonly buffer In { uint words[]; } src;
+layout(std430, binding = 1) writeonly buffer Out { uint words[]; } dst;
+
+const uint F16_TESTS = 21;
+const uint F32_TESTS = 16;
+
+float16_t h16(uint bits) { return uint16BitsToHalf(uint16_t(bits & 0xffffu)); }
+uint b16(float16_t h) { return uint(halfBitsToUint16(h)); }
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= 2048u) return;
+    float16_t h = h16(src.words[i]);
+    float16_t one = h16(src.words[2048]);
+    float16_t zero = h16(src.words[2049]);
+    float16_t half_ = h16(src.words[2050]);
+    float f1 = uintBitsToFloat(src.words[2051]);
+    uint o = i * F16_TESTS;
+    dst.words[o + 0] = floatBitsToUint(float(h));
+    dst.words[o + 1] = b16(h * one);
+    dst.words[o + 2] = b16(h + zero);
+    dst.words[o + 3] = b16(h + h);
+    dst.words[o + 4] = b16(fma(h, one, zero));
+    dst.words[o + 5] = b16(float16_t(float(h) * f1));
+    dst.words[o + 6] = b16(h * half_);
+    dst.words[o + 7] = b16(h >= zero ? max(h, zero) : min(h, zero));
+    dst.words[o + 8] = b16(abs(h));
+    dst.words[o + 9] = b16(-h);
+    dst.words[o + 10] = b16(h / one);
+    dst.words[o + 11] = b16(sqrt(abs(h)));
+    dst.words[o + 12] = (h != zero) ? 1u : 0u;
+    dst.words[o + 13] = b16(clamp(h, -one, one));
+    dst.words[o + 14] = b16(mix(zero, h, one));
+    dst.words[o + 15] = b16(dot(f16vec2(h, zero), f16vec2(one, one)));
+    dst.words[o + 16] = b16(exp2(float16_t(-14.0) - float16_t(i & 15u) * half_ * float16_t(2.0) * one));
+    dst.words[o + 17] = b16(h - zero);
+    dst.words[o + 18] = floatBitsToUint(unpackHalf2x16(src.words[i]).x);
+    dst.words[o + 19] = packHalf2x16(vec2(float(h) * f1, 0.0)) & 0xffffu;
+    dst.words[o + 20] = floatBitsToUint(quantize_to_f16(float(h) * f1));
+
+    if (i == 0u) {
+        float nan = uintBitsToFloat(src.words[2052]);
+        float inf = uintBitsToFloat(src.words[2053]);
+        float negz = uintBitsToFloat(src.words[2054]);
+        float z = uintBitsToFloat(src.words[2055]);
+        uint b = 2048u * F16_TESTS;
+        dst.words[b + 0] = isnan(nan) ? 1u : 0u;
+        dst.words[b + 1] = (nan != nan) ? 1u : 0u;
+        dst.words[b + 2] = isinf(inf) ? 1u : 0u;
+        dst.words[b + 3] = floatBitsToUint(-f1 * z);
+        dst.words[b + 4] = (nan < f1 || nan >= f1) ? 1u : 0u;
+        dst.words[b + 5] = floatBitsToUint(z / z);
+        dst.words[b + 6] = floatBitsToUint(f1 / z);
+        dst.words[b + 7] = floatBitsToUint(negz + z);
+        dst.words[b + 8] = (nan == nan) ? 0u : 1u;
+        dst.words[b + 9] = floatBitsToUint(inf * z);
+        dst.words[b + 10] = floatBitsToUint(negz * f1);
+        dst.words[b + 11] = floatBitsToUint(inf - inf);
+        dst.words[b + 12] = floatBitsToUint(nan * f1);
+        dst.words[b + 13] = floatBitsToUint(f1 / negz);
+        dst.words[b + 14] = (isnan(nan * f1) || isinf(inf)) ? 1u : 0u;
+        dst.words[b + 15] = floatBitsToUint(negz);
+    }
+}

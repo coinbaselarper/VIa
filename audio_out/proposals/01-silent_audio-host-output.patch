@@ -1,0 +1,632 @@
+--- a/shims_gdk/src/silent_audio.cpp
++++ b/shims_gdk/src/silent_audio.cpp
+@@ -17,7 +17,14 @@
+ #include <propsys.h>
+ #include <spatialaudioclient.h>
+ 
++#if defined(GTA6RT_HAVE_AUDIO_OUT)
++#include <gta6rt/audio_out.h>
++#endif
++
+ #include <algorithm>
++#include <atomic>
++#include <cmath>
++#include <cstdlib>
+ #include <chrono>
+ #include <condition_variable>
+ #include <cstdio>
+@@ -229,8 +236,59 @@
+     std::mutex mutex_;
+     std::condition_variable wake_;
+     bool stopping_ = false;
++    rt::gdk::Thread thread_;
++};
++
++#if defined(GTA6RT_HAVE_AUDIO_OUT)
++// GTA6RT_AUDIO=on|null: streams hand their frames to gta6rt_audio_out and their events follow its consumption.
++bool host_output() { return gta6rt_audio_out_mode() != GTA6RT_AUDIO_OFF; }
++
++uint32_t target_frames() {
++    const std::string v = rt::gdk::env_or("GTA6RT_AUDIO_TARGET_MS");
++    const long ms = v.empty() ? 50 : std::strtol(v.c_str(), nullptr, 10);
++    return static_cast<uint32_t>(std::clamp<long>(ms, 10, 500) * (kSampleRate / 1000));
++}
++
++// Calls `tick(context)` each time the output consumed frames, or every 5 ms, on its own thread.
++class PacedThread {
++public:
++    using Tick = void (*)(void*);
++    ~PacedThread() { stop(); }
++    bool start(gta6rt_audio_stream* s, Tick tick, void* context) {
++        if (thread_.joinable()) return true;
++        stream_ = s;
++        tick_ = tick;
++        context_ = context;
++        stopping_.store(false);
++        return rt::gdk::Thread::start(thread_, [this] { run(); }, "audio pacer");
++    }
++    void stop() {
++        if (!thread_.joinable()) return;
++        stopping_.store(true);
++        thread_.join();
++    }
++
++private:
++    void run() {
++        for (uint32_t n = 1; !stopping_.load(); ++n) {
++            gta6rt_audio_stream_wait_progress(stream_, 5);
++            if (!stopping_.load()) tick_(context_);
++            if (n % 256 == 0) cpu_us_.store(gta6rt_audio_out_thread_cpu_us());
++        }
++    }
++
++public:
++    double cpu_us() const { return cpu_us_.load(); }
++
++private:
++    std::atomic<double> cpu_us_{0.0};
++    gta6rt_audio_stream* stream_ = nullptr;
++    Tick tick_ = nullptr;
++    void* context_ = nullptr;
++    std::atomic<bool> stopping_{false};
+     rt::gdk::Thread thread_;
+ };
++#endif
+ 
+ // ---- IAudioClient3 --------------------------------------------------------------------------------------------
+ 
+@@ -253,6 +311,9 @@
+         Lock l(lock_);
+         if (!initialized_) return AUDCLNT_E_NOT_INITIALIZED;
+         *latency = kDefaultPeriodHns;
++#if defined(GTA6RT_HAVE_AUDIO_OUT)
++        if (out_) *latency += static_cast<REFERENCE_TIME>(gta6rt_audio_stream_latency(out_)) * 10000000 / rate_;
++#endif
+         return S_OK;
+     }
+     HRESULT STDMETHODCALLTYPE GetCurrentPadding(UINT32* padding) override {
+@@ -261,6 +322,9 @@
+         if (!initialized_) return AUDCLNT_E_NOT_INITIALIZED;
+         advance(qpc_now());
+         *padding = static_cast<UINT32>(written_ - played_);
++#if defined(GTA6RT_HAVE_AUDIO_OUT)
++        if (out_) *padding = gta6rt_audio_stream_padding(out_);
++#endif
+         return S_OK;
+     }
+     HRESULT STDMETHODCALLTYPE IsFormatSupported(AUDCLNT_SHAREMODE mode, const WAVEFORMATEX* format,
+@@ -297,6 +361,9 @@
+             played_at_anchor_ = played_;
+             running_ = true;
+             signal = event_;
++#if defined(GTA6RT_HAVE_AUDIO_OUT)
++            if (out_) gta6rt_audio_stream_start(out_);
++#endif
+         }
+         if (signal) SetEvent(signal);
+         return S_OK;
+@@ -307,6 +374,9 @@
+         if (!running_) return S_FALSE;
+         advance(qpc_now());
+         running_ = false;
++#if defined(GTA6RT_HAVE_AUDIO_OUT)
++        if (out_) gta6rt_audio_stream_stop(out_);
++#endif
+         return S_OK;
+     }
+     HRESULT STDMETHODCALLTYPE Reset() override {
+@@ -314,6 +384,13 @@
+         if (!initialized_) return AUDCLNT_E_NOT_INITIALIZED;
+         if (running_) return AUDCLNT_E_NOT_STOPPED;
+         if (pending_) return AUDCLNT_E_BUFFER_OPERATION_PENDING;
++#if defined(GTA6RT_HAVE_AUDIO_OUT)
++        if (out_) {
++            const bool empty = gta6rt_audio_stream_padding(out_) == 0 && gta6rt_audio_stream_position(out_, nullptr) == 0;
++            gta6rt_audio_stream_reset(out_);
++            return empty ? S_FALSE : S_OK;
++        }
++#endif
+         if (written_ == 0 && played_ == 0) return S_FALSE;
+         written_ = played_ = played_at_anchor_ = 0;
+         return S_OK;
+@@ -382,18 +459,34 @@
+         if (!initialized_) return AUDCLNT_E_NOT_INITIALIZED;
+         if (pending_) return AUDCLNT_E_OUT_OF_ORDER;
+         advance(qpc_now());
+-        const uint64_t padding = written_ - played_;
++        uint64_t padding = written_ - played_;
++#if defined(GTA6RT_HAVE_AUDIO_OUT)
++        if (out_) padding = gta6rt_audio_stream_padding(out_);
++#endif
+         if (frames > buffer_frames_ - padding) return AUDCLNT_E_BUFFER_TOO_LARGE;
+         pending_ = true;
+         pending_frames_ = frames;
+         *data = frames ? scratch_.data() : nullptr;
+         return S_OK;
+     }
+-    HRESULT release_buffer(UINT32 frames) {
++    HRESULT release_buffer(UINT32 frames, DWORD flags) {
+         Lock l(lock_);
+         if (!initialized_) return AUDCLNT_E_NOT_INITIALIZED;
+         if (!pending_) return frames ? AUDCLNT_E_OUT_OF_ORDER : S_OK;
+         if (frames > pending_frames_) return AUDCLNT_E_INVALID_SIZE;
++#if defined(GTA6RT_HAVE_AUDIO_OUT)
++        if (out_) {
++            if (flags & AUDCLNT_BUFFERFLAGS_SILENT) {
++                gta6rt_audio_stream_write_silence(out_, frames);
++            } else {
++                to_float(scratch_.data(), frames);
++                gta6rt_audio_stream_write(out_, conv_.data(), frames);
++            }
++            pending_ = false;
++            pending_frames_ = 0;
++            return S_OK;
++        }
++#endif
+         // A write after the stream ran dry plays from now on (advance re-anchors), as a device fed silence in the gap.
+         advance(qpc_now());
+         written_ += frames;
+@@ -406,6 +499,9 @@
+         const int64_t now = qpc_now();
+         advance(now);
+         *frames = played_;
++#if defined(GTA6RT_HAVE_AUDIO_OUT)
++        if (out_) *frames = gta6rt_audio_stream_position(out_, nullptr);
++#endif
+         if (qpc_hns) {
+             const int64_t f = qpc_frequency();
+             *qpc_hns = static_cast<UINT64>((now / f) * 10000000 + (now % f) * 10000000 / f);
+@@ -420,7 +516,15 @@
+     void set_volume(uint32_t i, float v) {
+         Lock l(lock_);
+         if (i < kMaxChannels) channel_volume_[i] = v;
++#if defined(GTA6RT_HAVE_AUDIO_OUT)
++        if (out_) gta6rt_audio_stream_set_channel_volume(out_, i, v);
++#endif
+     }
++    void volume_changed() {
++#if defined(GTA6RT_HAVE_AUDIO_OUT)
++        if (out_) gta6rt_audio_stream_set_volume(out_, master_, mute_);
++#endif
++    }
+     float master_ = 1.0f;
+     BOOL mute_ = FALSE;
+ 
+@@ -431,8 +535,75 @@
+         SRWLOCK& s_;
+     };
+ 
+-    ~AudioClient() override { clock_.stop(); }
++    ~AudioClient() override {
++        clock_.stop();
++#if defined(GTA6RT_HAVE_AUDIO_OUT)
++        pacer_.stop();
++        if (out_) gta6rt_audio_stream_close(out_);
++#endif
++    }
+ 
++    // The client's frames as interleaved float; PCM 16/24/32 and float 32 (the formats open_host takes).
++    void to_float(const BYTE* src, UINT32 frames) {
++        const size_t n = static_cast<size_t>(frames) * channels_;
++        float* dst = conv_.data();
++        if (float_) {
++            std::memcpy(dst, src, n * 4);
++        } else if (bits_ == 16) {
++            for (size_t i = 0; i < n; ++i) dst[i] = static_cast<int16_t>(src[2 * i] | (src[2 * i + 1] << 8)) / 32768.0f;
++        } else if (bits_ == 24) {
++            for (size_t i = 0; i < n; ++i) {
++                const int32_t v = (src[3 * i] << 8) | (src[3 * i + 1] << 16) | (src[3 * i + 2] << 24);
++                dst[i] = static_cast<float>(v) / 2147483648.0f;
++            }
++        } else {
++            for (size_t i = 0; i < n; ++i) {
++                int32_t v;
++                std::memcpy(&v, src + 4 * i, 4);
++                dst[i] = static_cast<float>(v) / 2147483648.0f;
++            }
++        }
++    }
++
++#if defined(GTA6RT_HAVE_AUDIO_OUT)
++    // The host output for a 48 kHz PCM/float stream of 1..8 channels; anything else stays on the silent clock.
++    bool open_host(const WAVEFORMATEX* format) {
++        if (!host_output()) return false;
++        const bool ext = format->wFormatTag == WAVE_FORMAT_EXTENSIBLE && format->cbSize >= 22;
++        const uint32_t mask = ext ? reinterpret_cast<const WAVEFORMATEXTENSIBLE*>(format)->dwChannelMask : 0;
++        float_ = is_float(format);
++        bits_ = format->wBitsPerSample;
++        if (rate_ != kSampleRate || channels_ > 8 || (float_ && bits_ != 32) || (!float_ && bits_ != 16 && bits_ != 24 && bits_ != 32)) {
++            std::fprintf(stderr,
++                         "[rt] audio: host output for a %u ch %u Hz %u-bit %s stream not implemented: this stream stays "
++                         "silent\n",
++                         channels_, rate_, bits_, float_ ? "float" : "PCM");
++            return false;
++        }
++        gta6rt_audio_stream_desc d{kSampleRate, channels_, mask, buffer_frames_, "IAudioClient"};
++        if (gta6rt_audio_stream_open(&d, &out_) != 0) return false;
++        conv_.assign(static_cast<size_t>(buffer_frames_) * channels_, 0.0f);
++        if (event_mode_ && !pacer_.start(out_, &AudioClient::pace, this)) {
++            gta6rt_audio_stream_close(out_);
++            out_ = nullptr;
++            return false;
++        }
++        return true;
++    }
++
++    static void pace(void* self) {
++        auto* c = static_cast<AudioClient*>(self);
++        HANDLE signal = nullptr;
++        {
++            Lock l(c->lock_);
++            if (!c->running_) return;
++            if (gta6rt_audio_stream_padding(c->out_) + c->period_frames() <= c->buffer_frames_) signal = c->event_;
++        }
++        if (signal) SetEvent(signal);
++    }
++    uint32_t period_frames() const { return static_cast<uint32_t>(period_hns_ * rate_ / 10000000); }
++#endif
++
+     bool answers(REFIID riid) const override {
+         return IsEqualIID(riid, __uuidof(IAudioClient)) || IsEqualIID(riid, __uuidof(IAudioClient2)) ||
+                IsEqualIID(riid, __uuidof(IAudioClient3));
+@@ -458,11 +629,16 @@
+         scratch_.assign(static_cast<size_t>(buffer_frames_) * block_, 0);
+         for (float& v : channel_volume_) v = 1.0f;
+         event_mode_ = (flags & AUDCLNT_STREAMFLAGS_EVENTCALLBACK) != 0;
+-        if (event_mode_ && !clock_.start(period_hns_, &AudioClient::tick, this)) return E_OUTOFMEMORY;
++        bool host = false;
++#if defined(GTA6RT_HAVE_AUDIO_OUT)
++        host = open_host(format);
++#endif
++        if (!host && event_mode_ && !clock_.start(period_hns_, &AudioClient::tick, this)) return E_OUTOFMEMORY;
+         initialized_ = true;
+         if (InterlockedExchange(&g_stream_logged, 1) == 0) {
+-            std::fprintf(stderr, "[rt] audio: silent stream: %u ch, %u Hz, %u-byte frames, %u-frame buffer, %s\n",
+-                         channels_, rate_, block_, buffer_frames_, event_mode_ ? "event-driven" : "polled");
++            std::fprintf(stderr, "[rt] audio: %s stream: %u ch, %u Hz, %u-byte frames, %u-frame buffer, %s\n",
++                         host ? "host" : "silent", channels_, rate_, block_, buffer_frames_,
++                         event_mode_ ? "event-driven" : "polled");
+         }
+         return S_OK;
+     }
+@@ -517,6 +693,13 @@
+     uint64_t played_at_anchor_ = 0;
+     int64_t anchor_qpc_ = 0;
+     float channel_volume_[kMaxChannels]{};
++    bool float_ = true;
++    uint32_t bits_ = 32;
++    std::vector<float> conv_;
++#if defined(GTA6RT_HAVE_AUDIO_OUT)
++    gta6rt_audio_stream* out_ = nullptr;
++    PacedThread pacer_;
++#endif
+ };
+ 
+ // The services hold their client.
+@@ -534,7 +717,9 @@
+ public:
+     using Service::Service;
+     HRESULT STDMETHODCALLTYPE GetBuffer(UINT32 frames, BYTE** data) override { return client_->get_buffer(frames, data); }
+-    HRESULT STDMETHODCALLTYPE ReleaseBuffer(UINT32 frames, DWORD) override { return client_->release_buffer(frames); }
++    HRESULT STDMETHODCALLTYPE ReleaseBuffer(UINT32 frames, DWORD flags) override {
++        return client_->release_buffer(frames, flags);
++    }
+ };
+ 
+ class Clock final : public Service<IAudioClock> {
+@@ -563,6 +748,7 @@
+     HRESULT STDMETHODCALLTYPE SetMasterVolume(float level, LPCGUID) override {
+         if (level < 0.0f || level > 1.0f) return E_INVALIDARG;
+         client_->master_ = level;
++        client_->volume_changed();
+         return S_OK;
+     }
+     HRESULT STDMETHODCALLTYPE GetMasterVolume(float* level) override {
+@@ -572,6 +758,7 @@
+     }
+     HRESULT STDMETHODCALLTYPE SetMute(BOOL mute, LPCGUID) override {
+         client_->mute_ = mute;
++        client_->volume_changed();
+         return S_OK;
+     }
+     HRESULT STDMETHODCALLTYPE GetMute(BOOL* mute) override {
+@@ -699,15 +886,21 @@
+         *type = static_cast<AudioObjectType>(type_);
+         return S_OK;
+     }
+-    HRESULT STDMETHODCALLTYPE SetPosition(float, float, float) override { return S_OK; }  // nothing is rendered
++    HRESULT STDMETHODCALLTYPE SetPosition(float, float, float) override { return S_OK; }  // static objects only
+     HRESULT STDMETHODCALLTYPE SetVolume(float volume) override {
+-        return volume >= 0.0f && volume <= 1.0f ? S_OK : E_INVALIDARG;
++        if (!(volume >= 0.0f && volume <= 1.0f)) return E_INVALIDARG;
++        volume_.store(volume);
++        return S_OK;
+     }
+     // The stream ends the object at the end of the pass it called SetEndOfStream in.
+     void make_inactive() { InterlockedExchange(&active_, 0); }
+     // True once: whoever takes the type frees it in the stream.
+     bool take_type() { return InterlockedExchange(&type_held_, 0) != 0; }
+     uint32_t type() const { return type_; }
++    // Host output: the object's own pass buffer, mixed into the bed at EndUpdatingAudioObjects.
++    float samples_[kSampleRate / 100] = {};
++    bool written_ = false;
++    std::atomic<float> volume_{1.0f};
+ 
+ private:
+     ~SpatialObject() override;
+@@ -723,7 +916,31 @@
+     SpatialStream(HANDLE event, uint32_t mask) : event_(event), mask_(mask) {
+         scratch_.assign(static_cast<size_t>(kObjectFrames) * 4, 0);
+     }
+-    bool start_clock() { return clock_.start(kDefaultPeriodHns, &SpatialStream::tick, this); }
++    bool start_clock() {
++#if defined(GTA6RT_HAVE_AUDIO_OUT)
++        if (host_output()) {
++            target_ = target_frames();
++            gta6rt_audio_stream_desc d{kSampleRate, kChannels, kChannelMask, std::max<uint32_t>(4 * target_, 9600),
++                                       "spatial bed"};
++            if (gta6rt_audio_stream_open(&d, &out_) == 0) {
++                bed_.assign(static_cast<size_t>(kObjectFrames) * kChannels, 0.0f);
++                if (pacer_.start(out_, &SpatialStream::pace, this)) return true;
++                gta6rt_audio_stream_close(out_);
++                out_ = nullptr;
++            }
++            std::fprintf(stderr, "[rt] audio: host output for the spatial stream failed to open: stays silent\n");
++        }
++#endif
++        return clock_.start(kDefaultPeriodHns, &SpatialStream::tick, this);
++    }
++    bool host() const {
++#if defined(GTA6RT_HAVE_AUDIO_OUT)
++        return out_ != nullptr;
++#else
++        return false;
++#endif
++    }
++    uint32_t target() const { return target_; }
+ 
+     HRESULT STDMETHODCALLTYPE GetAvailableDynamicObjectCount(UINT32* value) override {
+         if (!value) return E_POINTER;
+@@ -741,6 +958,9 @@
+             Lock l(lock_);
+             if (running_) return S_OK;
+             running_ = true;
++#if defined(GTA6RT_HAVE_AUDIO_OUT)
++            if (out_) gta6rt_audio_stream_start(out_);
++#endif
+         }
+         SetEvent(event_);
+         return S_OK;
+@@ -748,11 +968,18 @@
+     HRESULT STDMETHODCALLTYPE Stop() override {
+         Lock l(lock_);
+         running_ = false;
++#if defined(GTA6RT_HAVE_AUDIO_OUT)
++        if (out_) gta6rt_audio_stream_stop(out_);
++#endif
+         return S_OK;
+     }
+     HRESULT STDMETHODCALLTYPE Reset() override {
+         Lock l(lock_);
+-        return running_ ? SPTLAUDCLNT_E_STREAM_NOT_STOPPED : S_OK;
++        if (running_) return SPTLAUDCLNT_E_STREAM_NOT_STOPPED;
++#if defined(GTA6RT_HAVE_AUDIO_OUT)
++        if (out_) gta6rt_audio_stream_reset(out_);
++#endif
++        return S_OK;
+     }
+     HRESULT STDMETHODCALLTYPE BeginUpdatingAudioObjects(UINT32* available, UINT32* frames) override {
+         if (!available || !frames) return E_POINTER;
+@@ -765,10 +992,14 @@
+     }
+     HRESULT STDMETHODCALLTYPE EndUpdatingAudioObjects() override {
+         std::vector<SpatialObject*> ended;
++        bool more = false;
+         {
+             Lock l(lock_);
+             if (!updating_) return SPTLAUDCLNT_E_OUT_OF_ORDER;
+             updating_ = false;
++#if defined(GTA6RT_HAVE_AUDIO_OUT)
++            if (out_) more = render_pass_locked();
++#endif
+             ended.swap(ending_);
+             for (SpatialObject* o : ended) {
+                 o->make_inactive();
+@@ -776,6 +1007,7 @@
+             }
+         }
+         for (SpatialObject* o : ended) o->Release();
++        if (more) SetEvent(event_);
+         return S_OK;
+     }
+     HRESULT STDMETHODCALLTYPE ActivateSpatialAudioObject(AudioObjectType type, ISpatialAudioObject** object) override {
+@@ -800,13 +1032,32 @@
+     }
+ 
+     // For the objects.
+-    HRESULT buffer(BYTE** data, UINT32* length) {
++    HRESULT buffer(SpatialObject* o, BYTE** data, UINT32* length) {
+         Lock l(lock_);
+         if (!updating_) return SPTLAUDCLNT_E_OUT_OF_ORDER;
++        if (host()) {
++            if (!o->written_ && !(first_buffer_logged_ & o->type())) {
++                first_buffer_logged_ |= o->type();
++                std::fprintf(stderr, "[rt] audio: spatial object 0x%x: first GetBuffer (host output)\n", o->type());
++            }
++            o->written_ = true;
++            std::memset(o->samples_, 0, sizeof o->samples_);
++            *data = reinterpret_cast<BYTE*>(o->samples_);
++            *length = static_cast<UINT32>(sizeof o->samples_);
++            return S_OK;
++        }
+         *data = scratch_.data();
+         *length = static_cast<UINT32>(scratch_.size());
+         return S_OK;
+     }
++    void add_object(SpatialObject* o) {
++        Lock l(lock_);
++        objects_.push_back(o);
++    }
++    void remove_object(SpatialObject* o) {
++        Lock l(lock_);
++        objects_.erase(std::remove(objects_.begin(), objects_.end(), o), objects_.end());
++    }
+     HRESULT end_of_stream(SpatialObject* o) {
+         Lock l(lock_);
+         if (!updating_) return SPTLAUDCLNT_E_OUT_OF_ORDER;
+@@ -825,7 +1076,98 @@
+         ~Lock() { ReleaseSRWLockExclusive(&s_); }
+         SRWLOCK& s_;
+     };
+-    ~SpatialStream() override { clock_.stop(); }  // ending_ is empty: each entry holds the stream
++    ~SpatialStream() override {  // ending_ is empty: each entry holds the stream
++        clock_.stop();
++#if defined(GTA6RT_HAVE_AUDIO_OUT)
++        pacer_.stop();
++        if (out_) gta6rt_audio_stream_close(out_);
++#endif
++    }
++
++#if defined(GTA6RT_HAVE_AUDIO_OUT)
++    // Bed channel(s) of a static object type in the 7.1 mix format (FL FR FC LFE BL BR SL SR).
++    static int bed_targets(uint32_t type, int ch[2], float gain[2]) {
++        const float h = 0.70710678f;
++        switch (type) {
++            case AudioObjectType_FrontLeft: case 0x40000: ch[0] = 0, gain[0] = 1; return 1;
++            case AudioObjectType_FrontRight: case 0x80000: ch[0] = 1, gain[0] = 1; return 1;
++            case AudioObjectType_FrontCenter: ch[0] = 2, gain[0] = 1; return 1;
++            case AudioObjectType_LowFrequency: ch[0] = 3, gain[0] = 1; return 1;
++            case AudioObjectType_BackLeft: ch[0] = 4, gain[0] = 1; return 1;
++            case AudioObjectType_BackRight: ch[0] = 5, gain[0] = 1; return 1;
++            case AudioObjectType_SideLeft: ch[0] = 6, gain[0] = 1; return 1;
++            case AudioObjectType_SideRight: ch[0] = 7, gain[0] = 1; return 1;
++            case AudioObjectType_TopFrontLeft: case AudioObjectType_BottomFrontLeft: ch[0] = 0, gain[0] = h; return 1;
++            case AudioObjectType_TopFrontRight: case AudioObjectType_BottomFrontRight: ch[0] = 1, gain[0] = h; return 1;
++            case AudioObjectType_TopBackLeft: case AudioObjectType_BottomBackLeft: ch[0] = 4, gain[0] = h; return 1;
++            case AudioObjectType_TopBackRight: case AudioObjectType_BottomBackRight: ch[0] = 5, gain[0] = h; return 1;
++            case AudioObjectType_BackCenter: ch[0] = 4, ch[1] = 5, gain[0] = gain[1] = h; return 2;
++            default: return 0;
++        }
++    }
++
++    // Mixes the objects written this pass into one 7.1 frame block and queues it; true when the output still wants
++    // another pass.
++    bool render_pass_locked() {
++        const auto t0 = std::chrono::steady_clock::now();
++        std::fill(bed_.begin(), bed_.end(), 0.0f);
++        float peak = 0.0f;
++        double energy = 0.0;
++        for (SpatialObject* o : objects_) {
++            if (!o->written_) continue;
++            o->written_ = false;
++            int ch[2];
++            float gain[2];
++            const int n = bed_targets(o->type(), ch, gain);
++            if (n == 0 && !(unplaced_logged_ & o->type())) {
++                unplaced_logged_ |= o->type();
++                std::fprintf(stderr, "[rt] audio: spatial object type 0x%x has no 7.1 bed position: not rendered\n",
++                             o->type());
++            }
++            const float v = o->volume_.load();
++            for (uint32_t f = 0; f < kObjectFrames; ++f) {
++                const float x = o->samples_[f];
++                peak = std::max(peak, std::fabs(x));
++                energy += double(x) * x;
++                for (int k = 0; k < n; ++k) bed_[f * kChannels + ch[k]] += x * v * gain[k];
++            }
++        }
++        gta6rt_audio_stream_write(out_, bed_.data(), kObjectFrames);
++        const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
++        render_us_ += us;
++        render_max_us_ = std::max(render_max_us_, us);
++        ++passes_;
++        if (peak > 1e-6f) ++loud_passes_;
++        window_peak_ = std::max(window_peak_, peak);
++        window_energy_ += energy;
++        window_samples_ += kObjectFrames * 2;
++        if (passes_ % 1000 == 0) {
++            std::fprintf(stderr,
++                         "[rt] audio: spatial stream: %llu passes, %llu with signal; last 1000: object peak %.4f, rms "
++                         "%.5f (2 ch), mix+queue %.1f us mean %.1f max; pacer thread CPU %.1f ms\n",
++                         static_cast<unsigned long long>(passes_), static_cast<unsigned long long>(loud_passes_),
++                         window_peak_, std::sqrt(window_energy_ / std::max<uint64_t>(window_samples_, 1)),
++                         render_us_ / 1000.0, render_max_us_, pacer_.cpu_us() / 1000.0);
++            render_us_ = 0.0;
++            render_max_us_ = 0.0;
++            window_peak_ = 0.0f;
++            window_energy_ = 0.0;
++            window_samples_ = 0;
++        }
++        return running_ && gta6rt_audio_stream_padding(out_) + kObjectFrames <= target_;
++    }
++
++    static void pace(void* self) {
++        auto* s = static_cast<SpatialStream*>(self);
++        bool signal = false;
++        {
++            Lock l(s->lock_);
++            signal = s->running_ && !s->updating_ && gta6rt_audio_stream_padding(s->out_) + kObjectFrames <= s->target_;
++        }
++        if (signal) SetEvent(s->event_);
++    }
++#endif
++
+     static void tick(void* self) {
+         auto* s = static_cast<SpatialStream*>(self);
+         bool running = false;
+@@ -844,13 +1186,28 @@
+     bool updating_ = false;
+     std::vector<BYTE> scratch_;
+     std::vector<SpatialObject*> ending_;
++    std::vector<SpatialObject*> objects_;
+     PeriodicThread clock_;
++    uint32_t target_ = 0;
++    uint32_t first_buffer_logged_ = 0;
++    uint32_t unplaced_logged_ = 0;
++#if defined(GTA6RT_HAVE_AUDIO_OUT)
++    gta6rt_audio_stream* out_ = nullptr;
++    PacedThread pacer_;
++    std::vector<float> bed_;
++    uint64_t passes_ = 0, loud_passes_ = 0, window_samples_ = 0;
++    float window_peak_ = 0.0f;
++    double window_energy_ = 0.0;
++    double render_us_ = 0.0, render_max_us_ = 0.0;
++#endif
+ };
+ 
+ SpatialObject::SpatialObject(SpatialStream* stream, uint32_t type) : stream_(stream), type_(type) {
+     stream_->AddRef();
++    stream_->add_object(this);
+ }
+ SpatialObject::~SpatialObject() {
++    stream_->remove_object(this);
+     if (take_type()) stream_->release_type(type_);
+     stream_->Release();
+ }
+@@ -859,7 +1216,7 @@
+     *buffer = nullptr;
+     *length = 0;
+     if (!InterlockedCompareExchange(&active_, 0, 0)) return SPTLAUDCLNT_E_RESOURCES_INVALIDATED;
+-    return stream_->buffer(buffer, length);
++    return stream_->buffer(this, buffer, length);
+ }
+ HRESULT SpatialObject::SetEndOfStream(UINT32) {
+     if (!InterlockedCompareExchange(&active_, 0, 0)) return SPTLAUDCLNT_E_RESOURCES_INVALIDATED;
+@@ -950,9 +1307,15 @@
+         }
+         if (InterlockedExchange(&g_spatial_logged, 1) == 0) {
+             std::fprintf(stderr,
+-                         "[rt] audio: silent spatial stream: static objects 0x%x, dynamic objects %u..%u asked "
++                         "[rt] audio: %s spatial stream: static objects 0x%x, dynamic objects %u..%u asked "
+                          "(0 available), %u frames a pass\n",
+-                         mask, p.MinDynamicObjectCount, p.MaxDynamicObjectCount, kObjectFrames);
++                         s->host() ? "host" : "silent", mask, p.MinDynamicObjectCount, p.MaxDynamicObjectCount,
++                         kObjectFrames);
++            if (s->host())
++                std::fprintf(stderr,
++                             "[rt] audio: host spatial stream: objects mixed into the 7.1 bed, event follows the output "
++                             "(target padding %u frames)\n",
++                             s->target());
+         }
+         const HRESULT hr = s->QueryInterface(riid, out);
+         s->Release();

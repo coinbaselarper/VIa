@@ -1,0 +1,140 @@
+--- host/src/trace.cpp
++++ host/src/trace.cpp
+@@ -13,6 +13,7 @@
+ #include <sys/mman.h>
+ #include <unistd.h>
+ 
++#include <gta6rt/isa.h>
+ #include <gta6rt/loader.h>
+ #include <gta6rt/os.h>
+ 
+@@ -40,10 +41,8 @@
+ 
+ constexpr size_t kRing = 4096;
+ constexpr uint32_t kMaxOrder = 16384;
+-#if defined(__x86_64__)
+ constexpr size_t kStubSize = 24;
+ constexpr size_t kStubArena = 2u << 20;
+-#endif
+ 
+ Hit g_ring[kRing];
+ std::atomic<uint64_t> g_seq{0};
+@@ -62,9 +61,10 @@
+ std::vector<Rec*> g_all;
+ std::vector<std::string> g_unimpl_bindings;
+ std::vector<std::string> g_missing_procs;
+-#if defined(__x86_64__)
+ uint8_t* g_arena = nullptr;
+ size_t g_arena_used = 0;
++#if !defined(__x86_64__)
++uint64_t g_tramp = 0;
+ #endif
+ 
+ uint32_t current_tid() {
+@@ -156,15 +156,51 @@
+ 
+ #if defined(__x86_64__)
+ extern "C" void gta6rt_host_trace_tramp(void);
++#else
++namespace {
++void trace_hit_frame(gta6rt_guest_frame* f, void*) {
++    gta6rt_host_trace_hit(reinterpret_cast<host::trace::Rec*>(f->rcx), reinterpret_cast<const uint64_t*>(f->rdx), f->r8);
++}
++
++// The bytes of trace_x86_64.S, with its call to gta6rt_host_trace_hit replaced by a call through a FRAME thunk: on
++// arm64 the trampoline is guest code that FEX runs from plain readable memory.
++uint64_t make_guest_tramp(uint8_t* at) {
++    static const uint8_t pre[] = {0x48, 0x81, 0xec, 0x98, 0x00, 0x00, 0x00, 0x48, 0x89, 0x4c, 0x24, 0x20, 0x48, 0x89, 0x54,
++                                  0x24, 0x28, 0x4c, 0x89, 0x44, 0x24, 0x30, 0x4c, 0x89, 0x4c, 0x24, 0x38, 0xf3, 0x0f, 0x7f,
++                                  0x44, 0x24, 0x40, 0xf3, 0x0f, 0x7f, 0x4c, 0x24, 0x50, 0xf3, 0x0f, 0x7f, 0x54, 0x24, 0x60,
++                                  0xf3, 0x0f, 0x7f, 0x5c, 0x24, 0x70, 0x4c, 0x89, 0x94, 0x24, 0x80, 0x00, 0x00, 0x00, 0x48,
++                                  0x89, 0x84, 0x24, 0x88, 0x00, 0x00, 0x00, 0x4c, 0x89, 0xd1, 0x48, 0x8d, 0x54, 0x24, 0x20,
++                                  0x4c, 0x8b, 0x84, 0x24, 0x98, 0x00, 0x00, 0x00};
++    static const uint8_t post[] = {0x4c, 0x8b, 0x94, 0x24, 0x80, 0x00, 0x00, 0x00, 0x48, 0x8b, 0x84, 0x24, 0x88, 0x00, 0x00,
++                                   0x00, 0x48, 0x8b, 0x4c, 0x24, 0x20, 0x48, 0x8b, 0x54, 0x24, 0x28, 0x4c, 0x8b, 0x44, 0x24,
++                                   0x30, 0x4c, 0x8b, 0x4c, 0x24, 0x38, 0xf3, 0x0f, 0x6f, 0x44, 0x24, 0x40, 0xf3, 0x0f, 0x6f,
++                                   0x4c, 0x24, 0x50, 0xf3, 0x0f, 0x6f, 0x54, 0x24, 0x60, 0xf3, 0x0f, 0x6f, 0x5c, 0x24, 0x70,
++                                   0x48, 0x81, 0xc4, 0x98, 0x00, 0x00, 0x00, 0x41, 0xff, 0x22};
++    gta6rt_thunk_desc d{};
++    d.kind = GTA6RT_THUNK_FRAME;
++    d.fn = reinterpret_cast<const void*>(&trace_hit_frame);
++    d.debug_name = "host!trace_hit";
++    gta6rt_gva hit = 0;
++    if (gta6rt_isa_make_thunk(&d, &hit) != GTA6RT_OK) return 0;
++    uint8_t* p = at;
++    std::memcpy(p, pre, sizeof pre);
++    p += sizeof pre;
++    *p++ = 0x48;  // mov rax, hit
++    *p++ = 0xB8;
++    std::memcpy(p, &hit, 8);
++    p += 8;
++    *p++ = 0xFF;  // call rax
++    *p++ = 0xD0;
++    std::memcpy(p, post, sizeof post);
++    return reinterpret_cast<uint64_t>(at);
++}
++}  // namespace
+ #endif
+ 
+ namespace host::trace {
+ 
+ void configure(const Options& opt, gta6rt_gva exe_base, uint64_t exe_size) {
+     g_opt = opt;
+-#if !defined(__x86_64__)
+-    g_opt.enabled = false;
+-#endif
+     g_exe_base = exe_base;
+     g_exe_size = exe_size;
+ }
+@@ -178,16 +214,26 @@
+ 
+ gta6rt_gva wrap(gta6rt_gva target, const char* name, bool unimplemented) {
+     if (!g_opt.enabled || !target) return target;
+-#if defined(__x86_64__)
+     std::lock_guard lock(g_mu);
+     if (g_by_stub.count(target)) return target;
+     const auto key = std::make_pair(static_cast<uint64_t>(target), std::string(name ? name : "?"));
+     if (auto it = g_by_key.find(key); it != g_by_key.end()) return it->second->stub;
+     if (!g_arena || g_arena_used + kStubSize > kStubArena) {
++#if defined(__x86_64__)
+         void* p = mmap(nullptr, kStubArena, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANON, -1, 0);
++#else
++        void* p = mmap(nullptr, kStubArena, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
++#endif
+         if (p == MAP_FAILED) return target;
+         g_arena = static_cast<uint8_t*>(p);
+         g_arena_used = 0;
++#if !defined(__x86_64__)
++        if (!g_tramp) {
++            g_tramp = make_guest_tramp(g_arena);
++            if (!g_tramp) return target;
++            g_arena_used = 256;
++        }
++#endif
+     }
+     auto* r = new Rec;
+     r->target = target;
+@@ -195,7 +241,11 @@
+     r->unimplemented = unimplemented;
+     uint8_t code[kStubSize] = {0x49, 0xBA, 0, 0, 0, 0, 0, 0, 0, 0, 0x49, 0xBB, 0, 0, 0, 0, 0, 0, 0, 0, 0x41, 0xFF, 0xE3, 0xCC};
+     const uint64_t rp = reinterpret_cast<uint64_t>(r);
++#if defined(__x86_64__)
+     const uint64_t tp = reinterpret_cast<uint64_t>(&gta6rt_host_trace_tramp);
++#else
++    const uint64_t tp = g_tramp;
++#endif
+     std::memcpy(code + 2, &rp, 8);
+     std::memcpy(code + 12, &tp, 8);
+     uint8_t* at = g_arena + g_arena_used;
+@@ -207,11 +257,6 @@
+     g_by_stub.emplace(stub, r);
+     g_all.push_back(r);
+     return stub;
+-#else
+-    (void)name;
+-    (void)unimplemented;
+-    return target;
+-#endif
+ }
+ 
+ void note_unimplemented_binding(const char* name) {

@@ -1,0 +1,1781 @@
+// Xbox DirectStorage for a mapped title: DStorageGetFactory and the IDStorageFactoryX2 / IDStorageQueueX2 /
+// IDStorageFileX / IDStorageStatusArrayX objects of the console API (dstorage_xs_abi.h).
+//
+// Served as dstorage_xs.dll, xcrdapi.dll and dstorage.dll!DStorageGetFactory; docs/directstorage.md has the evidence
+// for those names, the console ABI and what each method does here. In short:
+//   - OpenFile resolves kernel32.dll!CreateFileW through the shim registry, so a GAME: path goes through the
+//     runtime's console path mapping and write overlay (file_system.cpp) exactly as the title's own CreateFileW.
+//   - Each queue publishes its submitted entries in order: a request reads a file range or
+//     copies a memory range into the destination, a status entry, fence signal or event runs when every entry before
+//     it has. Completion is therefore in queue order, as the API guarantees.
+//   - Compressed requests stage RFC 1950 inflate, BCPack BC block reconstruction and DirectStorage
+//     macro-unshuffle before publishing the destination. Physical page numbers resolve in xmem at execution.
+// Nothing here goes online or touches the GPU.
+#include <windows.h>
+#include <cerrno>
+#include <d3d12.h>
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <fcntl.h>
+#include <pthread/qos.h>
+#include <unistd.h>
+#include <zlib.h>
+#include <functional>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
+#include <map>
+#include <condition_variable>
+#include <cstdio>
+#include <cstring>
+#include <deque>
+#include <memory>
+#include <mutex>
+#include <new>
+#include <set>
+#include <span>
+#include <string>
+#include <unordered_set>
+#include <vector>
+
+#include <mach-o/dyld.h>
+
+#include "shader_library.h"  // leonida::zlib_inflate
+#include "bcpack.h"
+#include "dstorage_swizzle.h"
+#include "dstorage_shapes.h"
+#include "dstorage_trace.h"
+#include "dstorage_xs_abi.h"
+#include "dstorage_staging.h"
+#include "gdk_env.h"
+#include "gdk_text.h"
+#include "gdk_thread.h"
+#include "gdk_title_memory.h"
+#include "startup_trace.h"
+#include "xmem.h"
+#include "shims.h"
+
+using namespace dsx;
+
+namespace {
+
+// ---- Logging ------------------------------------------------------------------------------------------------------
+
+// Process-lifetime state is allocated once and never freed: a worker thread may still run while statics are destroyed
+// at exit.
+std::mutex& log_mutex() {
+    static auto* m = new std::mutex;
+    return *m;
+}
+
+void log_once(const std::string& key, const std::string& line) {
+    static auto* seen = new std::set<std::string>;
+    std::lock_guard lock(log_mutex());
+    if (!seen->insert(key).second) return;
+    std::fprintf(stderr, "[rt] dstorage: %s\n", line.c_str());
+}
+
+std::string guid_text(const GUID& g) {
+    char b[48];
+    std::snprintf(b, sizeof b, "{%08x-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x}", g.Data1, g.Data2, g.Data3,
+                  g.Data4[0], g.Data4[1], g.Data4[2], g.Data4[3], g.Data4[4], g.Data4[5], g.Data4[6], g.Data4[7]);
+    return b;
+}
+
+bool same_guid(const GUID& a, const GUID& b) { return std::memcmp(&a, &b, sizeof(GUID)) == 0; }
+
+std::string hr_text(HRESULT hr) {
+    char b[16];
+    std::snprintf(b, sizeof b, "0x%08x", static_cast<unsigned>(hr));
+    return b;
+}
+
+// ---- Interface ids ------------------------------------------------------------------------------------------------
+//
+// The X interfaces' ids are not public. A creating call (DStorageGetFactory, CreateQueue*, OpenFile,
+// CreateStatusArray) accepts an id it has not seen for the kind of object it hands out and logs it the first time, so
+// the first boot records the console's ids. It refuses an id seen for another kind, a PC DirectStorage id of another
+// shape, and the system COM interfaces (IMarshal, IAgileObject, ...), which a DirectStorage object never implements.
+// QueryInterface is stricter (docs/d3d12_vulkan.md: an unknown id is E_NOINTERFACE): it accepts IUnknown, the
+// declared ids (dstorage_xs_abi.h) and the ids a creating call accepted for that kind, and logs anything else. This is
+// a policy, not a fact; it lives here so a measured id list can replace it.
+
+enum class Kind { Factory, Queue, File, StatusArray };
+
+const char* kind_name(Kind k) {
+    switch (k) {
+        case Kind::Factory: return "factory";
+        case Kind::Queue: return "queue";
+        case Kind::File: return "file";
+        case Kind::StatusArray: return "status array";
+    }
+    return "?";
+}
+
+// System interfaces: the COM base range {xxxxxxxx-0000-0000-C000-000000000046} (IClassFactory, IMarshal,
+// IStdMarshalInfo, IExternalConnection, IMultiQI, IClientSecurity, IServerSecurity, IRpcOptions, IMarshal2,
+// IWeakReferenceSource, IDispatch, IPersist, ...) and these others.
+constexpr GUID kSystemInterfaceIds[] = {
+    {0x94ea2b94, 0xe9cc, 0x49e0, {0xc0, 0xff, 0xee, 0x64, 0xca, 0x8f, 0x5b, 0x90}},  // IAgileObject
+    {0xecc8691b, 0xc1db, 0x4dc0, {0x85, 0x5e, 0x65, 0xf6, 0xc5, 0x51, 0xaf, 0x49}},  // INoMarshal
+    {0x1c733a30, 0x2a1c, 0x11ce, {0xad, 0xe5, 0x00, 0xaa, 0x00, 0x44, 0x77, 0x3d}},  // ICallFactory
+    {0xaf86e2e0, 0xb12d, 0x4c6a, {0x9c, 0x5a, 0xd7, 0xaa, 0x65, 0x10, 0x1e, 0x90}},  // IInspectable
+    {0xdf0b3d60, 0x548f, 0x101b, {0x8e, 0x65, 0x08, 0x00, 0x2b, 0x2b, 0xd1, 0x19}},  // ISupportErrorInfo
+    {0xb196b283, 0xbab4, 0x101a, {0xb6, 0x9c, 0x00, 0xaa, 0x00, 0x34, 0x1d, 0x07}},  // IProvideClassInfo
+    {0xb196b284, 0xbab4, 0x101a, {0xb6, 0x9c, 0x00, 0xaa, 0x00, 0x34, 0x1d, 0x07}},  // IConnectionPointContainer
+    {0xfc4801a3, 0x2ba9, 0x11cf, {0xa2, 0x29, 0x00, 0xaa, 0x00, 0x3d, 0x73, 0x52}},  // IObjectWithSite
+};
+
+bool system_interface(const GUID& g) {
+    static const uint8_t kComBase[8] = {0xc0, 0, 0, 0, 0, 0, 0, 0x46};
+    if (g.Data2 == 0 && g.Data3 == 0 && std::memcmp(g.Data4, kComBase, 8) == 0) return true;
+    for (const GUID& s : kSystemInterfaceIds)
+        if (same_guid(g, s)) return true;
+    return false;
+}
+
+// The ids declared for a kind: the PC IDStorageStatusArray id, whose interface has the console one's shape (console
+// D3D12 binaries reuse the PC SDK's ids). No other X interface id is known.
+bool declared(const GUID& g, Kind kind) {
+    for (const GUID& id : kStatusArrayIds)
+        if (same_guid(g, id)) return kind == Kind::StatusArray;
+    return false;
+}
+
+bool declared_for_any(const GUID& g) {
+    for (const GUID& id : kStatusArrayIds)
+        if (same_guid(g, id)) return true;
+    return false;
+}
+
+class IidPolicy {
+public:
+    bool accept_creating(REFIID riid, Kind kind, const char* caller) {
+        if (same_guid(riid, __uuidof(IUnknown)) || declared(riid, kind)) return true;
+        if (system_interface(riid)) return refuse(riid, caller, "a system COM interface");
+        if (declared_for_any(riid)) return refuse(riid, caller, "an id declared for another kind of object");
+        for (const GUID& pc : kPcInterfaceIds)
+            if (same_guid(riid, pc))
+                return refuse(riid, caller, "a PC DirectStorage interface; only the console ABI is served");
+        std::lock_guard lock(mutex_);
+        for (const auto& [id, k] : learned_)
+            if (same_guid(id, riid)) {
+                if (k == kind) return true;
+                return refuse(riid, caller, std::string("seen before as a ") + kind_name(k) + " interface");
+            }
+        learned_.push_back({riid, kind});
+        log_once("learn" + guid_text(riid), std::string(caller) + " asked for " + guid_text(riid) + ": serving the " +
+                                                kind_name(kind) + " interface");
+        return true;
+    }
+
+    bool accept_query(REFIID riid, Kind kind, const char* caller) {
+        if (same_guid(riid, __uuidof(IUnknown)) || declared(riid, kind)) return true;
+        {
+            std::lock_guard lock(mutex_);
+            for (const auto& [id, k] : learned_)
+                if (same_guid(id, riid) && k == kind) return true;
+        }
+        return refuse(riid, caller, std::string("not an id a ") + kind_name(kind) + " was created with");
+    }
+
+private:
+    static bool refuse(REFIID riid, const char* caller, const std::string& why) {
+        log_once(std::string("refuse") + caller + guid_text(riid),
+                 std::string(caller) + " asked for " + guid_text(riid) + ": " + why + " (E_NOINTERFACE)");
+        return false;
+    }
+
+    std::mutex mutex_;
+    std::vector<std::pair<GUID, Kind>> learned_;
+};
+
+IidPolicy& iid_policy() {
+    static auto* p = new IidPolicy;
+    return *p;
+}
+
+// A bad argument to a factory or queue method, logged once per method and kind: a wrong vtable guess for the console
+// interfaces would show up here first, as arguments that make no sense for the method.
+HRESULT bad_call(const char* method, HRESULT hr, const char* what) {
+    log_once(std::string("bad") + method + what,
+             std::string(method) + ": " + what + " (" + hr_text(hr) +
+                 "; logged once; a wrong vtable slot guess would show up like this)");
+    return hr;
+}
+
+// ---- Statistics (IDStorageFactoryX1::GetStats) --------------------------------------------------------------------
+
+struct Stats {
+    std::mutex mutex;
+    DSTORAGE_STATS s{};
+    uint32_t live_queues = 0;  // all priorities; SetStagingBufferSize is refused while queues or files exist
+};
+
+Stats& stats() {
+    static auto* s = new Stats;
+    return *s;
+}
+
+DSTORAGE_PRIORITY_STATS& priority_stats(DSTORAGE_STATS& s, DSTORAGE_PRIORITY p) {
+    switch (p) {
+        case DSTORAGE_PRIORITY_LOW: return s.LowPriorityStats;
+        case DSTORAGE_PRIORITY_HIGH: return s.HighPriorityStats;
+        case DSTORAGE_PRIORITY_REALTIME: return s.RealtimePriorityStats;
+        default: return s.NormalPriorityStats;
+    }
+}
+
+void count_error() {
+    std::lock_guard lock(stats().mutex);
+    ++stats().s.ErrorCount;
+}
+
+// ---- Live objects ---------------------------------------------------------------------------------------------------
+//
+// A request names its file and a status entry its array by pointer. Only objects this shim made and that are still
+// alive are used; anything else is an error in the request, never a call through a stranger's vtable.
+
+std::mutex& live_mutex() {
+    static auto* m = new std::mutex;
+    return *m;
+}
+// One set per kind, so a status array passed as a file (or the other way round) is not found.
+std::unordered_set<const void*>& live_files() {
+    static auto* s = new std::unordered_set<const void*>;
+    return *s;
+}
+std::unordered_set<const void*>& live_status_arrays() {
+    static auto* s = new std::unordered_set<const void*>;
+    return *s;
+}
+
+// AddRef only if the count has not reached zero (an object being released is not revived).
+bool add_ref_if_live(std::atomic<ULONG>& refs) {
+    ULONG r = refs.load();
+    while (r != 0)
+        if (refs.compare_exchange_weak(r, r + 1)) return true;
+    return false;
+}
+
+// ---- Status arrays ------------------------------------------------------------------------------------------------
+
+class StatusArray final : public IDStorageStatusArrayX {
+public:
+    StatusArray(uint32_t capacity, std::unique_ptr<std::atomic<HRESULT>[]> entries)
+        : capacity_(capacity), entries_(std::move(entries)) {
+        for (uint32_t i = 0; i < capacity_; ++i) entries_[i].store(S_OK, std::memory_order_relaxed);
+        std::lock_guard lock(live_mutex());
+        live_status_arrays().insert(static_cast<IDStorageStatusArrayX*>(this));
+    }
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override {
+        if (!ppv) return E_POINTER;
+        *ppv = nullptr;
+        if (!iid_policy().accept_query(riid, Kind::StatusArray, "IDStorageStatusArrayX::QueryInterface"))
+            return E_NOINTERFACE;
+        AddRef();
+        *ppv = static_cast<IDStorageStatusArrayX*>(this);
+        return S_OK;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return ++refs_; }
+    ULONG STDMETHODCALLTYPE Release() override {
+        ULONG r;
+        {
+            std::lock_guard lock(live_mutex());
+            r = --refs_;
+            if (r == 0) live_status_arrays().erase(static_cast<IDStorageStatusArrayX*>(this));
+        }
+        if (r == 0) delete this;
+        return r;
+    }
+
+    // IsComplete is GetHResult(index) != E_PENDING (the reference says so); an index past the array is not pending.
+    bool STDMETHODCALLTYPE IsComplete(UINT32 index) override { return GetHResult(index) != E_PENDING; }
+    HRESULT STDMETHODCALLTYPE GetHResult(UINT32 index) override {
+        if (index >= capacity_) return E_DSTORAGE_INDEX_BOUND;
+        return entries_[index].load(std::memory_order_acquire);
+    }
+
+    uint32_t capacity() const { return capacity_; }
+    void set_pending(uint32_t index) { entries_[index].store(E_PENDING, std::memory_order_release); }
+    void complete(uint32_t index, HRESULT hr) { entries_[index].store(hr, std::memory_order_release); }
+    std::atomic<ULONG>& refs() { return refs_; }
+
+private:
+    std::atomic<ULONG> refs_{1};
+    const uint32_t capacity_;
+    std::unique_ptr<std::atomic<HRESULT>[]> entries_;
+};
+
+// ---- Files --------------------------------------------------------------------------------------------------------
+
+HANDLE open_title_file(const WCHAR* path);
+
+// Host file IO policy; the numbers behind it are in port/io_bench/STATUS.md. The environment overrides each field.
+struct IoPolicy {
+    bool nocache = true;
+    int rdahead = -1;
+    int advise = 0;
+    size_t depth = 32;
+    unsigned pool = 0;
+    int qos = 0;
+    size_t chunk = 0;
+};
+
+long env_long(const char* name, long fallback) {
+    const std::string v = rt::gdk::env_or(name);
+    if (v.empty()) return fallback;
+    char* end = nullptr;
+    const long n = std::strtol(v.c_str(), &end, 10);
+    return end && !*end ? n : fallback;
+}
+
+const IoPolicy& io_policy() {
+    static const IoPolicy policy = [] {
+        IoPolicy p;
+        p.nocache = env_long("LEONIDA_DSTORAGE_NOCACHE", p.nocache) != 0;
+        p.rdahead = static_cast<int>(env_long("LEONIDA_DSTORAGE_RDAHEAD", p.rdahead));
+        p.advise = static_cast<int>(std::max(0l, env_long("LEONIDA_DSTORAGE_ADVISE", p.advise)));
+        p.depth = static_cast<size_t>(std::clamp(env_long("LEONIDA_DSTORAGE_DEPTH", static_cast<long>(p.depth)), 1l, 128l));
+        const long hw = static_cast<long>(std::thread::hardware_concurrency());
+        const long pool = env_long("LEONIDA_DSTORAGE_POOL", std::clamp(std::max(1l, hw) * 3 / 2, 8l, 32l));
+        p.pool = static_cast<unsigned>(std::clamp(pool, 0l, 64l));
+#if defined(__x86_64__)
+        p.chunk = size_t{1} << 20;  // under Rosetta F_NOCACHE holds only for the first MiB of one pread
+#endif
+        if (const long kib = env_long("LEONIDA_DSTORAGE_READ_CHUNK_KIB", -1); kib >= 0) p.chunk = static_cast<size_t>(kib) << 10;
+        const std::string qos = rt::gdk::env_or("LEONIDA_DSTORAGE_POOL_QOS");
+        if (qos == "utility") p.qos = QOS_CLASS_UTILITY;
+        else if (qos == "initiated") p.qos = QOS_CLASS_USER_INITIATED;
+        else if (qos == "background") p.qos = QOS_CLASS_BACKGROUND;
+        const std::string workers = rt::gdk::env_or("LEONIDA_DSTORAGE_WORKERS");
+        if (workers == "0" || workers == "1") p.pool = 0;
+        return p;
+    }();
+    return policy;
+}
+
+// Needs the gta6rt.internal!FileNativeFd row from shims_core; without it the descriptor is -1 and reads take the old path.
+int native_fd_of(HANDLE h) {
+    using Fn = int(WINAPI*)(HANDLE);
+    static void* const fn = rt::shims::find("gta6rt.internal", "FileNativeFd");
+    return fn ? reinterpret_cast<Fn>(fn)(h) : -1;
+}
+
+class File final : public IDStorageFileX {
+public:
+    File(HANDLE handle, std::u16string path) : handle_(handle), path_(std::move(path)), fd_(native_fd_of(handle)) {
+        if (fd_ >= 0) {
+            const IoPolicy& p = io_policy();
+            if (p.nocache) fcntl(fd_, F_NOCACHE, 1);
+            if (p.rdahead >= 0) fcntl(fd_, F_RDAHEAD, p.rdahead);
+        }
+        {
+            std::lock_guard lock(live_mutex());
+            live_files().insert(static_cast<IDStorageFileX*>(this));
+        }
+        std::lock_guard lock(stats().mutex);
+        auto& s = stats().s;
+        ++s.CurrentOpenFileCount;
+        ++s.CumulativeOpenFileCount;
+        s.MaxOpenFileCount = std::max(s.MaxOpenFileCount, s.CurrentOpenFileCount);
+    }
+    ~File() {
+        Close();
+        std::lock_guard lock(stats().mutex);
+        --stats().s.CurrentOpenFileCount;
+    }
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override {
+        if (!ppv) return E_POINTER;
+        *ppv = nullptr;
+        if (!iid_policy().accept_query(riid, Kind::File, "IDStorageFileX::QueryInterface")) return E_NOINTERFACE;
+        AddRef();
+        *ppv = static_cast<IDStorageFileX*>(this);
+        return S_OK;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return ++refs_; }
+    ULONG STDMETHODCALLTYPE Release() override {
+        ULONG r;
+        {
+            std::lock_guard lock(live_mutex());
+            r = --refs_;
+            if (r == 0) live_files().erase(static_cast<IDStorageFileX*>(this));
+        }
+        if (r == 0) delete this;
+        return r;
+    }
+
+    // Waits for the submitted requests that read this file, then closes the handle. A request submitted later fails
+    // with E_DSTORAGE_FILE_NOT_OPEN. Waiting only for submitted requests keeps a Close from blocking forever on a
+    // request that sits unsubmitted in a queue with auto-submit disabled.
+    void STDMETHODCALLTYPE Close() override {
+        std::unique_lock lock(mutex_);
+        closed_ = true;
+        idle_.wait(lock, [&] { return pending_ == 0; });
+        if (handle_ != INVALID_HANDLE_VALUE) {
+            CloseHandle(handle_);
+            handle_ = INVALID_HANDLE_VALUE;
+        }
+    }
+
+    // A new handle the caller closes (GENERIC_READ, FILE_SHARE_READ, as the reference describes it): the path opened
+    // again, not a duplicate, which would share the file position with the shim's own reads.
+    HANDLE STDMETHODCALLTYPE GetHandle() override {
+        {
+            std::lock_guard lock(mutex_);
+            if (closed_ || handle_ == INVALID_HANDLE_VALUE) {
+                SetLastError(ERROR_INVALID_HANDLE);
+                return INVALID_HANDLE_VALUE;
+            }
+        }
+        return open_title_file(path_.c_str());
+    }
+
+    // Called when a request naming this file is submitted. False once the file is closed.
+    bool add_pending() {
+        std::lock_guard lock(mutex_);
+        if (closed_) return false;
+        ++pending_;
+        return true;
+    }
+    void finish_pending() {
+        std::lock_guard lock(mutex_);
+        if (--pending_ == 0) idle_.notify_all();
+    }
+    // Valid while the caller holds a pending count: Close does not close the handle before it drops to zero.
+    HANDLE handle() const { return handle_; }
+    const std::u16string& path() const { return path_; }
+    std::atomic<ULONG>& refs() { return refs_; }
+    int native_fd() const { return fd_; }
+    std::atomic<uint64_t>& size_cache() { return size_; }
+    void advise(uint64_t offset, uint32_t bytes) const {
+        if (fd_ < 0 || !bytes) return;
+        radvisory ra;
+        ra.ra_offset = static_cast<off_t>(offset);
+        ra.ra_count = static_cast<int>((std::min<uint32_t>)(bytes, 0x7fffffffu));
+        fcntl(fd_, F_RDADVISE, &ra);
+    }
+
+private:
+    std::atomic<ULONG> refs_{1};
+    std::mutex mutex_;
+    std::condition_variable idle_;
+    HANDLE handle_;
+    const std::u16string path_;
+    const int fd_;
+    std::atomic<uint64_t> size_{0};
+    uint32_t pending_ = 0;
+    bool closed_ = false;
+};
+
+StatusArray* live_status_array(IDStorageStatusArrayX* p) {
+    std::lock_guard lock(live_mutex());
+    if (!p || !live_status_arrays().count(p)) return nullptr;
+    auto* a = static_cast<StatusArray*>(p);
+    return add_ref_if_live(a->refs()) ? a : nullptr;
+}
+
+File* live_file(IDStorageFileX* p) {
+    std::lock_guard lock(live_mutex());
+    if (!p || !live_files().count(p)) return nullptr;
+    auto* f = static_cast<File*>(p);
+    return add_ref_if_live(f->refs()) ? f : nullptr;
+}
+
+// ---- Reads --------------------------------------------------------------------------------------------------------
+
+bool guarded_move(void* destination, const void* source, size_t size) {
+    return rt::gdk::guarded_copy(destination, source, size);
+}
+
+// A copy into a request's destination, title memory: through the D3D12 layer's hook when it registered one (a page it
+// keeps read-only is opened and pinned first, and its GPU copies take the bytes at the next submission), else a plain
+// guarded copy. False only when the copy faults.
+bool title_write(void* destination, const void* source, size_t size) {
+    return rt::gdk::title_write(destination, source, size);
+}
+
+uint64_t tick_ms() {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+HRESULT read_error(DWORD error) {
+    switch (error) {
+        case ERROR_NOACCESS:
+        case ERROR_INVALID_USER_BUFFER: return E_DSTORAGE_ACCESS_VIOLATION;
+        case ERROR_HANDLE_EOF: return E_DSTORAGE_END_OF_FILE;
+        default: return HRESULT_FROM_WIN32(error);
+    }
+}
+
+bool extended_enabled() {
+    static const bool enabled = rt::gdk::env_or("LEONIDA_DSTORAGE_EXTENDED") != "0";
+    return enabled;
+}
+
+// Calibrated predictor values stay in a local sidecar. Absent or invalid files retain the built-in codec policy.
+// The folder make_game recorded in shader_path.txt next to the host executable, or LEONIDA_SHADERS; empty without one.
+std::filesystem::path shader_directory() {
+    try {
+        const std::string configured = rt::gdk::env_or("LEONIDA_SHADERS");
+        if (!configured.empty()) return std::filesystem::path(configured);
+        char exe[4096];
+        uint32_t size = sizeof exe;
+        if (_NSGetExecutablePath(exe, &size) != 0) return {};
+        std::ifstream file(std::filesystem::path(exe).parent_path() / "shader_path.txt", std::ios::binary);
+        if (!file) return {};
+        const std::string text{std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()};
+        if (text.empty() || text.find('\0') != std::string::npos) return {};
+        return std::filesystem::path(text);
+    } catch (const std::exception&) {
+        return {};
+    }
+}
+
+// Calibrated predictor values stay in a local sidecar. Absent or invalid files retain the built-in codec policy.
+const leonida::bcpack::Calibration* bcpack_history() {
+    static const auto profile = []() -> std::unique_ptr<leonida::bcpack::Calibration> {
+        const std::string explicit_path = rt::gdk::env_or("LEONIDA_DSTORAGE_HISTORY");
+        std::filesystem::path path;
+        if (!explicit_path.empty()) {
+            if (explicit_path == "0") return {};
+            path = explicit_path;
+        } else {
+            auto shaders = shader_directory();
+            if (shaders.empty()) {
+                log_once("history-nodir", "no shader folder (LEONIDA_SHADERS, shader_path.txt) to find <shader folder parent>/bcpack/history.bcph in: BC6H and BC7 requests fail with missing-profile");
+                return {};
+            }
+            if (!shaders.has_filename()) shaders = shaders.parent_path();
+            path = shaders.parent_path() / "bcpack" / "history.bcph";
+        }
+        std::unique_ptr<FILE, decltype(&std::fclose)> file(std::fopen(path.c_str(), "rb"), &std::fclose);
+        FILE* raw = file.get();
+        if (!raw) {
+            log_once("history-open", "could not open the local BCPack predictor profile " + path.string() +
+                     ": BC6H and BC7 requests fail with missing-profile until port/io_bench/scripts/ensure_bcpack_history.sh has written it");
+            return {};
+        }
+        auto table = std::make_unique<leonida::bcpack::Calibration>();
+        char magic[8];
+        if (std::fread(magic, 1, sizeof magic, raw) != sizeof magic || std::memcmp(magic, "BCPHIST1", 8) ||
+            std::fread(table.get(), 1, sizeof *table, raw) != sizeof *table || std::fgetc(raw) != EOF || std::ferror(raw)) {
+            log_once("history-format", "invalid local BCPack predictor profile");
+            return {};
+        }
+        unsigned bc6_ep = 0, bc6_ix = 0, bc7_ep = 0, bc7_ix = 0;
+        for (const auto& row : table->bc6) {
+            bc6_ep += row.ep_class != 0;
+            bc6_ix += row.ix_class != 0;
+        }
+        for (const auto& row : table->bc7) {
+            bc7_ep += unsigned(std::count_if(row.ep_bits.begin(), row.ep_bits.end(), [](auto v) {return v != 0;}));
+            bc7_ix += unsigned(std::count_if(row.ix_bits.begin(), row.ix_bits.end(), [](auto v) {return v != 0;}));
+        }
+        log_once("history-ok", std::string("loaded ") + (!explicit_path.empty() ? "explicit" : "default") + " BCPack profile; BC6H endpoint/index rows " +
+                 std::to_string(bc6_ep) + "/256 " + std::to_string(bc6_ix) + "/256; BC7 endpoint/index fields " +
+                 std::to_string(bc7_ep) + "/6144 " + std::to_string(bc7_ix) + "/8192");
+        return table;
+    }();
+    return profile.get();
+}
+
+// ---- Positional reads over the title's file handle ------------------------------------------------------------------
+//
+// The handle came from the title's own CreateFileW, so only the registered kernel32 rows know what it is (shims_core
+// keeps its own file object behind it). Size and reads go through those rows; ReadFile with an OVERLAPPED offset is a
+// positional read that leaves the handle's file position alone. Without a registered row the plain Win32 calls serve.
+
+using GetFileSizeExFn = BOOL(WINAPI*)(HANDLE, LARGE_INTEGER*);
+using ReadFileFn = BOOL(WINAPI*)(HANDLE, LPVOID, DWORD, LPDWORD, LPOVERLAPPED);
+
+GetFileSizeExFn get_file_size_ex_fn() {
+    if (void* fn = rt::shims::find("kernel32.dll", "GetFileSizeEx")) return reinterpret_cast<GetFileSizeExFn>(fn);
+    return &::GetFileSizeEx;
+}
+
+ReadFileFn read_file_fn() {
+    if (void* fn = rt::shims::find("kernel32.dll", "ReadFile")) return reinterpret_cast<ReadFileFn>(fn);
+    return &::ReadFile;
+}
+
+bool file_size_of(HANDLE handle, uint64_t& size, DWORD& error) {
+    LARGE_INTEGER length{};
+    if (!get_file_size_ex_fn()(handle, &length)) {
+        error = GetLastError();
+        return false;
+    }
+    size = static_cast<uint64_t>(length.QuadPart);
+    return true;
+}
+
+// Bytes read (0 at end of file), or -1 with `error` set. Reads at most 1 GiB per call.
+int64_t pread_at(HANDLE handle, uint64_t offset, void* buffer, size_t bytes, DWORD& error) {
+    bytes = (std::min<size_t>)(bytes, size_t{1} << 30);
+    OVERLAPPED at{};
+    at.Offset = static_cast<DWORD>(offset);
+    at.OffsetHigh = static_cast<DWORD>(offset >> 32);
+    DWORD got = 0;
+    errno = 0;
+    if (!read_file_fn()(handle, buffer, static_cast<DWORD>(bytes), &got, &at)) {
+        const int saved_errno = errno;
+        error = GetLastError();
+        if (error == ERROR_HANDLE_EOF) return 0;
+        // shims_core reports a pread EFAULT (an unwritable destination) as the generic failure, errno still holds it
+        if (saved_errno == EFAULT) error = ERROR_NOACCESS;
+        return -1;
+    }
+    return got;
+}
+
+// pread on the native descriptor when there is one, else through the kernel32 rows.
+int64_t pread_file(File& file, uint64_t offset, void* buffer, size_t bytes, DWORD& error) {
+    const int fd = file.native_fd();
+    if (fd < 0) return pread_at(file.handle(), offset, buffer, bytes, error);
+    bytes = (std::min<size_t>)(bytes, size_t{1} << 30);
+    if (const size_t chunk = io_policy().chunk; chunk && io_policy().nocache) bytes = (std::min)(bytes, chunk);
+    for (;;) {
+        const ssize_t n = ::pread(fd, buffer, bytes, static_cast<off_t>(offset));
+        if (n >= 0) return n;
+        if (errno == EINTR) continue;
+        error = errno == EFAULT ? ERROR_NOACCESS : ERROR_READ_FAULT;
+        return -1;
+    }
+}
+
+// Reads exactly "size" bytes at "offset" of the file into "destination". A Title destination is title memory, which a
+// kernel write cannot fault in (xmem pages that wait for their first touch): a failed read is retried once after
+// rt::xmem::commit_physical_range. When the D3D12 layer registered a write hook, the bytes go through a private
+// chunk and that hook, so pages it keeps read-only are opened and pinned first.
+enum class ReadTarget { Title, Staging };
+HRESULT read_file_range(File& file, uint64_t offset, void* destination, uint32_t size, ReadTarget target) {
+    uint64_t file_size = file.size_cache().load(std::memory_order_relaxed);
+    DWORD error = 0;
+    if (offset > file_size || size > file_size - offset) {
+        if (!file_size_of(file.handle(), file_size, error)) return HRESULT_FROM_WIN32(error);
+        file.size_cache().store(file_size, std::memory_order_relaxed);
+    }
+    if (offset > file_size || size > file_size - offset) return E_DSTORAGE_END_OF_FILE;
+    auto* out = static_cast<uint8_t*>(destination);
+    const bool bounce = target == ReadTarget::Title && rt::gdk::title_write_hook_installed();
+    std::vector<uint8_t> chunk(bounce ? (std::min<size_t>)(size, size_t{1} << 20) : 0);
+    uint32_t done = 0;
+    while (done < size) {
+        const size_t want = bounce ? (std::min<size_t>)(chunk.size(), size - done) : size - done;
+        void* into = bounce ? static_cast<void*>(chunk.data()) : out + done;
+        int64_t got = pread_file(file, offset + done, into, want, error);
+        if (got < 0 && error == ERROR_NOACCESS && target == ReadTarget::Title) {
+            rt::gdk::title_commit(out + done, size - done);
+            got = pread_file(file, offset + done, into, want, error);
+        }
+        if (got < 0) return read_error(error);
+        if (got == 0) return E_DSTORAGE_END_OF_FILE;  // the file shrank since the size check
+        if (bounce && !title_write(out + done, chunk.data(), static_cast<size_t>(got))) return E_DSTORAGE_ACCESS_VIOLATION;
+        done += static_cast<uint32_t>(got);
+    }
+    return S_OK;
+}
+
+// ---- Queues -------------------------------------------------------------------------------------------------------
+
+// Only sampled when LEONIDA_DSTORAGE_TRACE or LEONIDA_DSTORAGE_SHAPES is set. Times include work done by the file/decode worker.
+struct Timing {
+    using Clock = std::chrono::steady_clock;
+    long long read{}, inflate{}, bcpack{}, copy{}, unshuffle{};
+    static bool sampled() {
+        static const bool on = leonida::dstorage::trace_enabled() || leonida::dstorage::shapes::enabled();
+        return on;
+    }
+    static Clock::time_point start() {
+        return sampled() ? Clock::now() : Clock::time_point{};
+    }
+    static long long elapsed(Clock::time_point begin) {
+        return sampled() ? std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - begin).count() : 0;
+    }
+};
+struct Entry {
+    Timing timing;
+    const char* reason = "none";
+    enum class Type { Request, Status, Signal, Event } type = Type::Request;
+    DSTORAGE_REQUEST request{};
+    File* file = nullptr;          // a reference, for a file request naming a live file
+    bool file_counted = false;     // the file's pending count was raised at submit
+    bool cancelled = false;        // CancelRequestsWithTag matched it before it started
+    bool counted = false;          // a request the title passed: counted in the statistics when it is submitted
+    bool advised = false;          // F_RDADVISE issued for its range
+    uint64_t seq = 0;              // shape log: the request's number on its queue
+    uint64_t enqueued_us = 0;      // shape log: when EnqueueRequest took it
+    HRESULT enqueue_error = S_OK;  // found at enqueue: reported when the entry is reached, in order
+    StatusArray* status = nullptr;  // a reference
+    IDStorageStatusArrayX* status_as_given = nullptr;
+    uint32_t index = 0;
+    ID3D12Fence* fence = nullptr;  // a reference
+    uint64_t value = 0;
+    HANDLE event = nullptr;  // a duplicate the entry owns
+};
+
+// Shared by every queue: the read and decode half of a request. Publishing and notifying stay on the queue thread.
+class PreparePool {
+public:
+    static PreparePool& get() {
+        static auto* pool = new PreparePool;
+        return *pool;
+    }
+    bool usable() const { return started_ > 0; }
+    void post(std::function<void()> job) {
+        {
+            std::lock_guard lock(mutex_);
+            jobs_.push_back(std::move(job));
+        }
+        ready_.notify_one();
+    }
+
+private:
+    PreparePool() {
+        for (unsigned i = 0; i < io_policy().pool; ++i) {
+            rt::gdk::Thread t;
+            if (!rt::gdk::Thread::start(t, [this] { loop(); }, "dstorage prepare")) break;
+            t.detach();
+            ++started_;
+        }
+    }
+    void loop() {
+        if (io_policy().qos) pthread_set_qos_class_self_np(static_cast<qos_class_t>(io_policy().qos), 0);
+        std::unique_lock lock(mutex_);
+        for (;;) {
+            ready_.wait(lock, [&] { return !jobs_.empty(); });
+            auto job = std::move(jobs_.front());
+            jobs_.pop_front();
+            lock.unlock();
+            job();
+            lock.lock();
+        }
+    }
+
+    std::mutex mutex_;
+    std::condition_variable ready_;
+    std::deque<std::function<void()>> jobs_;
+    unsigned started_ = 0;
+};
+
+class Queue final : public IDStorageQueueX2 {
+public:
+    explicit Queue(const DSTORAGE_QUEUE_DESC1& desc) : desc_(desc) {
+        error_event_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        clear_record_locked();
+        std::lock_guard lock(stats().mutex);
+        auto& p = priority_stats(stats().s, desc_.Priority);
+        ++p.CurrentQueueCount;
+        ++p.CumulativeQueueCount;
+        p.MaxQueueCount = std::max(p.MaxQueueCount, p.CurrentQueueCount);
+        ++stats().live_queues;
+    }
+    // Separate from the constructor so a failure to start the thread can be reported.
+    bool start() {
+        if (!error_event_) return false;
+        pool_ = io_policy().pool && PreparePool::get().usable();
+        if (leonida::dstorage::shapes::enabled())
+            leonida::dstorage::shapes::record("Q\t%llu\t%p\t%s\t%u\t%d\t%d\t%s\t%llu", static_cast<unsigned long long>(leonida::dstorage::shapes::now_us()),
+                                              static_cast<void*>(this), desc_.SourceType == DSTORAGE_REQUEST_SOURCE_FILE ? "file" : "mem",
+                                              unsigned(desc_.Capacity), int(desc_.Priority), int(desc_.Options.AutoSubmitDisabled),
+                                              desc_.Name ? desc_.Name : "-", static_cast<unsigned long long>(leonida::dstorage::shapes::thread_id()));
+        return rt::gdk::Thread::start(worker_, [this] { run(); }, "dstorage queue");
+    }
+    ~Queue() {
+        Close();
+        if (leonida::dstorage::shapes::enabled())
+            leonida::dstorage::shapes::record("Z\t%llu\t%p\t%llu\t%llu\t%zu", static_cast<unsigned long long>(leonida::dstorage::shapes::now_us()),
+                                              static_cast<void*>(this), static_cast<unsigned long long>(seq_),
+                                              static_cast<unsigned long long>(source_bytes_total_), max_window_);
+        if (error_event_) CloseHandle(error_event_);
+        std::lock_guard lock(stats().mutex);
+        --priority_stats(stats().s, desc_.Priority).CurrentQueueCount;
+        --stats().live_queues;
+    }
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override {
+        if (!ppv) return E_POINTER;
+        *ppv = nullptr;
+        if (!iid_policy().accept_query(riid, Kind::Queue, "IDStorageQueueX::QueryInterface")) return E_NOINTERFACE;
+        AddRef();
+        *ppv = static_cast<IDStorageQueueX2*>(this);
+        return S_OK;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return ++refs_; }
+    // The last Release closes the queue, which runs everything enqueued first.
+    ULONG STDMETHODCALLTYPE Release() override {
+        const ULONG r = --refs_;
+        if (r == 0) delete this;
+        return r;
+    }
+
+    void STDMETHODCALLTYPE EnqueueRequest(const DSTORAGE_REQUEST* request) override {
+        Entry e;
+        e.type = Entry::Type::Request;
+        if (!request) {
+            e.enqueue_error = bad_call("IDStorageQueueX::EnqueueRequest", E_INVALIDARG, "null request");
+        } else {
+            e.request = *request;  // the title may reuse its structure as soon as this returns
+            const uint64_t o = e.request.Options.AsUINT64;
+            if (options::source_type(o) == DSTORAGE_REQUEST_SOURCE_FILE &&
+                desc_.SourceType == DSTORAGE_REQUEST_SOURCE_FILE && e.request.File) {
+                e.file = live_file(e.request.File);
+                if (!e.file) e.enqueue_error = E_DSTORAGE_INVALID_FILE_HANDLE;
+            }
+            e.counted = true;  // TotalRequestCount is "submitted requests" (DSTORAGE_PRIORITY_STATS): see submit_locked
+            if (leonida::dstorage::shapes::enabled()) e.enqueued_us = leonida::dstorage::shapes::now_us();
+        }
+        enqueue(std::move(e));
+    }
+
+    void STDMETHODCALLTYPE EnqueueStatus(IDStorageStatusArrayX* status_array, UINT32 index) override {
+        Entry e;
+        e.type = Entry::Type::Status;
+        e.status_as_given = status_array;
+        e.index = index;
+        e.status = live_status_array(status_array);
+        if (!e.status) {
+            e.enqueue_error = E_DSTORAGE_INVALID_STATUS_ARRAY;
+        } else if (index >= e.status->capacity()) {
+            e.enqueue_error = E_DSTORAGE_INDEX_BOUND;
+        } else {
+            e.status->set_pending(index);  // polling after this call sees E_PENDING until the entry is reached
+        }
+        {
+            std::lock_guard lock(stats().mutex);
+            ++priority_stats(stats().s, desc_.Priority).TotalStatusCount;
+        }
+        enqueue(std::move(e));
+    }
+
+    void STDMETHODCALLTYPE EnqueueSignal(ID3D12Fence* fence, UINT64 value) override {
+        Entry e;
+        e.type = Entry::Type::Signal;
+        e.fence = fence;
+        e.value = value;
+        if (fence) {
+            fence->AddRef();
+        } else {
+            e.enqueue_error = E_DSTORAGE_INVALID_FENCE;
+        }
+        {
+            std::lock_guard lock(stats().mutex);
+            ++priority_stats(stats().s, desc_.Priority).TotalFenceCount;
+        }
+        enqueue(std::move(e));
+    }
+
+    // The handle is duplicated here and the duplicate closed once it has been set (or dropped), so an event the
+    // title closes, and whose handle value is then reused for another object, is never the one set.
+    void STDMETHODCALLTYPE EnqueueSetEvent(HANDLE handle) override {
+        Entry e;
+        e.type = Entry::Type::Event;
+        if (!handle) {
+            e.enqueue_error = bad_call("IDStorageQueueX1::EnqueueSetEvent", HRESULT_FROM_WIN32(ERROR_INVALID_HANDLE),
+                                       "null event handle");
+        } else if (!DuplicateHandle(GetCurrentProcess(), handle, GetCurrentProcess(), &e.event, 0, FALSE,
+                                    DUPLICATE_SAME_ACCESS)) {
+            e.event = nullptr;
+            e.enqueue_error = HRESULT_FROM_WIN32(GetLastError());
+        }
+        enqueue(std::move(e));
+    }
+
+    void STDMETHODCALLTYPE Submit() override {
+        std::lock_guard lock(mutex_);
+        submit_locked();
+    }
+
+    // Marks the requests enqueued before this call that have not started. A cancelled request completes as a success
+    // without being read (the overview: the title may no longer use its result).
+    void STDMETHODCALLTYPE CancelRequestsWithTag(UINT64 mask, UINT64 value) override {
+        std::lock_guard lock(mutex_);
+        unsigned matched = 0;
+        for (Entry& e : entries_)
+            if (e.type == Entry::Type::Request && (e.request.CancellationTag & mask) == value) e.cancelled = true, ++matched;
+        for (auto& s : window_)
+            if (!s->started && s->entry.type == Entry::Type::Request && (s->entry.request.CancellationTag & mask) == value) s->entry.cancelled = true, ++matched;
+        if (leonida::dstorage::shapes::enabled())
+            leonida::dstorage::shapes::record("X\t%llu\t%p\t%llx\t%llx\t%u", static_cast<unsigned long long>(leonida::dstorage::shapes::now_us()),
+                                              static_cast<void*>(this), static_cast<unsigned long long>(mask), static_cast<unsigned long long>(value), matched);
+    }
+
+    // Submits what is enqueued, waits until the worker has run all of it and stops the worker. Later enqueues are
+    // dropped and recorded as E_DSTORAGE_QUEUE_CLOSED.
+    void STDMETHODCALLTYPE Close() override {
+        std::lock_guard close_lock(close_mutex_);
+        {
+            std::unique_lock lock(mutex_);
+            if (closed_) return;
+            closing_ = true;
+            submit_locked();
+            space_.notify_all();  // an enqueue waiting for space gives up (the queue is closing)
+            idle_.wait(lock, [&] { return entries_.empty() && !in_flight_; });
+            closed_ = true;
+            work_.notify_all();
+        }
+        if (worker_.joinable()) worker_.join();
+    }
+
+    HANDLE STDMETHODCALLTYPE GetErrorEvent() override {
+        HANDLE dup = nullptr;
+        if (!error_event_ || !DuplicateHandle(GetCurrentProcess(), error_event_, GetCurrentProcess(), &dup, 0, FALSE,
+                                              DUPLICATE_SAME_ACCESS))
+            return nullptr;
+        return dup;  // the reference says the title closes it
+    }
+
+    void STDMETHODCALLTYPE RetrieveErrorRecord(DSTORAGE_ERROR_RECORD* record) override {
+        if (!record) {
+            bad_call("IDStorageQueueX::RetrieveErrorRecord", E_POINTER, "null record");
+            return;
+        }
+        std::lock_guard lock(error_mutex_);
+        *record = record_;
+        clear_record_locked();
+        if (error_event_) ResetEvent(error_event_);
+    }
+
+    void STDMETHODCALLTYPE Query(DSTORAGE_QUEUE_INFO* info) override {
+        if (!info) {
+            bad_call("IDStorageQueueX::Query", E_POINTER, "null info");
+            return;
+        }
+        DSTORAGE_QUEUE_INFO1 full{};
+        Query1(&full);
+        info->Desc.SourceType = full.Desc.SourceType;
+        info->Desc.Capacity = full.Desc.Capacity;
+        info->Desc.Priority = full.Desc.Priority;
+        info->Desc.Name = full.Desc.Name;
+        info->EmptySlotCount = full.EmptySlotCount;
+        info->RequestCountUntilAutoSubmit = full.RequestCountUntilAutoSubmit;
+    }
+
+    // An empty queue has capacity - 1 empty slots (one slot tells empty from full). The automatic submit happens when
+    // the entries enqueued since the last submit reach half the capacity; with it disabled the count is 0.
+    void STDMETHODCALLTYPE Query1(DSTORAGE_QUEUE_INFO1* info) override {
+        if (!info) {
+            bad_call("IDStorageQueueX2::Query1", E_POINTER, "null info");
+            return;
+        }
+        std::lock_guard lock(mutex_);
+        info->Desc = desc_;
+        info->EmptySlotCount = static_cast<UINT16>(usable() - used_locked());
+        const size_t unsubmitted = entries_.size() - submitted_;
+        info->RequestCountUntilAutoSubmit =
+            auto_submit() ? static_cast<UINT16>(half() > unsubmitted ? half() - unsubmitted : 0) : 0;
+    }
+
+private:
+    size_t usable() const { return desc_.Capacity - 1u; }
+    size_t half() const { return desc_.Capacity / 2u; }
+    bool auto_submit() const { return !desc_.Options.AutoSubmitDisabled; }
+    size_t used_locked() const { return entries_.size() + in_flight_; }
+
+    void enqueue(Entry&& e) {
+        {
+            std::unique_lock lock(mutex_);
+            // A full queue waits for the worker to free a slot. With auto-submit on, half the queue is always
+            // submitted by then; with it off, only a Submit from another thread frees one (as the reference warns).
+            space_.wait(lock, [&] { return closing_ || used_locked() < usable(); });
+            if (!closing_) {
+                if (e.type == Entry::Type::Request && leonida::dstorage::shapes::enabled()) record_shape_locked(e);
+                entries_.push_back(std::move(e));
+                if (auto_submit() && entries_.size() - submitted_ >= half()) submit_locked();
+                return;
+            }
+        }
+        DSTORAGE_ERROR_FIRST_FAILURE f{};
+        f.HResult = E_DSTORAGE_QUEUE_CLOSED;
+        describe(e, f);
+        record_failure(f);
+        log_once("closed", "an entry was enqueued on a closed queue (E_DSTORAGE_QUEUE_CLOSED); it never completes");
+        release_references(e);
+    }
+
+    void record_shape_locked(Entry& e) {
+        namespace sh = leonida::dstorage::shapes;
+        const auto& r = e.request;
+        const auto o = r.Options.AsUINT64;
+        e.seq = ++seq_;
+        source_bytes_total_ += r.SourceSize;
+        const bool file = e.file != nullptr;
+        sh::record("R\t%llu\t%p\t%llu\t%llu\t%llx\t%s\t%u\t%llu\t%u\t%u\t%u\t%s\t%llx\t%zu",
+                   static_cast<unsigned long long>(e.enqueued_us), static_cast<void*>(this), static_cast<unsigned long long>(e.seq),
+                   static_cast<unsigned long long>(sh::thread_id()), static_cast<unsigned long long>(o), file ? "file" : "mem",
+                   file ? sh::file_id(rt::gdk::to_utf8(e.file->path())) : 0u, static_cast<unsigned long long>(file ? r.FileOffset : 0),
+                   unsigned(r.SourceSize), unsigned(r.IntermediateSize), unsigned(r.DestinationSize),
+                   (o & options::kDestinationPages) ? "pages" : "buf", static_cast<unsigned long long>(r.CancellationTag), used_locked() + 1);
+    }
+
+    void submit_locked() {
+        uint32_t requests = 0;
+        uint64_t source_bytes = 0, destination_bytes = 0;
+        for (size_t i = submitted_; i < entries_.size(); ++i) {
+            Entry& e = entries_[i];
+            if (e.file) e.file_counted = e.file->add_pending();
+            if (e.counted) {
+                ++requests;
+                source_bytes += e.request.SourceSize;
+                destination_bytes += e.request.DestinationSize;
+            }
+        }
+        if (requests && leonida::dstorage::shapes::enabled())
+            leonida::dstorage::shapes::record("S\t%llu\t%p\t%u\t%zu\t%llu\t%llu", static_cast<unsigned long long>(leonida::dstorage::shapes::now_us()),
+                                              static_cast<void*>(this), requests, entries_.size(), static_cast<unsigned long long>(source_bytes),
+                                              static_cast<unsigned long long>(destination_bytes));
+        if (requests) {
+            std::lock_guard stats_lock(stats().mutex);
+            auto& p = priority_stats(stats().s, desc_.Priority);
+            p.TotalRequestCount += requests;
+            p.TotalRequestSourceByteCount += source_bytes;
+            p.TotalRequestDestinationByteCount += destination_bytes;
+        }
+        if (entries_.size() > submitted_) {
+            submitted_ = entries_.size();
+            work_.notify_one();
+        }
+    }
+
+    struct Prepared {
+        Entry& entry;
+        HRESULT result = S_OK;
+        std::vector<uint8_t> bytes;
+    };
+    // The next requests of a queue are read and decoded ahead on the shared pool and published in order.
+    struct Slot {
+        explicit Slot(Entry&& e) : entry(std::move(e)), prepared{entry, S_OK, {}}, lease(leonida::dstorage::staging_pool()) {}
+        Entry entry;
+        Prepared prepared;
+        leonida::dstorage::StagingPool::Lease lease;
+        bool scheduled = false;
+        bool started = false;  // under the queue mutex; a cancel after this no longer applies
+        std::mutex mutex;
+        std::condition_variable done_cv;
+        bool done = false;
+    };
+
+    static bool transforms(const Entry& e) {
+        const auto o = e.request.Options.AsUINT64;
+        return options::zlib(o) || options::bcpack(o) || options::swizzle(o);
+    }
+    // Bytes a prefetched request holds: its transform buffers, or just the source for a raw read.
+    static uint64_t prefetch_bytes(const Entry& e) {
+        const uint64_t bytes = leonida::dstorage::staging_bytes(e.request);
+        return bytes ? bytes : e.request.SourceSize;
+    }
+    static bool needs_staging(const Entry& e) {
+        if (e.type != Entry::Type::Request || e.cancelled || FAILED(e.enqueue_error)) return false;
+        return e.file || transforms(e) || (e.request.Options.AsUINT64 & (options::kDestinationPages | options::kSourcePages));
+    }
+    static bool can_prepare(const Entry& e) {
+        return e.type == Entry::Type::Request && !e.cancelled && SUCCEEDED(e.enqueue_error) && e.file &&
+               prefetch_bytes(e) <= leonida::dstorage::StagingPool::limit / 4;
+    }
+
+    void prepare_in_background(Slot* s) {
+        set_pending(+1);
+        s->prepared.result = validate_request(s->entry);
+        if (SUCCEEDED(s->prepared.result)) s->prepared.result = prepare(s->entry, s->prepared.bytes);
+        else s->entry.reason = "request-validation";
+        std::lock_guard lock(s->mutex);  // the worker may destroy the slot once it wakes
+        s->done = true;
+        s->done_cv.notify_one();
+    }
+
+    // Under mutex_. A slot takes staging only after every older slot holds its own or needs none; that keeps the window deadlock-free.
+    void schedule_window_locked() {
+        for (auto& s : window_) {
+            if (s->scheduled || s->started) continue;
+            if (!can_prepare(s->entry)) {
+                if (needs_staging(s->entry)) break;
+                continue;
+            }
+            if (!s->lease.try_take(prefetch_bytes(s->entry))) break;
+            s->scheduled = true;
+            Slot* raw = s.get();
+            PreparePool::get().post([this, raw] { prepare_in_background(raw); });
+        }
+    }
+
+    void advise_locked() {
+        const size_t reach = io_policy().advise;
+        if (!reach) return;
+        size_t seen = 0;
+        auto visit = [&](Entry& e) {
+            if (seen >= reach) return;
+            if (e.type != Entry::Type::Request) return;
+            ++seen;
+            if (e.advised || !e.file || e.cancelled) return;
+            e.advised = true;
+            e.file->advise(e.request.FileOffset, e.request.SourceSize);
+        };
+        for (auto& s : window_) visit(s->entry);
+        for (size_t i = 0; i < submitted_ && seen < reach; ++i) visit(entries_[i]);
+    }
+
+    void run() {
+        const size_t depth = pool_ ? io_policy().depth : 1;
+        for (;;) {
+            Slot* front = nullptr;
+            {
+                std::unique_lock lock(mutex_);
+                work_.wait(lock, [&] { return submitted_ > 0 || !window_.empty() || closed_; });
+                if (submitted_ == 0 && window_.empty()) return;
+                while (submitted_ > 0 && window_.size() < depth) {
+                    window_.push_back(std::make_unique<Slot>(std::move(entries_.front())));
+                    entries_.pop_front();
+                    --submitted_;
+                }
+                in_flight_ = window_.size();
+                window_seen_ = in_flight_;
+                max_window_ = std::max(max_window_, in_flight_);
+                advise_locked();
+                if (pool_) schedule_window_locked();
+                front = window_.front().get();
+                front->started = true;
+            }
+            if (front->scheduled) {
+                std::unique_lock lock(front->mutex);
+                front->done_cv.wait(lock, [&] { return front->done; });
+            }
+            process(front->entry, front->scheduled ? &front->prepared : nullptr);
+            release_references(front->entry);
+            {
+                std::lock_guard lock(mutex_);
+                window_.pop_front();
+                in_flight_ = window_.size();
+                space_.notify_all();
+                if (entries_.empty() && window_.empty()) idle_.notify_all();
+            }
+        }
+    }
+
+    // Runs on the worker. since_notify_ is the first failure since the last status entry or fence signal: the
+    // HRESULT a status entry reports.
+    void process(Entry& e, Prepared* prepared, bool pair_reserved = false) {
+        HRESULT hr = e.enqueue_error;
+        if (FAILED(hr)) e.reason = "enqueue";
+        const auto begin = Timing::start();
+        long long notify_us = 0;
+        switch (e.type) {
+            case Entry::Type::Request:
+                // A cancelled request is a success whatever else is wrong with it (the GDK: not counted as a failure).
+                if (e.cancelled) {
+                    hr = S_OK;
+                    if (prepared) set_pending(-1);
+                } else if (SUCCEEDED(hr)) {
+                    // Pending: processing has started and not completed (DSTORAGE_PRIORITY_STATS).
+                    if (prepared) {
+                        hr = prepared->result;
+                        if (SUCCEEDED(hr)) hr = publish(e, prepared->bytes);
+                    } else {
+                        set_pending(+1);
+                        hr = execute_request(e, pair_reserved);
+                    }
+                    set_pending(-1);
+                }
+                if (leonida::dstorage::shapes::enabled() && e.seq)
+                    leonida::dstorage::shapes::record("C\t%llu\t%p\t%llu\t0x%08x\t%llu\t%lld\t%lld\t%s\t%zu\t%d",
+                        static_cast<unsigned long long>(leonida::dstorage::shapes::now_us()), static_cast<void*>(this),
+                        static_cast<unsigned long long>(e.seq), static_cast<unsigned>(hr),
+                        static_cast<unsigned long long>(leonida::dstorage::shapes::now_us() - e.enqueued_us), e.timing.read,
+                        e.timing.inflate + e.timing.bcpack + e.timing.copy + e.timing.unshuffle, prepared ? "pool" : "inline", window_seen_,
+                        int(e.cancelled));
+                if (FAILED(hr) || leonida::dstorage::trace_enabled()) {
+                    const auto& r = e.request;
+                    const auto o = r.Options.AsUINT64;
+                    const bool pages = (o & options::kDestinationPages) != 0;
+                    std::fprintf(stderr, "[rt] ds-request queue=%p options=%llx zlib=%d bc=%llu sw=%llu "
+                                 "dest=%s address=%p file=%s offset=%llu src=%u mid=%u dst=%u cancelled=%d hr=%08x "
+                                 "tick_ms=%llu page_offset=%u read_us=%lld inflate_us=%lld bc_us=%lld copy_us=%lld sw_us=%lld paired=%d reason=%s priority=%d\n",
+                                 static_cast<void*>(this), o, int(options::zlib(o)), options::bcpack(o),
+                                 options::swizzle(o), pages ? "pages" : "buffer", r.Destination,
+                                 e.file ? rt::gdk::to_utf8(e.file->path()).c_str() : "-", e.file ? r.FileOffset : 0ull,
+                                 r.SourceSize, r.IntermediateSize, r.DestinationSize, int(e.cancelled),
+                                 static_cast<unsigned>(hr), tick_ms(),
+                                 pages ? unsigned(r.DestinationPageOffset) : 0u, e.timing.read, e.timing.inflate,
+                                 e.timing.bcpack, e.timing.copy, e.timing.unshuffle, int(prepared != nullptr), e.reason, int(desc_.Priority));
+                    if (hr == E_DSTORAGE_ACCESS_VIOLATION) {
+                        const void* cpu = pages ? r.DestinationPageArray : cpu_destination(r);
+                        gta6rt_vm_region info{};
+                        gta6rt_vm_query(cpu, &info);
+                        std::fprintf(stderr, "[rt] ds-access queue=%p dest=%p cpu=%p paired=%llx base=%p "
+                                     "region=%zu state=%u protect=%x allocation_protect=%x image=%u\n", static_cast<void*>(this),
+                                     r.Destination, cpu, static_cast<unsigned long long>(pages ? 0 :
+                                     rt::gdk::title_other_view(reinterpret_cast<uintptr_t>(cpu))),
+                                     info.base, info.size, unsigned(info.state), info.prot, info.allocation_prot,
+                                     info.is_image);
+                    }
+                    // Put failures on the same clock as title faults, even if another queue is active.
+                    if (FAILED(hr) && rt::startup_trace::enabled()) {
+                        rt::startup_trace::event("dstorage_failure",
+                            "\"queue\":" + rt::startup_trace::quote(rt::startup_trace::hex(reinterpret_cast<uintptr_t>(this))) +
+                            ",\"hr\":" + rt::startup_trace::quote(hr_text(hr)) +
+                            ",\"options\":" + rt::startup_trace::quote(rt::startup_trace::hex(o)) +
+                            ",\"offset\":" + std::to_string(e.file ? r.FileOffset : 0ull) +
+                            ",\"source_size\":" + std::to_string(r.SourceSize) +
+                            ",\"destination_size\":" + std::to_string(r.DestinationSize));
+                    }
+                }
+                if (e.file && e.file_counted) e.file->finish_pending();
+                if (FAILED(hr) && SUCCEEDED(since_notify_)) since_notify_ = hr;
+                break;
+            case Entry::Type::Status: {
+                const auto result = FAILED(hr) ? hr : since_notify_;
+                if (SUCCEEDED(hr)) {
+                    e.status->complete(e.index, result);
+                    since_notify_ = S_OK;
+                }
+                notify_us = Timing::elapsed(begin);
+                if (leonida::dstorage::trace_enabled())
+                    std::fprintf(stderr, "[rt] ds-status queue=%p array=%p slot=%u hr=%08x\n",
+                                 static_cast<void*>(this), static_cast<void*>(e.status), e.index,
+                                 static_cast<unsigned>(result));
+                break;
+            }
+            case Entry::Type::Signal:
+                if (SUCCEEDED(hr)) hr = e.fence->Signal(e.value);
+                notify_us = Timing::elapsed(begin);
+                if (leonida::dstorage::trace_enabled())
+                    std::fprintf(stderr, "[rt] ds-signal queue=%p value=%llu hr=%08x\n", static_cast<void*>(this),
+                                 e.value, static_cast<unsigned>(hr));
+                since_notify_ = S_OK;
+                break;
+            case Entry::Type::Event:
+                if (SUCCEEDED(hr) && !SetEvent(e.event)) hr = HRESULT_FROM_WIN32(GetLastError());
+                notify_us = Timing::elapsed(begin);
+                if (leonida::dstorage::trace_enabled())
+                    std::fprintf(stderr, "[rt] ds-event queue=%p hr=%08x\n", static_cast<void*>(this),
+                                 static_cast<unsigned>(hr));
+                break;
+        }
+        if (e.type != Entry::Type::Request && leonida::dstorage::trace_enabled())
+            std::fprintf(stderr, "[rt] ds-notify queue=%p type=%u us=%lld\n", static_cast<void*>(this),
+                         static_cast<unsigned>(e.type), notify_us);
+        if (FAILED(hr)) {
+            DSTORAGE_ERROR_FIRST_FAILURE f{};
+            f.HResult = hr;
+            describe(e, f);
+            record_failure(f);
+        }
+    }
+
+    HRESULT validate_request(const Entry& e) const {
+        const DSTORAGE_REQUEST& r = e.request;
+        const uint64_t o = r.Options.AsUINT64;
+        if (o & options::kReservedMask) return E_DSTORAGE_RESERVED_FIELDS;
+        if (options::source_type(o) != desc_.SourceType) return E_DSTORAGE_INVALID_SOURCE_TYPE;
+        if (options::bcpack(o) > DSTORAGE_BCPACK_MODE_BC7) return E_DSTORAGE_INVALID_BCPACK_MODE;
+        if (options::swizzle(o) > DSTORAGE_SWIZZLE_MODE_4K_12K_4K_12K) return E_DSTORAGE_INVALID_SWIZZLE_MODE;
+        const unsigned bc = unsigned(options::bcpack(o)), sw = unsigned(options::swizzle(o));
+        const bool pages = o & (options::kDestinationPages | options::kSourcePages);
+        if ((bc || sw || pages) && !extended_enabled()) return E_NOTIMPL;
+        if (bc == DSTORAGE_BCPACK_MODE_BC2) {
+            log_once("bc2", "BC2 has no known BCPack block decoder (E_NOTIMPL)");
+            return E_NOTIMPL;
+        }
+        const bool zlib = options::zlib(o);
+        if ((zlib && bc) != (r.IntermediateSize != 0) || r.IntermediateSize > kMaxRequestBytes)
+            return E_DSTORAGE_INVALID_INTERMEDIATE_SIZE;
+        if (zlib || bc) {
+            if (r.DestinationSize <= r.SourceSize) return E_DSTORAGE_INVALID_DESTINATION_SIZE;
+        } else if (r.DestinationSize != r.SourceSize) return E_DSTORAGE_INVALID_DESTINATION_SIZE;
+        if (bc && r.DestinationSize % ((bc == 1 || bc == 4) ? 8 : 16)) return E_DSTORAGE_INVALID_DESTINATION_SIZE;
+        if (sw && r.DestinationSize % leonida::dstorage::group_size(sw)) return E_DSTORAGE_INVALID_DESTINATION_SIZE;
+        const bool memory = desc_.SourceType == DSTORAGE_REQUEST_SOURCE_MEMORY;
+        if (!memory && (o & options::kSourcePages)) return E_DSTORAGE_INVALID_SOURCE_TYPE;
+        const uint64_t total = static_cast<uint64_t>(r.DestinationSize) + (memory ? r.SourceSize : 0u);
+        if (total > kMaxRequestBytes ||
+            (r.DestinationSize > kMax4kPageDestinationSize && !(o & options::kDestinationPages)) ||
+            (memory && r.SourceSize > kMax4kPageDestinationSize && !(o & options::kSourcePages)))
+            return E_DSTORAGE_REQUEST_TOO_LARGE;
+        if ((zlib || bc) && !memory && r.FileOffset % 16 != 0) return E_DSTORAGE_INVALID_FILE_OFFSET;
+        if (!r.Destination) return E_INVALIDARG;
+        if (memory) {
+            if (!r.Source) return E_INVALIDARG;
+        } else {
+            if (!r.File) return E_INVALIDARG;
+            if (!e.file_counted) return E_DSTORAGE_FILE_NOT_OPEN;
+        }
+        return S_OK;
+    }
+
+    HRESULT execute_request(Entry& e, bool pair_reserved) {
+        const HRESULT valid = validate_request(e);
+        if (FAILED(valid)) { e.reason = "request-validation"; return valid; }
+        const auto& r = e.request;
+        const auto o = r.Options.AsUINT64;
+        const bool memory = desc_.SourceType == DSTORAGE_REQUEST_SOURCE_MEMORY;
+        if ((o & (options::kDestinationPages | options::kSourcePages)) || options::zlib(o) ||
+            options::bcpack(o) || options::swizzle(o)) {
+            leonida::dstorage::StagingPool::Lease reservation(leonida::dstorage::staging_pool());
+            if (!pair_reserved) reservation.acquire(leonida::dstorage::staging_bytes(r));
+            std::vector<uint8_t> data;
+            const auto hr = prepare(e, data);
+            return FAILED(hr) ? hr : publish(e, data);
+        }
+        if (r.SourceSize == 0) return S_OK;  // nothing to move; the reference does not say this fails
+        void* const destination = cpu_destination(r);
+        if (memory) {
+            const auto begin = Timing::start();
+            const auto hr = written(r, title_write(destination, r.Source, r.SourceSize) ? S_OK : E_DSTORAGE_ACCESS_VIOLATION);
+            e.timing.copy = Timing::elapsed(begin);
+            if (FAILED(hr)) e.reason = "copy";
+            return hr;
+        }
+        if (extended_enabled() && !rt::gdk::title_commit(destination, r.DestinationSize)) {
+            e.reason = "destination-commit";
+            return E_DSTORAGE_ACCESS_VIOLATION;
+        }
+        const auto begin = Timing::start();
+        const auto hr = read_file_range(*e.file, r.FileOffset, destination, r.SourceSize, ReadTarget::Title);
+        e.timing.read = Timing::elapsed(begin);
+        if (FAILED(hr)) e.reason = "file-read";
+        return written(r, hr);
+    }
+
+    // Where the CPU writes a request's destination: the title hands its stream pool's GPU-only alias range as the
+    // destination of streamed texture data (gfxgeom notes, section 2), which only the GPU maps; its CPU view holds the
+    // same pages (src/title_page_watch.h, title_gpu_views).
+    static void* cpu_destination(const DSTORAGE_REQUEST& r) {
+        return reinterpret_cast<void*>(rt::gdk::title_to_cpu(reinterpret_cast<uintptr_t>(r.Destination)));
+    }
+    // A request that wrote its destination tells the D3D12 layer, whose images of textures in that memory are filled
+    // from it (title_texel_writes).
+    static HRESULT written(const DSTORAGE_REQUEST& r, HRESULT hr) {
+        if (SUCCEEDED(hr)) rt::gdk::title_texel_write(cpu_destination(r), r.DestinationSize);
+        return hr;
+    }
+
+    // The caller may populate or remap the physical page list between enqueue and Submit.
+    // Snapshot page numbers on the worker before taking xmem's allocation/map lock.
+    static HRESULT page_transfer(const ULONG_PTR* pages, uint16_t offset, std::span<uint8_t> buffer, bool write) {
+        if (buffer.empty()) return S_OK;
+        std::vector<uint64_t> numbers(1 + (buffer.size() - 1 + offset) / 65536);
+        if (!guarded_move(numbers.data(), pages, numbers.size() * sizeof(numbers[0])))
+            return E_DSTORAGE_ACCESS_VIOLATION;
+        if (rt::xmem::transfer_physical(numbers, offset, buffer, write)) return S_OK;
+        return HRESULT_FROM_WIN32(GetLastError());
+    }
+
+    // Only a clean result is taken from the system zlib; a failure repeats on the leonida path, which owns the typed errors.
+    static bool system_inflate(const std::vector<uint8_t>& src, std::vector<uint8_t>& out, size_t size) {
+        if (!size || size > kMaxRequestBytes || src.size() > 0xffffffffull) return false;
+        out.resize(size);
+        z_stream zs{};
+        if (inflateInit(&zs) != Z_OK) return false;
+        zs.next_in = const_cast<Bytef*>(src.data());
+        zs.avail_in = static_cast<uInt>(src.size());
+        zs.next_out = out.data();
+        zs.avail_out = static_cast<uInt>(size);
+        const int rc = ::inflate(&zs, Z_FINISH);
+        const bool ok = rc == Z_STREAM_END && zs.total_out == size;
+        inflateEnd(&zs);
+        return ok;
+    }
+
+    static HRESULT inflate(const std::vector<uint8_t>& src, std::vector<uint8_t>& out, size_t size) {
+        static const bool system = env_long("LEONIDA_DSTORAGE_SYSTEM_ZLIB", 1) != 0;
+        if (system && system_inflate(src, out, size)) return S_OK;
+        leonida::ZlibError why{};
+        static const bool bulk = [] {
+            return rt::gdk::env_or("LEONIDA_DSTORAGE_FAST_INFLATE") != "0";
+        }();
+        out.reserve(size);
+        if (leonida::zlib_inflate(src, out, size, &why, bulk))
+            return out.size() == size ? S_OK : E_DSTORAGE_DECOMPRESSION_ERROR;
+        switch (why) {
+            case leonida::ZlibError::header: return E_DSTORAGE_ZLIB_BAD_HEADER;
+            case leonida::ZlibError::checksum: return E_DSTORAGE_ZLIB_PARITY_FAIL;
+            case leonida::ZlibError::limit: return E_DSTORAGE_DECOMPRESSION_ERROR;
+            default: return E_DSTORAGE_ZLIB_BAD_DATA;
+        }
+    }
+
+    static HRESULT decode_stages(Entry& e, unsigned bc, unsigned sw, std::vector<uint8_t>& data) {
+        const auto& r = e.request;
+        if (options::zlib(r.Options.AsUINT64)) {
+            std::vector<uint8_t> scratch;
+            static const bool reported = (log_once("zlib", "zlib requests use CPU inflate (RFC 1950)"), true);
+            (void)reported;
+            const auto begin = Timing::start();
+            const auto hr = inflate(data, scratch, bc ? r.IntermediateSize : r.DestinationSize);
+            e.timing.inflate = Timing::elapsed(begin);
+            if (FAILED(hr)) { e.reason = "inflate"; return hr; }
+            data = std::move(scratch);
+        }
+        if (bc) {
+            std::vector<uint8_t> scratch(r.DestinationSize);
+            static const bool allow_fitted = [] {
+                return rt::gdk::env_or("LEONIDA_DSTORAGE_FITTED") != "0";
+            }();
+            const auto begin = Timing::start();
+            static const bool fast_entropy = [] {
+                return rt::gdk::env_or("LEONIDA_DSTORAGE_FAST_BCPACK") != "0";
+            }();
+            const char* failure = nullptr;
+            const auto quality = leonida::bcpack::decode(bc, data, scratch, allow_fitted, bc >= 6 ? bcpack_history() : nullptr, &failure, fast_entropy);
+            e.timing.bcpack = Timing::elapsed(begin);
+            if (quality == leonida::bcpack::Quality::failed) { e.reason = failure; return E_DSTORAGE_DECOMPRESSION_ERROR; }
+            if (quality == leonida::bcpack::Quality::fitted) {
+                static const bool reported = (log_once("fitted", "using fitted BCPack predictors"), true);
+                (void)reported;
+                if (leonida::dstorage::trace_enabled())
+                    std::fprintf(stderr, "[rt] ds-fitted bc=%u bytes=%u\n", bc, r.DestinationSize);
+            }
+            data = std::move(scratch);
+        }
+        if (sw) {
+            std::vector<uint8_t> scratch(r.DestinationSize);
+            const auto begin = Timing::start();
+            if (!leonida::dstorage::unshuffle(sw, data, scratch)) return E_DSTORAGE_INVALID_DESTINATION_SIZE;
+            e.timing.unshuffle = Timing::elapsed(begin);
+            data = std::move(scratch);
+        }
+        return S_OK;
+    }
+
+    HRESULT prepare(Entry& e, std::vector<uint8_t>& data) try {
+        const auto& r = e.request;
+        const auto o = r.Options.AsUINT64;
+        const bool memory = desc_.SourceType == DSTORAGE_REQUEST_SOURCE_MEMORY;
+        const auto bc = unsigned(options::bcpack(o)), sw = unsigned(options::swizzle(o));
+        data.resize(r.SourceSize);
+        HRESULT hr = S_OK;
+        const auto read_begin = Timing::start();
+        if (!memory) hr = read_file_range(*e.file, r.FileOffset, data.data(), r.SourceSize, ReadTarget::Staging);
+        else if (o & options::kSourcePages) hr = page_transfer(r.SourcePageArray, r.SourcePageOffset, data, false);
+        else if (!data.empty() && !guarded_move(data.data(), r.Source, data.size())) hr = E_DSTORAGE_ACCESS_VIOLATION;
+        e.timing.read = Timing::elapsed(read_begin);
+        if (FAILED(hr)) { e.reason = "read"; return hr; }
+        if (bc || sw || options::zlib(o)) {
+            set_decompression_pending(+1);
+            try {
+                hr = decode_stages(e, bc, sw, data);
+            } catch (const std::bad_alloc&) {
+                hr = E_OUTOFMEMORY;
+            }
+            set_decompression_pending(-1);
+            if (FAILED(hr)) {
+                std::lock_guard lock(stats().mutex);
+                ++stats().s.DecompressionErrors;
+                return hr;
+            }
+        }
+        return S_OK;
+    } catch (const std::bad_alloc&) { return E_OUTOFMEMORY; }
+
+    HRESULT publish(Entry& e, std::vector<uint8_t>& data) try {
+        const auto& r = e.request;
+        const auto o = r.Options.AsUINT64;
+        const auto bc = options::bcpack(o), sw = options::swizzle(o);
+        HRESULT hr = S_OK;
+        const auto copy_begin = Timing::start();
+        if (o & options::kDestinationPages) hr = page_transfer(r.DestinationPageArray, r.DestinationPageOffset, data, true);
+        else if (!data.empty()) {
+            void* const dest = cpu_destination(r);
+            if (extended_enabled() && !rt::gdk::title_commit(dest, data.size())) {
+                e.reason = "destination-commit";
+                return E_DSTORAGE_ACCESS_VIOLATION;
+            }
+            hr = written(r, title_write(dest, data.data(), data.size()) ? S_OK : E_DSTORAGE_ACCESS_VIOLATION);
+        }
+        e.timing.copy = Timing::elapsed(copy_begin);
+        if (FAILED(hr)) e.reason = "publish";
+        if (leonida::dstorage::trace_enabled() && SUCCEEDED(hr) && (bc || sw || (o & options::kDestinationPages) ||
+            rt::gdk::title_other_view(reinterpret_cast<uintptr_t>(r.Destination)))) {
+            std::fprintf(stderr, "[rt] ds-write queue=%p dest=%p cpu=%p options=%llx bytes=%zu nonzero=%d\n",
+                         static_cast<void*>(this), r.Destination, (o & options::kDestinationPages) ? nullptr : cpu_destination(r),
+                         o, data.size(),
+                         int(std::any_of(data.begin(), data.end(), [](uint8_t byte) { return byte != 0; })));
+        }
+        return hr;
+    } catch (const std::bad_alloc&) { return E_OUTOFMEMORY; }
+
+    void set_pending(int delta) {
+        std::lock_guard lock(stats().mutex);
+        priority_stats(stats().s, desc_.Priority).PendingRequestCount += static_cast<uint32_t>(delta);
+    }
+
+    // PendingDecompressionRequestCount covers the current decode pipeline; TotalDecompressionRequestCount counts each
+    // one that reached its inflate (its source was read), DecompressionErrors those whose stream then failed.
+    static void set_decompression_pending(int delta) {
+        std::lock_guard lock(stats().mutex);
+        auto& s = stats().s;
+        s.PendingDecompressionRequestCount += static_cast<uint32_t>(delta);
+        if (delta > 0) ++s.TotalDecompressionRequestCount;
+    }
+
+    void describe(const Entry& e, DSTORAGE_ERROR_FIRST_FAILURE& f) const {
+        switch (e.type) {
+            case Entry::Type::Request: {
+                f.CommandType = DSTORAGE_COMMAND_TYPE_REQUEST;
+                auto& q = f.Request;
+                const DSTORAGE_REQUEST& r = e.request;
+                q.Options = r.Options;
+                q.Destination = r.Destination;
+                q.DestinationSize = r.DestinationSize;
+                q.SourceSize = r.SourceSize;
+                q.CancellationTag = r.CancellationTag;
+                if (options::source_type(r.Options.AsUINT64) == DSTORAGE_REQUEST_SOURCE_MEMORY) {
+                    q.Source = r.Source;
+                } else {
+                    q.FileOffset = r.FileOffset;
+                    if (e.file) {
+                        const std::u16string& name = e.file->path();
+                        const size_t n = (std::min)(name.size(), std::size(q.Filename) - 1);
+                        std::copy_n(name.data(), n, q.Filename);
+                        q.Filename[n] = 0;
+                    }
+                }
+                // The reference says the name stays readable until the request completes.
+                if (r.Name)
+                    for (size_t i = 0; i + 1 < kRequestMaxName && r.Name[i]; ++i) q.Name[i] = r.Name[i];
+                break;
+            }
+            case Entry::Type::Status:
+                f.CommandType = DSTORAGE_COMMAND_TYPE_STATUS;
+                f.Status.StatusArray = e.status_as_given;
+                f.Status.Index = e.index;
+                break;
+            case Entry::Type::Signal:
+                f.CommandType = DSTORAGE_COMMAND_TYPE_SIGNAL;
+                f.Signal.Fence = e.fence;
+                f.Signal.Value = e.value;
+                break;
+            case Entry::Type::Event:
+                f.CommandType = kCommandTypeEvent;
+                break;
+        }
+    }
+
+    void record_failure(const DSTORAGE_ERROR_FIRST_FAILURE& f) {
+        count_error();
+        {
+            std::lock_guard lock(error_mutex_);
+            if (record_.FailureCount++ == 0) record_.FirstFailure = f;
+            if (error_event_) SetEvent(error_event_);
+        }
+        static auto* counts = new std::map<HRESULT, uint64_t>;
+        std::lock_guard lock(log_mutex());
+        const auto count = ++(*counts)[f.HResult];
+        // The boot digest groups identical lines. Keep one invariant line per HRESULT and
+        // report the cumulative value separately so a truncated run is still countable.
+        std::fprintf(stderr, "[rt] dstorage: an entry failed with 0x%08x (facility=%x code=%x)\n"
+                             "[rt] ds-error-count hr=%08x count=%llu command=%u\n",
+                     static_cast<unsigned>(f.HResult), static_cast<unsigned>(HRESULT_FACILITY(f.HResult)),
+                     static_cast<unsigned>(HRESULT_CODE(f.HResult)), static_cast<unsigned>(f.HResult),
+                     static_cast<unsigned long long>(count), unsigned(f.CommandType));
+    }
+
+    void clear_record_locked() {
+        record_ = DSTORAGE_ERROR_RECORD{};
+        record_.FirstFailure.CommandType = DSTORAGE_COMMAND_TYPE_NONE;
+    }
+
+    static void release_references(Entry& e) {
+        if (e.file) e.file->Release();
+        if (e.status) e.status->Release();
+        if (e.fence) e.fence->Release();
+        if (e.event) CloseHandle(e.event);
+        e.event = nullptr;
+        e.file = nullptr;
+        e.status = nullptr;
+        e.fence = nullptr;
+    }
+
+    std::atomic<ULONG> refs_{1};
+    const DSTORAGE_QUEUE_DESC1 desc_;
+    std::mutex close_mutex_;  // one Close at a time
+    std::mutex mutex_;        // entries_, submitted_, in_flight_, closing_, closed_
+    std::condition_variable work_, space_, idle_;
+    std::deque<Entry> entries_;
+    size_t submitted_ = 0;  // the first submitted_ entries are submitted
+    size_t in_flight_ = 0;
+    bool closing_ = false;
+    bool closed_ = false;
+    rt::gdk::Thread worker_;
+    std::deque<std::unique_ptr<Slot>> window_;  // under mutex_; the worker pops the front
+    bool pool_ = false;
+    uint64_t seq_ = 0, source_bytes_total_ = 0;  // shape log, under mutex_
+    size_t max_window_ = 0, window_seen_ = 0;    // shape log; window_seen_ is the worker's
+    HRESULT since_notify_ = S_OK;  // worker only
+    std::mutex error_mutex_;
+    DSTORAGE_ERROR_RECORD record_{};
+    HANDLE error_event_ = nullptr;
+};
+
+// ---- The factory ----------------------------------------------------------------------------------------------------
+
+HRESULT validate_queue_desc(const DSTORAGE_QUEUE_DESC1& d) {
+    if (d.SourceType != DSTORAGE_REQUEST_SOURCE_FILE && d.SourceType != DSTORAGE_REQUEST_SOURCE_MEMORY)
+        return E_DSTORAGE_INVALID_SOURCE_TYPE;
+    if (d.Capacity < kMinQueueCapacity || d.Capacity > kMaxQueueCapacity) return E_DSTORAGE_INVALID_QUEUE_CAPACITY;
+    if (d.Priority < DSTORAGE_PRIORITY_FIRST || d.Priority > DSTORAGE_PRIORITY_LAST)
+        return E_DSTORAGE_INVALID_QUEUE_PRIORITY;
+    if (d.SourceType == DSTORAGE_REQUEST_SOURCE_MEMORY && d.Priority != DSTORAGE_PRIORITY_REALTIME)
+        return E_DSTORAGE_INVALID_MEMORY_QUEUE_PRIORITY;
+    if (d.Options.Reserved) return E_DSTORAGE_RESERVED_FIELDS;
+    return S_OK;
+}
+
+using CreateFileWFn = HANDLE(WINAPI*)(LPCWSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
+
+// The title's own CreateFileW: the GAME: mapping and overlay when shims_core's file_system is registered, else the
+// plain Win32 one.
+CreateFileWFn create_file_w() {
+    if (void* fn = rt::shims::find("kernel32.dll", "CreateFileW")) return reinterpret_cast<CreateFileWFn>(fn);
+    return &::CreateFileW;
+}
+
+HANDLE open_title_file(const WCHAR* path) {
+    return create_file_w()(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+}
+
+class Factory final : public IDStorageFactoryX2 {
+public:
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override {
+        if (!ppv) return E_POINTER;
+        *ppv = nullptr;
+        if (!iid_policy().accept_query(riid, Kind::Factory, "IDStorageFactoryX::QueryInterface")) return E_NOINTERFACE;
+        AddRef();
+        *ppv = static_cast<IDStorageFactoryX2*>(this);
+        return S_OK;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return ++refs_; }
+    // One factory for the process; its count never drops below one, so it is never freed.
+    ULONG STDMETHODCALLTYPE Release() override {
+        ULONG r = refs_.load();
+        while (r > 1 && !refs_.compare_exchange_weak(r, r - 1)) {}
+        return r > 1 ? r - 1 : 1;
+    }
+
+    HRESULT STDMETHODCALLTYPE CreateQueue(const DSTORAGE_QUEUE_DESC* desc, REFIID riid, void** ppv) override {
+        if (!ppv) return bad_call("IDStorageFactoryX::CreateQueue", E_POINTER, "null ppv");
+        *ppv = nullptr;
+        if (!desc) return bad_call("IDStorageFactoryX::CreateQueue", E_INVALIDARG, "null desc");
+        DSTORAGE_QUEUE_DESC1 d{};
+        d.SourceType = desc->SourceType;
+        d.Capacity = desc->Capacity;
+        d.Priority = desc->Priority;
+        d.Name = desc->Name;
+        return create_queue(d, riid, ppv, "IDStorageFactoryX::CreateQueue");
+    }
+
+    HRESULT STDMETHODCALLTYPE CreateQueue1(const DSTORAGE_QUEUE_DESC1* desc, REFIID riid, void** ppv) override {
+        if (!ppv) return bad_call("IDStorageFactoryX2::CreateQueue1", E_POINTER, "null ppv");
+        *ppv = nullptr;
+        if (!desc) return bad_call("IDStorageFactoryX2::CreateQueue1", E_INVALIDARG, "null desc");
+        return create_queue(*desc, riid, ppv, "IDStorageFactoryX2::CreateQueue1");
+    }
+
+    HRESULT STDMETHODCALLTYPE OpenFile(const WCHAR* path, REFIID riid, void** ppv) override {
+        if (!ppv) return bad_call("IDStorageFactoryX::OpenFile", E_POINTER, "null ppv");
+        *ppv = nullptr;
+        if (!path || !*path) return bad_call("IDStorageFactoryX::OpenFile", E_INVALIDARG, "null or empty path");
+        if (!iid_policy().accept_creating(riid, Kind::File, "IDStorageFactoryX::OpenFile")) return E_NOINTERFACE;
+        const HANDLE h = open_title_file(path);
+        if (h == INVALID_HANDLE_VALUE) {
+            const DWORD error = GetLastError();
+            return HRESULT_FROM_WIN32(error ? error : ERROR_FILE_NOT_FOUND);
+        }
+        File* f = new (std::nothrow) File(h, path);
+        if (!f) {
+            CloseHandle(h);
+            return E_OUTOFMEMORY;
+        }
+        *ppv = static_cast<IDStorageFileX*>(f);
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE CreateStatusArray(UINT32 capacity, PCSTR, REFIID riid, void** ppv) override {
+        if (!ppv) return bad_call("IDStorageFactoryX::CreateStatusArray", E_POINTER, "null ppv");
+        *ppv = nullptr;
+        if (capacity == 0) return bad_call("IDStorageFactoryX::CreateStatusArray", E_INVALIDARG, "capacity 0");
+        if (!iid_policy().accept_creating(riid, Kind::StatusArray, "IDStorageFactoryX::CreateStatusArray"))
+            return E_NOINTERFACE;
+        std::unique_ptr<std::atomic<HRESULT>[]> entries(new (std::nothrow) std::atomic<HRESULT>[capacity]);
+        if (!entries) return E_OUTOFMEMORY;
+        auto* a = new (std::nothrow) StatusArray(capacity, std::move(entries));
+        if (!a) return E_OUTOFMEMORY;
+        *ppv = static_cast<IDStorageStatusArrayX*>(a);
+        return S_OK;
+    }
+
+    // DirectStorage's own worker work would be pinned to these cores on the console. The mask names console cores,
+    // so it is stored and not applied to the host's.
+    HRESULT STDMETHODCALLTYPE SetCpuAffinity(UINT64 affinity) override {
+        cpu_affinity_.store(affinity);
+        return S_OK;
+    }
+    void STDMETHODCALLTYPE SetDebugFlags(UINT32 flags) override { debug_flags_.store(flags); }
+
+    HRESULT STDMETHODCALLTYPE SetStagingBufferSize(UINT32 size) override {
+        if (std::find(std::begin(kStagingBufferSizes), std::end(kStagingBufferSizes), size) ==
+            std::end(kStagingBufferSizes))
+            return bad_call("IDStorageFactoryX::SetStagingBufferSize", E_DSTORAGE_INVALID_STAGING_BUFFER_SIZE,
+                            "not one of 0, 16, 20, 24, 28 or 32 MiB");
+        std::lock_guard lock(stats().mutex);
+        if (stats().live_queues || stats().s.CurrentOpenFileCount) return E_DSTORAGE_STAGING_BUFFER_LOCKED;
+        staging_size_ = size;  // there is no staging buffer here; the size is only kept
+        return S_OK;
+    }
+
+    void STDMETHODCALLTYPE GetStats(DSTORAGE_STATS* out) override {
+        if (!out) {
+            bad_call("IDStorageFactoryX1::GetStats", E_POINTER, "null stats");
+            return;
+        }
+        std::lock_guard lock(stats().mutex);
+        *out = stats().s;
+    }
+
+private:
+    HRESULT create_queue(const DSTORAGE_QUEUE_DESC1& desc, REFIID riid, void** ppv, const char* caller) {
+        if (const HRESULT hr = validate_queue_desc(desc); FAILED(hr)) return bad_call(caller, hr, "invalid queue desc");
+        if (!iid_policy().accept_creating(riid, Kind::Queue, caller)) return E_NOINTERFACE;
+        auto* q = new (std::nothrow) Queue(desc);
+        if (!q) return E_OUTOFMEMORY;
+        if (!q->start()) {
+            q->Release();
+            return E_OUTOFMEMORY;
+        }
+        *ppv = static_cast<IDStorageQueueX2*>(q);
+        return S_OK;
+    }
+
+    std::atomic<ULONG> refs_{1};
+    std::atomic<uint64_t> cpu_affinity_{~0ull};
+    std::atomic<uint32_t> debug_flags_{0};
+    uint32_t staging_size_ = 32u << 20;  // under stats().mutex
+};
+
+Factory& factory() {
+    static auto* f = new Factory;
+    return *f;
+}
+
+HRESULT WINAPI dstorage_get_factory(REFIID riid, void** ppv) {
+    if (!ppv) return bad_call("DStorageGetFactory", E_POINTER, "null ppv");
+    *ppv = nullptr;
+    if (!iid_policy().accept_creating(riid, Kind::Factory, "DStorageGetFactory")) return E_NOINTERFACE;
+    Factory& f = factory();
+    f.AddRef();
+    *ppv = static_cast<IDStorageFactoryX2*>(&f);
+    return S_OK;
+}
+
+}  // namespace
+
+// The console module names; docs/directstorage.md has the evidence and the confidence for each.
+SHIM_TABLE(dstorage,
+    {"dstorage_xs.dll", "DStorageGetFactory", reinterpret_cast<void*>(&dstorage_get_factory)},
+    {"xcrdapi.dll", "DStorageGetFactory", reinterpret_cast<void*>(&dstorage_get_factory)},
+    {"dstorage.dll", "DStorageGetFactory", reinterpret_cast<void*>(&dstorage_get_factory)},
+);

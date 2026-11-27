@@ -1,0 +1,89 @@
+--- a/shims_gdk/src/acphal.cpp
++++ b/shims_gdk/src/acphal.cpp
+@@ -889,6 +889,23 @@
+             return value;
+         };
+ 
++        {
++            static std::atomic<uint64_t> counts[32], total{0}, dumped[32];
++            counts[cmd < 31 ? cmd : 31].fetch_add(1);
++            if (dumped[cmd < 31 ? cmd : 31].fetch_add(1) < 2) {
++                std::fprintf(stderr, "[diag] acphal: submit cmd %u id %llu frame %u notification %#x config:", cmd,
++                             (unsigned long long)id, frame, notification);
++                for (int i = 0; i < 8 && config; ++i) std::fprintf(stderr, " %08x", static_cast<const uint32_t*>(config)[i]);
++                std::fprintf(stderr, "\n");
++            }
++            const uint64_t n = total.fetch_add(1) + 1;
++            if (n % 20000 == 0) {
++                std::fprintf(stderr, "[diag] acphal: %llu commands:", (unsigned long long)n);
++                for (int i = 0; i < 32; ++i)
++                    if (counts[i].load()) std::fprintf(stderr, " cmd%d=%llu", i, (unsigned long long)counts[i].load());
++                std::fprintf(stderr, "\n");
++            }
++        }
+         const bool handled_xma = g_xma_engine.handle_command(cmd, config);
+         {
+             std::lock_guard lock(mutex_);
+@@ -1029,6 +1046,9 @@
+         return E_OUTOFMEMORY;
+     }
+ 
++    std::fprintf(stderr, "[diag] acphal: AllocateShapeContexts src %u eqcomp %u filtvol %u dma %u xma %u pcm %u\n",
++                 result.numSrcContexts, result.numEqCompContexts, result.numFiltVolContexts, result.numDmaContexts,
++                 result.numXmaContexts, result.numPcmContexts);
+     // Both the backing arrays and the engine's slots are now fully allocated.
+     g_shape_allocations.push_back(std::move(pending));
+     *ctx = result;
+@@ -1088,6 +1108,7 @@
+     }
+ 
+     g_apu_heap_created = true;
++    std::fprintf(stderr, "[diag] acphal: ApuCreateHeap cached %u noncached %u\n", cachedSizeInBytes, nonCachedSizeInBytes);
+     if (rt::startup_trace::enabled()) {
+         try {
+             trace_call("ApuCreateHeap",
+--- a/shims_gdk/src/xapu_chad.cpp
++++ b/shims_gdk/src/xapu_chad.cpp
+@@ -54,6 +54,9 @@
+ #include "shims.h"
+ #include "startup_trace.h"
+ 
++#include <atomic>
++#include <cstdio>
++
+ namespace {
+ 
+ constexpr size_t kApuBufferSize = 0x14000 + 128 * 0x1E00;
+@@ -124,8 +127,32 @@
+     return S_OK;
+ }
+ 
++std::atomic<uint64_t> g_diag_types[8];
++std::atomic<uint64_t> g_diag_calls{0}, g_diag_dumped[8];
++
+ HRESULT __stdcall XApuEnqueueCommand(void* handle, const uint32_t* command, uint64_t flags) {
+     note("XApuEnqueueCommand", command ? command[0] : ~0ull, _ReturnAddress());
++    if (command && handle) {
++        const uint32_t t = command[0] < 7 ? command[0] : 7;
++        g_diag_types[t].fetch_add(1);
++        const uint64_t n = g_diag_calls.fetch_add(1) + 1;
++        if (g_diag_dumped[t].fetch_add(1) < 3) {
++            const auto* in = reinterpret_cast<const uint32_t*>(static_cast<uint8_t*>(static_cast<ApuConnection*>(handle)->buffer) +
++                                                               (command[1] & 127) * 0x280);
++            std::fprintf(stderr, "[diag] xapu: cmd type %u slot %u caller %p cmd:", command[0], command[1], _ReturnAddress());
++            for (int i = 0; i < 12; ++i) std::fprintf(stderr, " %08x", command[i]);
++            std::fprintf(stderr, " | input slot:");
++            for (int i = 0; i < 16; ++i) std::fprintf(stderr, " %08x", in[i]);
++            std::fprintf(stderr, "\n");
++        }
++        if (n % 20000 == 0)
++            std::fprintf(stderr, "[diag] xapu: %llu commands: t0 %llu t1 %llu t2 %llu t3 %llu t4 %llu t5 %llu t6 %llu t7+ %llu\n",
++                         (unsigned long long)n, (unsigned long long)g_diag_types[0].load(),
++                         (unsigned long long)g_diag_types[1].load(), (unsigned long long)g_diag_types[2].load(),
++                         (unsigned long long)g_diag_types[3].load(), (unsigned long long)g_diag_types[4].load(),
++                         (unsigned long long)g_diag_types[5].load(), (unsigned long long)g_diag_types[6].load(),
++                         (unsigned long long)g_diag_types[7].load());
++    }
+     (void)flags;
+     auto* c = static_cast<ApuConnection*>(handle);
+     if (!c || !command) return E_INVALIDARG;

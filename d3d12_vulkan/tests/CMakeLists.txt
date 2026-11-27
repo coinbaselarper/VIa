@@ -1,0 +1,24 @@
+add_executable(d3d12vk_present_clear_test present_clear_test.cpp)
+target_link_libraries(d3d12vk_present_clear_test PRIVATE gta6rt_d3d12_vulkan gta6rt_d3d12_vulkan_headers)
+target_compile_options(d3d12vk_present_clear_test PRIVATE
+  -include "${CMAKE_CURRENT_SOURCE_DIR}/../platform/win32_host.h" -Wno-deprecated-declarations)
+
+add_executable(d3d12vk_register_test register_test.cpp)
+target_link_libraries(d3d12vk_register_test PRIVATE gta6rt_d3d12_vulkan gta6rt_d3d12_vulkan_headers gta6rt_shims_core
+  gta6rt_isa gta6rt_os)
+
+add_executable(d3d12vk_pso_accounting_test pso_accounting_test.cpp)
+target_compile_features(d3d12vk_pso_accounting_test PRIVATE cxx_std_20)
+
+add_executable(d3d12vk_fault_guard_test fault_guard_test.cpp)
+target_link_libraries(d3d12vk_fault_guard_test PRIVATE gta6rt_d3d12_vulkan gta6rt_isa gta6rt_os)
+target_include_directories(d3d12vk_fault_guard_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../platform")
+
+add_executable(d3d12vk_rect_list_vertex_test rect_list_vertex_test.cpp)
+target_include_directories(d3d12vk_rect_list_vertex_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../src")
+target_compile_options(d3d12vk_rect_list_vertex_test PRIVATE -include cstring)
+
+add_executable(d3d12vk_rts0_deserializer_test rts0_deserializer_test.cpp)
+target_link_libraries(d3d12vk_rts0_deserializer_test PRIVATE gta6rt_d3d12_vulkan gta6rt_d3d12_vulkan_headers
+  gta6rt_shims_core gta6rt_isa gta6rt_os)
+target_include_directories(d3d12vk_rts0_deserializer_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../platform")

@@ -1,0 +1,2789 @@
+{
+ "rule": "lane bad iff (c>>32)!=0 and (c&0xffffffff)<64",
+ "sites": [
+  {
+   "rva": 5810424,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c4e2fd45053f13be05",
+   "insn": "vpsrlvq ymm0, ymm0, ymmword ptr [rip + 0x5be133f]",
+   "func": [
+    5810192,
+    5811943
+   ],
+   "count_kind": "mem-const",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "11-11",
+    "0-0",
+    "25-25",
+    "0-0",
+    "1e-1e",
+    "0-0",
+    "1f-1f",
+    "0-0"
+   ],
+   "notes": []
+  },
+  {
+   "rva": 8659162,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c442dd47f5",
+   "insn": "vpsllvq ymm14, ymm4, ymm13",
+   "func": [
+    8658544,
+    8659597
+   ],
+   "count_kind": "reg",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0"
+   ],
+   "notes": []
+  },
+  {
+   "rva": 9634659,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c462ed45fb",
+   "insn": "vpsrlvq ymm15, ymm2, ymm3",
+   "func": [
+    9634464,
+    9635001
+   ],
+   "count_kind": "reg",
+   "verdict": "PATCH",
+   "count_dwords": [
+    "0-ffffffff",
+    "0-ffffffff",
+    "0-ffffffff",
+    "0-ffffffff",
+    "0-ffffffff",
+    "0-ffffffff",
+    "0-ffffffff",
+    "0-ffffffff"
+   ],
+   "notes": [
+    "v3: loop-carried definition at 930374"
+   ]
+  },
+  {
+   "rva": 9634701,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c442ed45fc",
+   "insn": "vpsrlvq ymm15, ymm2, ymm12",
+   "func": [
+    9634464,
+    9635001
+   ],
+   "count_kind": "reg",
+   "verdict": "PATCH",
+   "count_dwords": [
+    "0-ffffffff",
+    "0-ffffffff",
+    "0-ffffffff",
+    "0-ffffffff",
+    "0-ffffffff",
+    "0-ffffffff",
+    "0-ffffffff",
+    "0-ffffffff"
+   ],
+   "notes": []
+  },
+  {
+   "rva": 9634726,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c442ed45fd",
+   "insn": "vpsrlvq ymm15, ymm2, ymm13",
+   "func": [
+    9634464,
+    9635001
+   ],
+   "count_kind": "reg",
+   "verdict": "PATCH",
+   "count_dwords": [
+    "0-ffffffff",
+    "0-ffffffff",
+    "0-ffffffff",
+    "0-ffffffff",
+    "0-ffffffff",
+    "0-ffffffff",
+    "0-ffffffff",
+    "0-ffffffff"
+   ],
+   "notes": [
+    "v3: loop-carried definition at 930374"
+   ]
+  },
+  {
+   "rva": 9634755,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c442ed45fe",
+   "insn": "vpsrlvq ymm15, ymm2, ymm14",
+   "func": [
+    9634464,
+    9635001
+   ],
+   "count_kind": "reg",
+   "verdict": "PATCH",
+   "count_dwords": [
+    "0-ffffffff",
+    "0-ffffffff",
+    "0-ffffffff",
+    "0-ffffffff",
+    "0-ffffffff",
+    "0-ffffffff",
+    "0-ffffffff",
+    "0-ffffffff"
+   ],
+   "notes": [
+    "v3: loop-carried definition at 930374"
+   ]
+  },
+  {
+   "rva": 9730730,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c4e2f947051d438105",
+   "insn": "vpsllvq xmm0, xmm0, xmmword ptr [rip + 0x581431d]",
+   "func": [
+    9717760,
+    9731194
+   ],
+   "count_kind": "mem-const",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "38-38",
+    "0-0",
+    "30-30",
+    "0-0"
+   ],
+   "notes": []
+  },
+  {
+   "rva": 9730739,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c4e2f1470d04438105",
+   "insn": "vpsllvq xmm1, xmm1, xmmword ptr [rip + 0x5814304]",
+   "func": [
+    9717760,
+    9731194
+   ],
+   "count_kind": "mem-const",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "30-30",
+    "0-0",
+    "38-38",
+    "0-0"
+   ],
+   "notes": []
+  },
+  {
+   "rva": 20217156,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c4e2ed4505339de304",
+   "insn": "vpsrlvq ymm0, ymm2, ymmword ptr [rip + 0x4e39d33]",
+   "func": [
+    20217056,
+    20217550
+   ],
+   "count_kind": "mem-const",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "15-15",
+    "0-0",
+    "17-17",
+    "0-0",
+    "2b-2b",
+    "0-0",
+    "20-20",
+    "0-0"
+   ],
+   "notes": []
+  },
+  {
+   "rva": 20217165,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c4e2ed45154a9de304",
+   "insn": "vpsrlvq ymm2, ymm2, ymmword ptr [rip + 0x4e39d4a]",
+   "func": [
+    20217056,
+    20217550
+   ],
+   "count_kind": "mem-const",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "12-12",
+    "0-0",
+    "e-e",
+    "0-0",
+    "10-10",
+    "0-0",
+    "19-19",
+    "0-0"
+   ],
+   "notes": []
+  },
+  {
+   "rva": 23353947,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c4e2e947153c8ab304",
+   "insn": "vpsllvq xmm2, xmm2, xmmword ptr [rip + 0x4b38a3c]",
+   "func": [
+    23353744,
+    23354149
+   ],
+   "count_kind": "mem-const",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "2-2",
+    "0-0",
+    "6-6",
+    "0-0"
+   ],
+   "notes": []
+  },
+  {
+   "rva": 28735716,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c4e2e94715b36b6104",
+   "insn": "vpsllvq xmm2, xmm2, xmmword ptr [rip + 0x4616bb3]",
+   "func": [
+    28735520,
+    28735992
+   ],
+   "count_kind": "mem-const",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "2-2",
+    "0-0",
+    "6-6",
+    "0-0"
+   ],
+   "notes": []
+  },
+  {
+   "rva": 38295802,
+   "indirect_jumps_in_func": 1,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c4e2d9452d9d6bcd03",
+   "insn": "vpsrlvq xmm5, xmm4, xmmword ptr [rip + 0x3cd6b9d]",
+   "func": [
+    38294208,
+    38306505
+   ],
+   "count_kind": "mem-const",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "18-18",
+    "0-0",
+    "22-22",
+    "0-0"
+   ],
+   "notes": []
+  },
+  {
+   "rva": 38295811,
+   "indirect_jumps_in_func": 1,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c4e2d9451da46bcd03",
+   "insn": "vpsrlvq xmm3, xmm4, xmmword ptr [rip + 0x3cd6ba4]",
+   "func": [
+    38294208,
+    38306505
+   ],
+   "count_kind": "mem-const",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "1a-1a",
+    "0-0",
+    "24-24",
+    "0-0"
+   ],
+   "notes": []
+  },
+  {
+   "rva": 38295820,
+   "indirect_jumps_in_func": 1,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c4e2d94515ab6bcd03",
+   "insn": "vpsrlvq xmm2, xmm4, xmmword ptr [rip + 0x3cd6bab]",
+   "func": [
+    38294208,
+    38306505
+   ],
+   "count_kind": "mem-const",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "1c-1c",
+    "0-0",
+    "26-26",
+    "0-0"
+   ],
+   "notes": []
+  },
+  {
+   "rva": 38295829,
+   "indirect_jumps_in_func": 1,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c4e2d9450db26bcd03",
+   "insn": "vpsrlvq xmm1, xmm4, xmmword ptr [rip + 0x3cd6bb2]",
+   "func": [
+    38294208,
+    38306505
+   ],
+   "count_kind": "mem-const",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "1e-1e",
+    "0-0",
+    "28-28",
+    "0-0"
+   ],
+   "notes": []
+  },
+  {
+   "rva": 38295838,
+   "indirect_jumps_in_func": 1,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c4e2d94505b96bcd03",
+   "insn": "vpsrlvq xmm0, xmm4, xmmword ptr [rip + 0x3cd6bb9]",
+   "func": [
+    38294208,
+    38306505
+   ],
+   "count_kind": "mem-const",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "20-20",
+    "0-0",
+    "2a-2a",
+    "0-0"
+   ],
+   "notes": []
+  },
+  {
+   "rva": 38295847,
+   "indirect_jumps_in_func": 1,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c4e2d94525c06bcd03",
+   "insn": "vpsrlvq xmm4, xmm4, xmmword ptr [rip + 0x3cd6bc0]",
+   "func": [
+    38294208,
+    38306505
+   ],
+   "count_kind": "mem-const",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "23-23",
+    "0-0",
+    "2d-2d",
+    "0-0"
+   ],
+   "notes": []
+  },
+  {
+   "rva": 52846331,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c462cd47d0",
+   "insn": "vpsllvq ymm10, ymm6, ymm0",
+   "func": [
+    52830160,
+    52846683
+   ],
+   "count_kind": "reg",
+   "verdict": "PATCH",
+   "count_dwords": [
+    "0-ffffffff",
+    "0-ffffffff",
+    "0-ffffffff",
+    "0-ffffffff",
+    "0-ffffffff",
+    "0-ffffffff",
+    "0-ffffffff",
+    "0-ffffffff"
+   ],
+   "notes": [
+    "v0: loop-carried definition at 3265f00"
+   ]
+  },
+  {
+   "rva": 64416084,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c4e2f9470593a44002",
+   "insn": "vpsllvq xmm0, xmm0, xmmword ptr [rip + 0x240a493]",
+   "func": [
+    64414512,
+    64418112
+   ],
+   "count_kind": "mem-const",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "3e-3e",
+    "0-0",
+    "3a-3a",
+    "0-0"
+   ],
+   "notes": []
+  },
+  {
+   "rva": 81493796,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c4e2f1470d935f3b01",
+   "insn": "vpsllvq xmm1, xmm1, xmmword ptr [rip + 0x13b5f93]",
+   "func": [
+    81492976,
+    81494012
+   ],
+   "count_kind": "mem-const",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "30-30",
+    "0-0",
+    "20-20",
+    "0-0"
+   ],
+   "notes": []
+  },
+  {
+   "rva": 81493814,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c4e2e94715715f3b01",
+   "insn": "vpsllvq xmm2, xmm2, xmmword ptr [rip + 0x13b5f71]",
+   "func": [
+    81492976,
+    81494012
+   ],
+   "count_kind": "mem-const",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "20-20",
+    "0-0",
+    "30-30",
+    "0-0"
+   ],
+   "notes": []
+  },
+  {
+   "rva": 82422056,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c442b147ed",
+   "insn": "vpsllvq xmm13, xmm9, xmm13",
+   "func": [
+    82421456,
+    82423438
+   ],
+   "count_kind": "reg",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "0-7fffffff",
+    "0-0",
+    "0-7fffffff",
+    "0-0"
+   ],
+   "notes": [
+    "unmodelled def 4e9a8fc vcvttps2dq xmm12, xmm12",
+    "unmodelled def 4e9a901 vcvttps2dq xmm11, xmm11"
+   ]
+  },
+  {
+   "rva": 82422061,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c442b147db",
+   "insn": "vpsllvq xmm11, xmm9, xmm11",
+   "func": [
+    82421456,
+    82423438
+   ],
+   "count_kind": "reg",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "0-7fffffff",
+    "0-0",
+    "0-7fffffff",
+    "0-0"
+   ],
+   "notes": [
+    "unmodelled def 4e9a8fc vcvttps2dq xmm12, xmm12",
+    "unmodelled def 4e9a901 vcvttps2dq xmm11, xmm11"
+   ]
+  },
+  {
+   "rva": 82422076,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c4429147ee",
+   "insn": "vpsllvq xmm13, xmm13, xmm14",
+   "func": [
+    82421456,
+    82423438
+   ],
+   "count_kind": "reg",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0"
+   ],
+   "notes": [
+    "unmodelled def 4e9a8fc vcvttps2dq xmm12, xmm12"
+   ]
+  },
+  {
+   "rva": 82422081,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c442a147dc",
+   "insn": "vpsllvq xmm11, xmm11, xmm12",
+   "func": [
+    82421456,
+    82423438
+   ],
+   "count_kind": "reg",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0"
+   ],
+   "notes": [
+    "unmodelled def 4e9a8fc vcvttps2dq xmm12, xmm12"
+   ]
+  },
+  {
+   "rva": 82422592,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c442b147ed",
+   "insn": "vpsllvq xmm13, xmm9, xmm13",
+   "func": [
+    82421456,
+    82423438
+   ],
+   "count_kind": "reg",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0"
+   ],
+   "notes": []
+  },
+  {
+   "rva": 82422620,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c4429147ee",
+   "insn": "vpsllvq xmm13, xmm13, xmm14",
+   "func": [
+    82421456,
+    82423438
+   ],
+   "count_kind": "reg",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0"
+   ],
+   "notes": []
+  },
+  {
+   "rva": 82423303,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c442ad47ed",
+   "insn": "vpsllvq ymm13, ymm10, ymm13",
+   "func": [
+    82421456,
+    82423438
+   ],
+   "count_kind": "reg",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0"
+   ],
+   "notes": []
+  },
+  {
+   "rva": 82423324,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c4429547e4",
+   "insn": "vpsllvq ymm12, ymm13, ymm12",
+   "func": [
+    82421456,
+    82423438
+   ],
+   "count_kind": "reg",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0"
+   ],
+   "notes": []
+  },
+  {
+   "rva": 82800883,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c442b545cb",
+   "insn": "vpsrlvq ymm9, ymm9, ymm11",
+   "func": [
+    82800352,
+    82801872
+   ],
+   "count_kind": "reg",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "0-3f",
+    "0-0",
+    "0-3f",
+    "0-0",
+    "0-3f",
+    "0-0",
+    "0-3f",
+    "0-0"
+   ],
+   "notes": [
+    "v0: loop-carried definition at 4ef70ef"
+   ]
+  },
+  {
+   "rva": 82801788,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c442b545cb",
+   "insn": "vpsrlvq ymm9, ymm9, ymm11",
+   "func": [
+    82800352,
+    82801872
+   ],
+   "count_kind": "reg",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "0-3f",
+    "0-0",
+    "0-3f",
+    "0-0",
+    "0-3f",
+    "0-0",
+    "0-3f",
+    "0-0"
+   ],
+   "notes": [
+    "v0: loop-carried definition at 4ef7478"
+   ]
+  },
+  {
+   "rva": 82802301,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c442c545c0",
+   "insn": "vpsrlvq ymm8, ymm7, ymm8",
+   "func": [
+    82801872,
+    82816401
+   ],
+   "count_kind": "reg",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "0-3f",
+    "0-0",
+    "0-3f",
+    "0-0",
+    "0-3f",
+    "0-0",
+    "0-3f",
+    "0-0"
+   ],
+   "notes": [
+    "v1: loop-carried definition at 4ef766a"
+   ]
+  },
+  {
+   "rva": 82802306,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c4e2c545f6",
+   "insn": "vpsrlvq ymm6, ymm7, ymm6",
+   "func": [
+    82801872,
+    82816401
+   ],
+   "count_kind": "reg",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "0-3f",
+    "0-0",
+    "0-3f",
+    "0-0",
+    "0-3f",
+    "0-0",
+    "0-3f",
+    "0-0"
+   ],
+   "notes": [
+    "v1: loop-carried definition at 4ef766a"
+   ]
+  },
+  {
+   "rva": 82804294,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c442b545cb",
+   "insn": "vpsrlvq ymm9, ymm9, ymm11",
+   "func": [
+    82801872,
+    82816401
+   ],
+   "count_kind": "reg",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "0-3f",
+    "0-0",
+    "0-3f",
+    "0-0",
+    "0-3f",
+    "0-0",
+    "0-3f",
+    "0-0"
+   ],
+   "notes": [
+    "v0: loop-carried definition at 4ef7e42"
+   ]
+  },
+  {
+   "rva": 82804961,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c442b545cb",
+   "insn": "vpsrlvq ymm9, ymm9, ymm11",
+   "func": [
+    82801872,
+    82816401
+   ],
+   "count_kind": "reg",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "0-3f",
+    "0-0",
+    "0-3f",
+    "0-0",
+    "0-3f",
+    "0-0",
+    "0-3f",
+    "0-0"
+   ],
+   "notes": [
+    "v0: loop-carried definition at 4ef80dd"
+   ]
+  },
+  {
+   "rva": 82805334,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c442b545cb",
+   "insn": "vpsrlvq ymm9, ymm9, ymm11",
+   "func": [
+    82801872,
+    82816401
+   ],
+   "count_kind": "reg",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "0-3f",
+    "0-0",
+    "0-3f",
+    "0-0",
+    "0-3f",
+    "0-0",
+    "0-3f",
+    "0-0"
+   ],
+   "notes": [
+    "v0: loop-carried definition at 4ef8252"
+   ]
+  },
+  {
+   "rva": 82805771,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c442b545cb",
+   "insn": "vpsrlvq ymm9, ymm9, ymm11",
+   "func": [
+    82801872,
+    82816401
+   ],
+   "count_kind": "reg",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "0-3f",
+    "0-0",
+    "0-3f",
+    "0-0",
+    "0-3f",
+    "0-0",
+    "0-3f",
+    "0-0"
+   ],
+   "notes": [
+    "v0: loop-carried definition at 4ef8407"
+   ]
+  },
+  {
+   "rva": 82806444,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c442b545cb",
+   "insn": "vpsrlvq ymm9, ymm9, ymm11",
+   "func": [
+    82801872,
+    82816401
+   ],
+   "count_kind": "reg",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "0-3f",
+    "0-0",
+    "0-3f",
+    "0-0",
+    "0-3f",
+    "0-0",
+    "0-3f",
+    "0-0"
+   ],
+   "notes": [
+    "v0: loop-carried definition at 4ef86a8"
+   ]
+  },
+  {
+   "rva": 82806817,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c442b545cb",
+   "insn": "vpsrlvq ymm9, ymm9, ymm11",
+   "func": [
+    82801872,
+    82816401
+   ],
+   "count_kind": "reg",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "0-3f",
+    "0-0",
+    "0-3f",
+    "0-0",
+    "0-3f",
+    "0-0",
+    "0-3f",
+    "0-0"
+   ],
+   "notes": [
+    "v0: loop-carried definition at 4ef881d"
+   ]
+  },
+  {
+   "rva": 82807430,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c442b545cb",
+   "insn": "vpsrlvq ymm9, ymm9, ymm11",
+   "func": [
+    82801872,
+    82816401
+   ],
+   "count_kind": "reg",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "0-3f",
+    "0-0",
+    "0-3f",
+    "0-0",
+    "0-3f",
+    "0-0",
+    "0-3f",
+    "0-0"
+   ],
+   "notes": [
+    "v0: loop-carried definition at 4ef8a82"
+   ]
+  },
+  {
+   "rva": 82807927,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c442b545cb",
+   "insn": "vpsrlvq ymm9, ymm9, ymm11",
+   "func": [
+    82801872,
+    82816401
+   ],
+   "count_kind": "reg",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "0-3f",
+    "0-0",
+    "0-3f",
+    "0-0",
+    "0-3f",
+    "0-0",
+    "0-3f",
+    "0-0"
+   ],
+   "notes": [
+    "v0: loop-carried definition at 4ef8c73"
+   ]
+  },
+  {
+   "rva": 82809238,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c442b545cb",
+   "insn": "vpsrlvq ymm9, ymm9, ymm11",
+   "func": [
+    82801872,
+    82816401
+   ],
+   "count_kind": "reg",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "0-3f",
+    "0-0",
+    "0-3f",
+    "0-0",
+    "0-3f",
+    "0-0",
+    "0-3f",
+    "0-0"
+   ],
+   "notes": [
+    "v0: loop-carried definition at 4ef9192"
+   ]
+  },
+  {
+   "rva": 82809672,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c442b545cb",
+   "insn": "vpsrlvq ymm9, ymm9, ymm11",
+   "func": [
+    82801872,
+    82816401
+   ],
+   "count_kind": "reg",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "0-3f",
+    "0-0",
+    "0-3f",
+    "0-0",
+    "0-3f",
+    "0-0",
+    "0-3f",
+    "0-0"
+   ],
+   "notes": [
+    "v0: loop-carried definition at 4ef9344"
+   ]
+  },
+  {
+   "rva": 82810109,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c442b545cb",
+   "insn": "vpsrlvq ymm9, ymm9, ymm11",
+   "func": [
+    82801872,
+    82816401
+   ],
+   "count_kind": "reg",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "0-3f",
+    "0-0",
+    "0-3f",
+    "0-0",
+    "0-3f",
+    "0-0",
+    "0-3f",
+    "0-0"
+   ],
+   "notes": [
+    "v0: loop-carried definition at 4ef94f9"
+   ]
+  },
+  {
+   "rva": 82810516,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c442b545cb",
+   "insn": "vpsrlvq ymm9, ymm9, ymm11",
+   "func": [
+    82801872,
+    82816401
+   ],
+   "count_kind": "reg",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "0-3f",
+    "0-0",
+    "0-3f",
+    "0-0",
+    "0-3f",
+    "0-0",
+    "0-3f",
+    "0-0"
+   ],
+   "notes": [
+    "v0: loop-carried definition at 4ef9690"
+   ]
+  },
+  {
+   "rva": 82810927,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c442b545cb",
+   "insn": "vpsrlvq ymm9, ymm9, ymm11",
+   "func": [
+    82801872,
+    82816401
+   ],
+   "count_kind": "reg",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "0-3f",
+    "0-0",
+    "0-3f",
+    "0-0",
+    "0-3f",
+    "0-0",
+    "0-3f",
+    "0-0"
+   ],
+   "notes": [
+    "v0: loop-carried definition at 4ef982b"
+   ]
+  },
+  {
+   "rva": 82811300,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c442b545cb",
+   "insn": "vpsrlvq ymm9, ymm9, ymm11",
+   "func": [
+    82801872,
+    82816401
+   ],
+   "count_kind": "reg",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "0-3f",
+    "0-0",
+    "0-3f",
+    "0-0",
+    "0-3f",
+    "0-0",
+    "0-3f",
+    "0-0"
+   ],
+   "notes": [
+    "v0: loop-carried definition at 4ef99a0"
+   ]
+  },
+  {
+   "rva": 82811673,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c442b545cb",
+   "insn": "vpsrlvq ymm9, ymm9, ymm11",
+   "func": [
+    82801872,
+    82816401
+   ],
+   "count_kind": "reg",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "0-3f",
+    "0-0",
+    "0-3f",
+    "0-0",
+    "0-3f",
+    "0-0",
+    "0-3f",
+    "0-0"
+   ],
+   "notes": [
+    "v0: loop-carried definition at 4ef9b15"
+   ]
+  },
+  {
+   "rva": 82812056,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c442b545cb",
+   "insn": "vpsrlvq ymm9, ymm9, ymm11",
+   "func": [
+    82801872,
+    82816401
+   ],
+   "count_kind": "reg",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "0-3f",
+    "0-0",
+    "0-3f",
+    "0-0",
+    "0-3f",
+    "0-0",
+    "0-3f",
+    "0-0"
+   ],
+   "notes": [
+    "v0: loop-carried definition at 4ef9c94"
+   ]
+  },
+  {
+   "rva": 82812687,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c442b545cb",
+   "insn": "vpsrlvq ymm9, ymm9, ymm11",
+   "func": [
+    82801872,
+    82816401
+   ],
+   "count_kind": "reg",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "0-3f",
+    "0-0",
+    "0-3f",
+    "0-0",
+    "0-3f",
+    "0-0",
+    "0-3f",
+    "0-0"
+   ],
+   "notes": [
+    "v0: loop-carried definition at 4ef9f0b"
+   ]
+  },
+  {
+   "rva": 82813168,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c442b545cb",
+   "insn": "vpsrlvq ymm9, ymm9, ymm11",
+   "func": [
+    82801872,
+    82816401
+   ],
+   "count_kind": "reg",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "0-3f",
+    "0-0",
+    "0-3f",
+    "0-0",
+    "0-3f",
+    "0-0",
+    "0-3f",
+    "0-0"
+   ],
+   "notes": [
+    "v0: loop-carried definition at 4efa0ec"
+   ]
+  },
+  {
+   "rva": 82814009,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c442b545cb",
+   "insn": "vpsrlvq ymm9, ymm9, ymm11",
+   "func": [
+    82801872,
+    82816401
+   ],
+   "count_kind": "reg",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "0-3f",
+    "0-0",
+    "0-3f",
+    "0-0",
+    "0-3f",
+    "0-0",
+    "0-3f",
+    "0-0"
+   ],
+   "notes": [
+    "v0: loop-carried definition at 4efa435"
+   ]
+  },
+  {
+   "rva": 82814708,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c442b545cb",
+   "insn": "vpsrlvq ymm9, ymm9, ymm11",
+   "func": [
+    82801872,
+    82816401
+   ],
+   "count_kind": "reg",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "0-3f",
+    "0-0",
+    "0-3f",
+    "0-0",
+    "0-3f",
+    "0-0",
+    "0-3f",
+    "0-0"
+   ],
+   "notes": [
+    "v0: loop-carried definition at 4efa6f0"
+   ]
+  },
+  {
+   "rva": 82815149,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c442b545cb",
+   "insn": "vpsrlvq ymm9, ymm9, ymm11",
+   "func": [
+    82801872,
+    82816401
+   ],
+   "count_kind": "reg",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "0-3f",
+    "0-0",
+    "0-3f",
+    "0-0",
+    "0-3f",
+    "0-0",
+    "0-3f",
+    "0-0"
+   ],
+   "notes": [
+    "v0: loop-carried definition at 4efa8a9"
+   ]
+  },
+  {
+   "rva": 83047677,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c4428947db",
+   "insn": "vpsllvq xmm11, xmm14, xmm11",
+   "func": [
+    83045664,
+    83049798
+   ],
+   "count_kind": "reg",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "0-7fffffff",
+    "0-0",
+    "0-7fffffff",
+    "0-0"
+   ],
+   "notes": [
+    "unmodelled def 4f334b6 vcvttps2dq xmm2, xmm5",
+    "unmodelled def 4f334ba vcvttps2dq xmm11, xmm7"
+   ]
+  },
+  {
+   "rva": 83047682,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c4428947e4",
+   "insn": "vpsllvq xmm12, xmm14, xmm12",
+   "func": [
+    83045664,
+    83049798
+   ],
+   "count_kind": "reg",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "0-7fffffff",
+    "0-0",
+    "0-7fffffff",
+    "0-0"
+   ],
+   "notes": [
+    "unmodelled def 4f334b6 vcvttps2dq xmm2, xmm5",
+    "unmodelled def 4f334ba vcvttps2dq xmm11, xmm7"
+   ]
+  },
+  {
+   "rva": 83047697,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c4e2a147d2",
+   "insn": "vpsllvq xmm2, xmm11, xmm2",
+   "func": [
+    83045664,
+    83049798
+   ],
+   "count_kind": "reg",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0"
+   ],
+   "notes": [
+    "unmodelled def 4f334b6 vcvttps2dq xmm2, xmm5"
+   ]
+  },
+  {
+   "rva": 83047708,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c4429947e5",
+   "insn": "vpsllvq xmm12, xmm12, xmm13",
+   "func": [
+    83045664,
+    83049798
+   ],
+   "count_kind": "reg",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0"
+   ],
+   "notes": [
+    "unmodelled def 4f334b6 vcvttps2dq xmm2, xmm5"
+   ]
+  },
+  {
+   "rva": 83048513,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c4e28947d2",
+   "insn": "vpsllvq xmm2, xmm14, xmm2",
+   "func": [
+    83045664,
+    83049798
+   ],
+   "count_kind": "reg",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0"
+   ],
+   "notes": [
+    "unmodelled def 4f335b9 vcvttps2dq xmm12, xmm7",
+    "unmodelled def 4f335bd vcvttps2dq xmm3, xmm5",
+    "v12: loop-carried definition at 4f33686",
+    "v13: loop-carried definition at 4f335c1",
+    "v15: loop-carried definition at 4f335c6"
+   ]
+  },
+  {
+   "rva": 83048522,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c4e2e947d3",
+   "insn": "vpsllvq xmm2, xmm2, xmm3",
+   "func": [
+    83045664,
+    83049798
+   ],
+   "count_kind": "reg",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0"
+   ],
+   "notes": [
+    "unmodelled def 4f335bd vcvttps2dq xmm3, xmm5",
+    "v15: loop-carried definition at 4f335c6"
+   ]
+  },
+  {
+   "rva": 83048549,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c4e28947c9",
+   "insn": "vpsllvq xmm1, xmm14, xmm1",
+   "func": [
+    83045664,
+    83049798
+   ],
+   "count_kind": "reg",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0"
+   ],
+   "notes": [
+    "unmodelled def 4f335b9 vcvttps2dq xmm12, xmm7",
+    "unmodelled def 4f335bd vcvttps2dq xmm3, xmm5",
+    "v12: loop-carried definition at 4f33686",
+    "v13: loop-carried definition at 4f335c1",
+    "v15: loop-carried definition at 4f335c6"
+   ]
+  },
+  {
+   "rva": 83048558,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c4e2f147cb",
+   "insn": "vpsllvq xmm1, xmm1, xmm3",
+   "func": [
+    83045664,
+    83049798
+   ],
+   "count_kind": "reg",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0"
+   ],
+   "notes": [
+    "unmodelled def 4f335bd vcvttps2dq xmm3, xmm5",
+    "v15: loop-carried definition at 4f335c6"
+   ]
+  },
+  {
+   "rva": 83049558,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c4e2e147d2",
+   "insn": "vpsllvq xmm2, xmm3, xmm2",
+   "func": [
+    83045664,
+    83049798
+   ],
+   "count_kind": "reg",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0"
+   ],
+   "notes": [
+    "unmodelled def 4f32f58 vcvttps2dq xmm5, xmm5",
+    "unmodelled def 4f33107 vshufpd xmm8, xmm7, xmm7, 1"
+   ]
+  },
+  {
+   "rva": 83049567,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c4e2e947c9",
+   "insn": "vpsllvq xmm1, xmm2, xmm1",
+   "func": [
+    83045664,
+    83049798
+   ],
+   "count_kind": "reg",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0"
+   ],
+   "notes": [
+    "unmodelled def 4f33989 vcvttps2dq xmm1, xmm5",
+    "v6: loop-carried definition at 4f33992"
+   ]
+  },
+  {
+   "rva": 83049599,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c4e2e147c0",
+   "insn": "vpsllvq xmm0, xmm3, xmm0",
+   "func": [
+    83045664,
+    83049798
+   ],
+   "count_kind": "reg",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0"
+   ],
+   "notes": [
+    "unmodelled def 4f32f58 vcvttps2dq xmm5, xmm5",
+    "unmodelled def 4f33107 vshufpd xmm8, xmm7, xmm7, 1"
+   ]
+  },
+  {
+   "rva": 83049608,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c4e2f947c4",
+   "insn": "vpsllvq xmm0, xmm0, xmm4",
+   "func": [
+    83045664,
+    83049798
+   ],
+   "count_kind": "reg",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0"
+   ],
+   "notes": [
+    "unmodelled def 4f33989 vcvttps2dq xmm1, xmm5",
+    "v6: loop-carried definition at 4f33992"
+   ]
+  },
+  {
+   "rva": 83050716,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c442ad47e4",
+   "insn": "vpsllvq ymm12, ymm10, ymm12",
+   "func": [
+    83049808,
+    83053180
+   ],
+   "count_kind": "reg",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0"
+   ],
+   "notes": []
+  },
+  {
+   "rva": 83050742,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c4429d47db",
+   "insn": "vpsllvq ymm11, ymm12, ymm11",
+   "func": [
+    83049808,
+    83053180
+   ],
+   "count_kind": "reg",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0"
+   ],
+   "notes": []
+  },
+  {
+   "rva": 83050747,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c442ad47f6",
+   "insn": "vpsllvq ymm14, ymm10, ymm14",
+   "func": [
+    83049808,
+    83053180
+   ],
+   "count_kind": "reg",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0"
+   ],
+   "notes": []
+  },
+  {
+   "rva": 83050757,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c4428d47ed",
+   "insn": "vpsllvq ymm13, ymm14, ymm13",
+   "func": [
+    83049808,
+    83053180
+   ],
+   "count_kind": "reg",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0"
+   ],
+   "notes": []
+  },
+  {
+   "rva": 83051852,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c442ad47e4",
+   "insn": "vpsllvq ymm12, ymm10, ymm12",
+   "func": [
+    83049808,
+    83053180
+   ],
+   "count_kind": "reg",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0"
+   ],
+   "notes": []
+  },
+  {
+   "rva": 83051878,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c4429d47db",
+   "insn": "vpsllvq ymm11, ymm12, ymm11",
+   "func": [
+    83049808,
+    83053180
+   ],
+   "count_kind": "reg",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0"
+   ],
+   "notes": []
+  },
+  {
+   "rva": 83051883,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c442ad47f6",
+   "insn": "vpsllvq ymm14, ymm10, ymm14",
+   "func": [
+    83049808,
+    83053180
+   ],
+   "count_kind": "reg",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0"
+   ],
+   "notes": []
+  },
+  {
+   "rva": 83051893,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c4428d47ed",
+   "insn": "vpsllvq ymm13, ymm14, ymm13",
+   "func": [
+    83049808,
+    83053180
+   ],
+   "count_kind": "reg",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0"
+   ],
+   "notes": []
+  },
+  {
+   "rva": 83052865,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c4e2a547c9",
+   "insn": "vpsllvq ymm1, ymm11, ymm1",
+   "func": [
+    83049808,
+    83053180
+   ],
+   "count_kind": "reg",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0"
+   ],
+   "notes": []
+  },
+  {
+   "rva": 83052870,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c442a547ed",
+   "insn": "vpsllvq ymm13, ymm11, ymm13",
+   "func": [
+    83049808,
+    83053180
+   ],
+   "count_kind": "reg",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0"
+   ],
+   "notes": []
+  },
+  {
+   "rva": 83052884,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c4c2f547ce",
+   "insn": "vpsllvq ymm1, ymm1, ymm14",
+   "func": [
+    83049808,
+    83053180
+   ],
+   "count_kind": "reg",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0"
+   ],
+   "notes": []
+  },
+  {
+   "rva": 83052895,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c4429547e4",
+   "insn": "vpsllvq ymm12, ymm13, ymm12",
+   "func": [
+    83049808,
+    83053180
+   ],
+   "count_kind": "reg",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0"
+   ],
+   "notes": []
+  },
+  {
+   "rva": 83058932,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c442ad47f6",
+   "insn": "vpsllvq ymm14, ymm10, ymm14",
+   "func": [
+    83057424,
+    83061498
+   ],
+   "count_kind": "reg",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0"
+   ],
+   "notes": []
+  },
+  {
+   "rva": 83058942,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c4428d47ed",
+   "insn": "vpsllvq ymm13, ymm14, ymm13",
+   "func": [
+    83057424,
+    83061498
+   ],
+   "count_kind": "reg",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0"
+   ],
+   "notes": []
+  },
+  {
+   "rva": 83060443,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c442ad47f6",
+   "insn": "vpsllvq ymm14, ymm10, ymm14",
+   "func": [
+    83057424,
+    83061498
+   ],
+   "count_kind": "reg",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0"
+   ],
+   "notes": []
+  },
+  {
+   "rva": 83060463,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c4428d47ed",
+   "insn": "vpsllvq ymm13, ymm14, ymm13",
+   "func": [
+    83057424,
+    83061498
+   ],
+   "count_kind": "reg",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0"
+   ],
+   "notes": []
+  },
+  {
+   "rva": 83061154,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c4e2ed47c9",
+   "insn": "vpsllvq ymm1, ymm2, ymm1",
+   "func": [
+    83057424,
+    83061498
+   ],
+   "count_kind": "reg",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0"
+   ],
+   "notes": []
+  },
+  {
+   "rva": 83061163,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c4e2f547cb",
+   "insn": "vpsllvq ymm1, ymm1, ymm3",
+   "func": [
+    83057424,
+    83061498
+   ],
+   "count_kind": "reg",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0"
+   ],
+   "notes": []
+  },
+  {
+   "rva": 85414166,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c4429947ff",
+   "insn": "vpsllvq xmm15, xmm12, xmm15",
+   "func": [
+    85410368,
+    85417913
+   ],
+   "count_kind": "reg",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0"
+   ],
+   "notes": [
+    "unmodelled def 51750d8 vcvttps2dq xmm8, xmm8",
+    "unmodelled def 51750dd vcvttps2dq xmm4, xmm4"
+   ]
+  },
+  {
+   "rva": 85414171,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c4e29947e4",
+   "insn": "vpsllvq xmm4, xmm12, xmm4",
+   "func": [
+    85410368,
+    85417913
+   ],
+   "count_kind": "reg",
+   "verdict": "PATCH",
+   "count_dwords": [
+    "0-ffffffff",
+    "0-ffffffff",
+    "0-ffffffff",
+    "0-ffffffff"
+   ],
+   "notes": [
+    "unmodelled def 51750d8 vcvttps2dq xmm8, xmm8",
+    "unmodelled def 51750dd vcvttps2dq xmm4, xmm4",
+    "unmodelled def 517510d vpshufb xmm4, xmm4, xmm7",
+    "v7: loop-carried definition at 517522f"
+   ]
+  },
+  {
+   "rva": 85414185,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c4e28147db",
+   "insn": "vpsllvq xmm3, xmm15, xmm3",
+   "func": [
+    85410368,
+    85417913
+   ],
+   "count_kind": "reg",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0"
+   ],
+   "notes": [
+    "unmodelled def 51750d8 vcvttps2dq xmm8, xmm8"
+   ]
+  },
+  {
+   "rva": 85414190,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c442d947f8",
+   "insn": "vpsllvq xmm15, xmm4, xmm8",
+   "func": [
+    85410368,
+    85417913
+   ],
+   "count_kind": "reg",
+   "verdict": "PATCH",
+   "count_dwords": [
+    "0-ffffffff",
+    "0-ffffffff",
+    "0-ffffffff",
+    "0-ffffffff"
+   ],
+   "notes": [
+    "unmodelled def 51750d8 vcvttps2dq xmm8, xmm8",
+    "unmodelled def 51750f4 vpshufb xmm8, xmm8, xmm7",
+    "v7: loop-carried definition at 517522f"
+   ]
+  },
+  {
+   "rva": 85414259,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c4e29947db",
+   "insn": "vpsllvq xmm3, xmm12, xmm3",
+   "func": [
+    85410368,
+    85417913
+   ],
+   "count_kind": "reg",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "0-7fffffff",
+    "0-0",
+    "0-7fffffff",
+    "0-0"
+   ],
+   "notes": [
+    "unmodelled def 51750e1 vcvttps2dq xmm14, xmm14",
+    "unmodelled def 51750e6 vcvttps2dq xmm1, xmm1"
+   ]
+  },
+  {
+   "rva": 85414264,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c4e29947c9",
+   "insn": "vpsllvq xmm1, xmm12, xmm1",
+   "func": [
+    85410368,
+    85417913
+   ],
+   "count_kind": "reg",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "0-7fffffff",
+    "0-0",
+    "0-7fffffff",
+    "0-0"
+   ],
+   "notes": [
+    "unmodelled def 51750e1 vcvttps2dq xmm14, xmm14",
+    "unmodelled def 51750e6 vcvttps2dq xmm1, xmm1"
+   ]
+  },
+  {
+   "rva": 85414277,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c4c2e147d8",
+   "insn": "vpsllvq xmm3, xmm3, xmm8",
+   "func": [
+    85410368,
+    85417913
+   ],
+   "count_kind": "reg",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0"
+   ],
+   "notes": [
+    "unmodelled def 51750e1 vcvttps2dq xmm14, xmm14"
+   ]
+  },
+  {
+   "rva": 85414288,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c4c2f147c8",
+   "insn": "vpsllvq xmm1, xmm1, xmm8",
+   "func": [
+    85410368,
+    85417913
+   ],
+   "count_kind": "reg",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0"
+   ],
+   "notes": [
+    "unmodelled def 51750e1 vcvttps2dq xmm14, xmm14"
+   ]
+  },
+  {
+   "rva": 85415992,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c442ad47e4",
+   "insn": "vpsllvq ymm12, ymm10, ymm12",
+   "func": [
+    85410368,
+    85417913
+   ],
+   "count_kind": "reg",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0"
+   ],
+   "notes": []
+  },
+  {
+   "rva": 85416011,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c4e29d47db",
+   "insn": "vpsllvq ymm3, ymm12, ymm3",
+   "func": [
+    85410368,
+    85417913
+   ],
+   "count_kind": "reg",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0"
+   ],
+   "notes": []
+  },
+  {
+   "rva": 85416754,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c4429d47f6",
+   "insn": "vpsllvq ymm14, ymm12, ymm14",
+   "func": [
+    85410368,
+    85417913
+   ],
+   "count_kind": "reg",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0"
+   ],
+   "notes": []
+  },
+  {
+   "rva": 85416791,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c4428d47ed",
+   "insn": "vpsllvq ymm13, ymm14, ymm13",
+   "func": [
+    85410368,
+    85417913
+   ],
+   "count_kind": "reg",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0"
+   ],
+   "notes": []
+  },
+  {
+   "rva": 85416835,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c4e29d47ff",
+   "insn": "vpsllvq ymm7, ymm12, ymm7",
+   "func": [
+    85410368,
+    85417913
+   ],
+   "count_kind": "reg",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0"
+   ],
+   "notes": []
+  },
+  {
+   "rva": 85416844,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c4c2c547fd",
+   "insn": "vpsllvq ymm7, ymm7, ymm13",
+   "func": [
+    85410368,
+    85417913
+   ],
+   "count_kind": "reg",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0"
+   ],
+   "notes": []
+  },
+  {
+   "rva": 85417256,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c4e2ad47f6",
+   "insn": "vpsllvq ymm6, ymm10, ymm6",
+   "func": [
+    85410368,
+    85417913
+   ],
+   "count_kind": "reg",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0"
+   ],
+   "notes": []
+  },
+  {
+   "rva": 85417274,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c4e2cd47e4",
+   "insn": "vpsllvq ymm4, ymm6, ymm4",
+   "func": [
+    85410368,
+    85417913
+   ],
+   "count_kind": "reg",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0"
+   ],
+   "notes": []
+  },
+  {
+   "rva": 85417630,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c4429d47f6",
+   "insn": "vpsllvq ymm14, ymm12, ymm14",
+   "func": [
+    85410368,
+    85417913
+   ],
+   "count_kind": "reg",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0"
+   ],
+   "notes": []
+  },
+  {
+   "rva": 85417649,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c4e28d47e4",
+   "insn": "vpsllvq ymm4, ymm14, ymm4",
+   "func": [
+    85410368,
+    85417913
+   ],
+   "count_kind": "reg",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0"
+   ],
+   "notes": []
+  },
+  {
+   "rva": 86313200,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c442ed47c0",
+   "insn": "vpsllvq ymm8, ymm2, ymm8",
+   "func": [
+    86312704,
+    86314602
+   ],
+   "count_kind": "reg",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0"
+   ],
+   "notes": []
+  },
+  {
+   "rva": 86313209,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c4e2bd47ff",
+   "insn": "vpsllvq ymm7, ymm8, ymm7",
+   "func": [
+    86312704,
+    86314602
+   ],
+   "count_kind": "reg",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0"
+   ],
+   "notes": []
+  },
+  {
+   "rva": 86313840,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c442ed47c0",
+   "insn": "vpsllvq ymm8, ymm2, ymm8",
+   "func": [
+    86312704,
+    86314602
+   ],
+   "count_kind": "reg",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0"
+   ],
+   "notes": []
+  },
+  {
+   "rva": 86313849,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c4e2bd47ff",
+   "insn": "vpsllvq ymm7, ymm8, ymm7",
+   "func": [
+    86312704,
+    86314602
+   ],
+   "count_kind": "reg",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0"
+   ],
+   "notes": []
+  },
+  {
+   "rva": 86314385,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c442c547c9",
+   "insn": "vpsllvq ymm9, ymm7, ymm9",
+   "func": [
+    86312704,
+    86314602
+   ],
+   "count_kind": "reg",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0"
+   ],
+   "notes": []
+  },
+  {
+   "rva": 86314394,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c442b547c0",
+   "insn": "vpsllvq ymm8, ymm9, ymm8",
+   "func": [
+    86312704,
+    86314602
+   ],
+   "count_kind": "reg",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0",
+    "0-ffffffff",
+    "0-0"
+   ],
+   "notes": []
+  },
+  {
+   "rva": 87390481,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c442b545cb",
+   "insn": "vpsrlvq ymm9, ymm9, ymm11",
+   "func": [
+    87389984,
+    87390744
+   ],
+   "count_kind": "reg",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "0-3f",
+    "0-0",
+    "0-3f",
+    "0-0",
+    "0-3f",
+    "0-0",
+    "0-3f",
+    "0-0"
+   ],
+   "notes": [
+    "v0: loop-carried definition at 535790d"
+   ]
+  },
+  {
+   "rva": 89968327,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c442b545cb",
+   "insn": "vpsrlvq ymm9, ymm9, ymm11",
+   "func": [
+    89967936,
+    89969773
+   ],
+   "count_kind": "reg",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "0-3f",
+    "0-0",
+    "0-3f",
+    "0-0",
+    "0-3f",
+    "0-0",
+    "0-3f",
+    "0-0"
+   ],
+   "notes": [
+    "v0: loop-carried definition at 55ccf3a"
+   ]
+  },
+  {
+   "rva": 90850339,
+   "indirect_jumps_in_func": 0,
+   "external_entries": 0,
+   "unwind_flags": 0,
+   "bytes": "c442b545cb",
+   "insn": "vpsrlvq ymm9, ymm9, ymm11",
+   "func": [
+    90849888,
+    90850435
+   ],
+   "count_kind": "reg",
+   "verdict": "SAFE",
+   "count_dwords": [
+    "0-3f",
+    "0-0",
+    "0-3f",
+    "0-0",
+    "0-3f",
+    "0-0",
+    "0-3f",
+    "0-0"
+   ],
+   "notes": [
+    "v0: loop-carried definition at 56a441f"
+   ]
+  }
+ ],
+ "n_safe": 105,
+ "n_patch": 7
+}

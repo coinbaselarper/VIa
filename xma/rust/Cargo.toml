@@ -1,0 +1,21 @@
+[package]
+name = "gta6rt-xma-decoder"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+publish = false
+
+[lib]
+name = "gta6rt_xma_decoder"
+crate-type = ["staticlib"]
+path = "src/lib.rs"
+
+[dependencies]
+xma = { path = "../third_party/xma" }
+
+[profile.release]
+panic = "unwind"
+opt-level = 3
+codegen-units = 1
+lto = true
+debug = false

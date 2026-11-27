@@ -1,0 +1,22 @@
+--- a/src/file_system.cpp
++++ b/src/file_system.cpp
+@@ -543,6 +543,11 @@
+         if (g_files.count(o)) return {static_cast<FileObj*>(o), false};
+     }
+     return {nullptr, true};
++}
++
++int WINAPI file_native_fd(HANDLE h) {
++    const FileRef rf = file_ref(h);
++    return rf.core && !rf.core->is_dir ? rf.core->fd : -1;
+ }
+ 
+ BOOL foreign_unavailable() {
+@@ -1771,6 +1776,7 @@
+ }  // namespace
+ 
+ SHIM_TABLE(file_system,
++    SHIM("gta6rt.internal", "FileNativeFd", file_native_fd),
+     F("CreateFileA", create_file_a), F("CreateFileW", create_file_w), F("CreateFile2", create_file2),
+     F("ReadFile", read_file), F("ReadFileEx", read_file_ex), F("ReadFileScatter", read_file_scatter),
+     F("WriteFile", write_file), F("GetFileSizeEx", get_file_size_ex), F("GetFileSize", get_file_size),

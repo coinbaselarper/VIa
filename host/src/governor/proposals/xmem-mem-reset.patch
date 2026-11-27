@@ -1,0 +1,15 @@
+--- a/shims_core/src/xmem.cpp	2026-11-26 16:58:40
++++ shims_core/src/xmem.cpp	2026-11-26 17:13:43
+@@ -577,7 +577,11 @@
+     const uint32_t vm_prot = to_vm_prot(protect);
+     const bool large = (type & kMemLargePages) != 0;
+     const std::lock_guard lock(g_mutex);
+-    if (type & kMemReset) return address;
++    if (type & kMemReset) {
++        // MEM_RESET: the contents may be discarded; MADV_FREE lets the kernel drop the pages instead of compressing them.
++        if (address) gta6rt_vm_reset(address, size);
++        return address;
++    }
+     void* base = address;
+     uint64_t length = size;
+     if (address) {

@@ -1,0 +1,197 @@
+#pragma once
+
+// Format identifiers the D3D12 front end shares with d3d12_vulkan: VkFormat values (from the Vulkan headers, as plain
+// enumerators; no Vulkan function is called) key the GFX10 descriptor encoders and the footprint tables. block_format
+// is copied from d3d12_vulkan/src/vulkan_replay.h unchanged (ORIGIN.md); metal_format maps an identifier to the DXGI
+// format gta6rt::gpu creates.
+
+#include <vulkan/vulkan_core.h>
+
+#include <cstdint>
+
+#include <d3d12.h>
+
+namespace leonida {
+
+// Bytes per texel, or per 4x4 block for block-compressed formats, of one aspect as copies lay it out in a buffer
+// (D3D12 footprints and Vulkan buffer-image copies agree on these). bytes == 0: not a format copies support yet.
+struct BlockFormat {
+    std::uint32_t bytes = 0;
+    std::uint32_t block = 1;  // texels per block edge
+};
+
+inline BlockFormat block_format(VkFormat format, VkImageAspectFlags aspect) {
+    if (aspect == VK_IMAGE_ASPECT_STENCIL_BIT) return {1, 1};
+    switch (format) {
+    case VK_FORMAT_R32G32B32A32_SFLOAT:
+    case VK_FORMAT_R32G32B32A32_SINT:
+    case VK_FORMAT_R32G32B32A32_UINT: return {16, 1};
+    case VK_FORMAT_R16G16B16A16_SFLOAT:
+    case VK_FORMAT_R16G16B16A16_UNORM:
+    case VK_FORMAT_R16G16B16A16_SNORM:
+    case VK_FORMAT_R16G16B16A16_UINT:
+    case VK_FORMAT_R16G16B16A16_SINT:
+    case VK_FORMAT_R32G32_SFLOAT:
+    case VK_FORMAT_R32G32_UINT:
+    case VK_FORMAT_R32G32_SINT: return {8, 1};
+    case VK_FORMAT_A2B10G10R10_UNORM_PACK32:
+    case VK_FORMAT_A2B10G10R10_UINT_PACK32:
+    case VK_FORMAT_E5B9G9R9_UFLOAT_PACK32:
+    case VK_FORMAT_B10G11R11_UFLOAT_PACK32:
+    case VK_FORMAT_R8G8B8A8_UNORM:
+    case VK_FORMAT_R8G8B8A8_SRGB:
+    case VK_FORMAT_R8G8B8A8_SNORM:
+    case VK_FORMAT_R8G8B8A8_UINT:
+    case VK_FORMAT_R8G8B8A8_SINT:
+    case VK_FORMAT_B8G8R8A8_UNORM:
+    case VK_FORMAT_B8G8R8A8_SRGB:
+    case VK_FORMAT_R16G16_SFLOAT:
+    case VK_FORMAT_R16G16_UNORM:
+    case VK_FORMAT_R16G16_SNORM:
+    case VK_FORMAT_R16G16_UINT:
+    case VK_FORMAT_R16G16_SINT:
+    case VK_FORMAT_R32_SFLOAT:
+    case VK_FORMAT_R32_UINT:
+    case VK_FORMAT_R32_SINT:
+    case VK_FORMAT_D32_SFLOAT:
+    case VK_FORMAT_D32_SFLOAT_S8_UINT:  // depth aspect
+    case VK_FORMAT_D24_UNORM_S8_UINT: return {4, 1};
+    case VK_FORMAT_R8G8_UNORM:
+    case VK_FORMAT_R8G8_SNORM:
+    case VK_FORMAT_R5G6B5_UNORM_PACK16:
+    case VK_FORMAT_A1R5G5B5_UNORM_PACK16:
+    case VK_FORMAT_R8G8_UINT:
+    case VK_FORMAT_R8G8_SINT:
+    case VK_FORMAT_R16_SFLOAT:
+    case VK_FORMAT_R16_UNORM:
+    case VK_FORMAT_R16_SNORM:
+    case VK_FORMAT_R16_UINT:
+    case VK_FORMAT_R16_SINT:
+    case VK_FORMAT_A4R4G4B4_UNORM_PACK16:
+    case VK_FORMAT_R4G4B4A4_UNORM_PACK16:
+    case VK_FORMAT_D16_UNORM_S8_UINT:
+    case VK_FORMAT_D16_UNORM: return {2, 1};
+    case VK_FORMAT_R8_UNORM:
+    case VK_FORMAT_R8_SNORM:
+    case VK_FORMAT_R8_UINT:
+    case VK_FORMAT_R8_SINT:
+#ifdef VK_KHR_MAINTENANCE_5_EXTENSION_NAME
+    case VK_FORMAT_A8_UNORM_KHR:  // an A8_UNORM render target (VulkanDeviceInfo::a8_render_target)
+#endif
+        return {1, 1};
+    case VK_FORMAT_BC1_RGBA_UNORM_BLOCK:
+    case VK_FORMAT_BC1_RGBA_SRGB_BLOCK:
+    case VK_FORMAT_BC4_UNORM_BLOCK:
+    case VK_FORMAT_BC4_SNORM_BLOCK: return {8, 4};
+    case VK_FORMAT_BC2_UNORM_BLOCK:
+    case VK_FORMAT_BC2_SRGB_BLOCK:
+    case VK_FORMAT_BC3_UNORM_BLOCK:
+    case VK_FORMAT_BC3_SRGB_BLOCK:
+    case VK_FORMAT_BC5_UNORM_BLOCK:
+    case VK_FORMAT_BC5_SNORM_BLOCK:
+    case VK_FORMAT_BC6H_UFLOAT_BLOCK:
+    case VK_FORMAT_BC6H_SFLOAT_BLOCK:
+    case VK_FORMAT_BC7_UNORM_BLOCK:
+    case VK_FORMAT_BC7_SRGB_BLOCK: return {16, 4};
+    default: return {};
+    }
+}
+
+inline constexpr std::uint32_t rgb96_bytes = 12;
+
+// port/d3d12_metal: the DXGI format the Metal backend creates for a VkFormat identifier (gta6rt::gpu numbers formats
+// the DXGI way). 0 when the backend has none.
+inline std::uint32_t metal_format(VkFormat format) {
+    switch (format) {
+    case VK_FORMAT_R32G32B32A32_SFLOAT: return DXGI_FORMAT_R32G32B32A32_FLOAT;
+    case VK_FORMAT_R32G32B32A32_UINT: return DXGI_FORMAT_R32G32B32A32_UINT;
+    case VK_FORMAT_R32G32B32A32_SINT: return DXGI_FORMAT_R32G32B32A32_SINT;
+    case VK_FORMAT_R16G16B16A16_SFLOAT: return DXGI_FORMAT_R16G16B16A16_FLOAT;
+    case VK_FORMAT_R16G16B16A16_UNORM: return DXGI_FORMAT_R16G16B16A16_UNORM;
+    case VK_FORMAT_R16G16B16A16_SNORM: return DXGI_FORMAT_R16G16B16A16_SNORM;
+    case VK_FORMAT_R16G16B16A16_UINT: return DXGI_FORMAT_R16G16B16A16_UINT;
+    case VK_FORMAT_R16G16B16A16_SINT: return DXGI_FORMAT_R16G16B16A16_SINT;
+    case VK_FORMAT_R32G32_SFLOAT: return DXGI_FORMAT_R32G32_FLOAT;
+    case VK_FORMAT_R32G32_UINT: return DXGI_FORMAT_R32G32_UINT;
+    case VK_FORMAT_R32G32_SINT: return DXGI_FORMAT_R32G32_SINT;
+    case VK_FORMAT_A2B10G10R10_UNORM_PACK32: return DXGI_FORMAT_R10G10B10A2_UNORM;
+    case VK_FORMAT_A2B10G10R10_UINT_PACK32: return DXGI_FORMAT_R10G10B10A2_UINT;
+    case VK_FORMAT_E5B9G9R9_UFLOAT_PACK32: return DXGI_FORMAT_R9G9B9E5_SHAREDEXP;
+    case VK_FORMAT_B10G11R11_UFLOAT_PACK32: return DXGI_FORMAT_R11G11B10_FLOAT;
+    case VK_FORMAT_R8G8B8A8_UNORM: return DXGI_FORMAT_R8G8B8A8_UNORM;
+    case VK_FORMAT_R8G8B8A8_SRGB: return DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+    case VK_FORMAT_R8G8B8A8_SNORM: return DXGI_FORMAT_R8G8B8A8_SNORM;
+    case VK_FORMAT_R8G8B8A8_UINT: return DXGI_FORMAT_R8G8B8A8_UINT;
+    case VK_FORMAT_R8G8B8A8_SINT: return DXGI_FORMAT_R8G8B8A8_SINT;
+    case VK_FORMAT_B8G8R8A8_UNORM: return DXGI_FORMAT_B8G8R8A8_UNORM;
+    case VK_FORMAT_B8G8R8A8_SRGB: return DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+    case VK_FORMAT_A4R4G4B4_UNORM_PACK16: return DXGI_FORMAT_B4G4R4A4_UNORM;
+    case VK_FORMAT_R16G16_SFLOAT: return DXGI_FORMAT_R16G16_FLOAT;
+    case VK_FORMAT_R16G16_UNORM: return DXGI_FORMAT_R16G16_UNORM;
+    case VK_FORMAT_R16G16_SNORM: return DXGI_FORMAT_R16G16_SNORM;
+    case VK_FORMAT_R16G16_UINT: return DXGI_FORMAT_R16G16_UINT;
+    case VK_FORMAT_R16G16_SINT: return DXGI_FORMAT_R16G16_SINT;
+    case VK_FORMAT_R8G8_UNORM: return DXGI_FORMAT_R8G8_UNORM;
+    case VK_FORMAT_R8G8_SNORM: return DXGI_FORMAT_R8G8_SNORM;
+    case VK_FORMAT_R8G8_UINT: return DXGI_FORMAT_R8G8_UINT;
+    case VK_FORMAT_R8G8_SINT: return DXGI_FORMAT_R8G8_SINT;
+    case VK_FORMAT_R16_UNORM: return DXGI_FORMAT_R16_UNORM;
+    case VK_FORMAT_R16_SNORM: return DXGI_FORMAT_R16_SNORM;
+    case VK_FORMAT_R16_UINT: return DXGI_FORMAT_R16_UINT;
+    case VK_FORMAT_R16_SINT: return DXGI_FORMAT_R16_SINT;
+    case VK_FORMAT_R16_SFLOAT: return DXGI_FORMAT_R16_FLOAT;
+    case VK_FORMAT_R5G6B5_UNORM_PACK16: return DXGI_FORMAT_B5G6R5_UNORM;
+    case VK_FORMAT_A1R5G5B5_UNORM_PACK16: return DXGI_FORMAT_B5G5R5A1_UNORM;
+    case VK_FORMAT_R8_UNORM: return DXGI_FORMAT_R8_UNORM;
+    case VK_FORMAT_R8_SNORM: return DXGI_FORMAT_R8_SNORM;
+    case VK_FORMAT_R8_UINT: return DXGI_FORMAT_R8_UINT;
+    case VK_FORMAT_R8_SINT: return DXGI_FORMAT_R8_SINT;
+    case VK_FORMAT_R32_SFLOAT: return DXGI_FORMAT_R32_FLOAT;
+    case VK_FORMAT_R32_UINT: return DXGI_FORMAT_R32_UINT;
+    case VK_FORMAT_R32_SINT: return DXGI_FORMAT_R32_SINT;
+    case VK_FORMAT_BC1_RGBA_UNORM_BLOCK: return DXGI_FORMAT_BC1_UNORM;
+    case VK_FORMAT_BC1_RGBA_SRGB_BLOCK: return DXGI_FORMAT_BC1_UNORM_SRGB;
+    case VK_FORMAT_BC2_UNORM_BLOCK: return DXGI_FORMAT_BC2_UNORM;
+    case VK_FORMAT_BC2_SRGB_BLOCK: return DXGI_FORMAT_BC2_UNORM_SRGB;
+    case VK_FORMAT_BC3_UNORM_BLOCK: return DXGI_FORMAT_BC3_UNORM;
+    case VK_FORMAT_BC3_SRGB_BLOCK: return DXGI_FORMAT_BC3_UNORM_SRGB;
+    case VK_FORMAT_BC4_UNORM_BLOCK: return DXGI_FORMAT_BC4_UNORM;
+    case VK_FORMAT_BC4_SNORM_BLOCK: return DXGI_FORMAT_BC4_SNORM;
+    case VK_FORMAT_BC5_UNORM_BLOCK: return DXGI_FORMAT_BC5_UNORM;
+    case VK_FORMAT_BC5_SNORM_BLOCK: return DXGI_FORMAT_BC5_SNORM;
+    case VK_FORMAT_BC6H_UFLOAT_BLOCK: return DXGI_FORMAT_BC6H_UF16;
+    case VK_FORMAT_BC6H_SFLOAT_BLOCK: return DXGI_FORMAT_BC6H_SF16;
+    case VK_FORMAT_BC7_UNORM_BLOCK: return DXGI_FORMAT_BC7_UNORM;
+    case VK_FORMAT_BC7_SRGB_BLOCK: return DXGI_FORMAT_BC7_UNORM_SRGB;
+    case VK_FORMAT_D32_SFLOAT: return DXGI_FORMAT_D32_FLOAT;
+    case VK_FORMAT_D16_UNORM: return DXGI_FORMAT_D16_UNORM;
+    case VK_FORMAT_D32_SFLOAT_S8_UINT: return DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+    case VK_FORMAT_D24_UNORM_S8_UINT: return DXGI_FORMAT_D24_UNORM_S8_UINT;
+    case VK_FORMAT_A8_UNORM_KHR: return DXGI_FORMAT_A8_UNORM;
+    default: return 0;
+    }
+}
+
+// The DXGI typeless family a color view format belongs to (d3d12_vulkan/src/vulkan_replay.h, copied unchanged).
+inline int typeless_view_family(VkFormat format) {
+    switch (format) {
+    case VK_FORMAT_R8G8B8A8_UNORM: case VK_FORMAT_R8G8B8A8_SRGB: case VK_FORMAT_R8G8B8A8_SNORM:
+    case VK_FORMAT_R8G8B8A8_UINT: case VK_FORMAT_R8G8B8A8_SINT: return 1;
+    case VK_FORMAT_B8G8R8A8_UNORM: case VK_FORMAT_B8G8R8A8_SRGB: return 2;
+    case VK_FORMAT_R16G16B16A16_SFLOAT: case VK_FORMAT_R16G16B16A16_UNORM: case VK_FORMAT_R16G16B16A16_SNORM:
+    case VK_FORMAT_R16G16B16A16_UINT: case VK_FORMAT_R16G16B16A16_SINT: return 3;
+    case VK_FORMAT_R32G32B32A32_SFLOAT: case VK_FORMAT_R32G32B32A32_UINT: case VK_FORMAT_R32G32B32A32_SINT: return 4;
+    case VK_FORMAT_R32G32_SFLOAT: case VK_FORMAT_R32G32_UINT: case VK_FORMAT_R32G32_SINT: return 5;
+    case VK_FORMAT_R16G16_SFLOAT: case VK_FORMAT_R16G16_UNORM: case VK_FORMAT_R16G16_SNORM:
+    case VK_FORMAT_R16G16_UINT: case VK_FORMAT_R16G16_SINT: return 6;
+    case VK_FORMAT_A2B10G10R10_UNORM_PACK32: case VK_FORMAT_A2B10G10R10_UINT_PACK32: return 7;
+    case VK_FORMAT_R8G8_UNORM: case VK_FORMAT_R8G8_SNORM: case VK_FORMAT_R8G8_UINT: case VK_FORMAT_R8G8_SINT: return 8;
+    case VK_FORMAT_R32_SFLOAT: case VK_FORMAT_R32_UINT: case VK_FORMAT_R32_SINT: return 9;
+    case VK_FORMAT_R16_SFLOAT: case VK_FORMAT_R16_UNORM: case VK_FORMAT_R16_SNORM: case VK_FORMAT_R16_UINT:
+    case VK_FORMAT_R16_SINT: return 10;
+    case VK_FORMAT_R8_UNORM: case VK_FORMAT_R8_SNORM: case VK_FORMAT_R8_UINT: case VK_FORMAT_R8_SINT: return 11;
+    default: return 0;
+    }
+}
+
+}  // namespace leonida
