@@ -706,7 +706,7 @@ private:
         if (f == Fate::compiling && compute_waits()) {
             const auto t0 = std::chrono::steady_clock::now();
             p.pipeline->wait();
-            note_compute_wait(p.name, std::chrono::steady_clock::now() - t0);
+            note_pipeline_wait("compute", p.name, std::chrono::steady_clock::now() - t0);
             f = pipeline_fate(p.pipeline, why);
         }
         return f;
@@ -720,24 +720,27 @@ private:
         }();
         return on;
     }
-    static void note_compute_wait(const char* name, std::chrono::steady_clock::duration d) {
+    static void note_pipeline_wait(const char* kind, const char* name, std::chrono::steady_clock::duration d) {
         static std::mutex m;
-        static std::uint64_t waits = 0, reported = 0;
-        static double total_ms = 0, longest_ms = 0;
+        static std::uint64_t waits[2] = {}, reported = 0;
+        static double total_ms[2] = {}, longest_ms = 0;
         static std::string longest;
         static auto last = std::chrono::steady_clock::now();
         const double ms = std::chrono::duration<double, std::milli>(d).count();
+        const int k = kind[0] == 'd';
         std::lock_guard lock(m);
-        ++waits;
-        total_ms += ms;
+        ++waits[k];
+        total_ms[k] += ms;
         if (ms > longest_ms) longest_ms = ms, longest = name ? name : "?";
         const auto now = std::chrono::steady_clock::now();
         if (now - last < std::chrono::seconds(5) && reported) return;
         last = now;
-        reported = waits;
-        std::fprintf(stderr, "[rt] d3d12-metal: compute passes that waited for their pipeline (GTA6RT_METAL_COMPUTE_WAIT): "
-                             "%llu, %.0f ms in all, longest %.0f ms (%s)\n",
-                     static_cast<unsigned long long>(waits), total_ms, longest_ms, longest.c_str());
+        reported = waits[0] + waits[1];
+        std::fprintf(stderr, "[rt] d3d12-metal: work that waited for its pipeline instead of being skipped "
+                             "(GTA6RT_METAL_COMPUTE_WAIT / _DRAW_WAIT): compute %llu (%.0f ms), draws %llu (%.0f ms), "
+                             "longest %.0f ms (%s)\n",
+                     static_cast<unsigned long long>(waits[0]), total_ms[0], static_cast<unsigned long long>(waits[1]),
+                     total_ms[1], longest_ms, longest.c_str());
     }
     // A compute pass skipped: into the per-pipeline report; one whose pipeline waits in the compile queue (a prebuild
     // queues at background priority) is moved up to demand, as the backend's own NotReady path does for draws.
@@ -1105,8 +1108,24 @@ private:
             why = p.name;
             return Fate::pso_refused;
         }
-        if (p.mesh) return pipeline_fate(p.mesh, why);
-        return pipeline_fate(p.render, why);
+        gpu::Pipeline* pl = p.mesh ? static_cast<gpu::Pipeline*>(p.mesh) : static_cast<gpu::Pipeline*>(p.render);
+        return draw_fate(pl, p.name, why);
+    }
+    // GTA6RT_METAL_DRAW_WAIT (default on, 0: off): a draw whose pipeline is still compiling waits for it instead of
+    // being skipped (as GTA6RT_METAL_COMPUTE_WAIT for compute passes).
+    static Fate draw_fate(gpu::Pipeline* pl, const char* name, const char*& why) {
+        static const bool on = [] {
+            const char* v = std::getenv("GTA6RT_METAL_DRAW_WAIT");
+            return !v || std::strcmp(v, "0") != 0;
+        }();
+        Fate f = pipeline_fate(pl, why);
+        if (f == Fate::compiling && on) {
+            const auto t0 = std::chrono::steady_clock::now();
+            pl->wait();
+            note_pipeline_wait("draw", name, std::chrono::steady_clock::now() - t0);
+            f = pipeline_fate(pl, why);
+        }
+        return f;
     }
     static Work work_of(const Draw& draw, const MetalGraphicsPipeline& p, bool indirect) {
         if (draw.mesh || p.mesh)
@@ -1182,7 +1201,7 @@ private:
                     unsupported("rect-list draw whose rectangle pipeline variant is not built");
                     return Fate::library_pending;
                 }
-                if (const Fate f = pipeline_fate(pipeline, why); f != Fate::recorded) return f;
+                if (const Fate f = draw_fate(pipeline, p.name, why); f != Fate::recorded) return f;
             }
             out_.set_pipeline(pipeline);
             // A rect-list draw the backend expands on the CPU reads slot 0's vertices (and the indices) through their
