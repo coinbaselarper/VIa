@@ -30,8 +30,9 @@ slot_lock_take() {
     mkdir -p "$(dirname "$SLOT_LOCK")"
     local said=0 holder age
     until mkdir "$SLOT_LOCK" 2>/dev/null; do
-        holder=$(cat "$SLOT_LOCK/pid" 2>/dev/null)
-        if [ -n "$holder" ] && ! kill -0 "$holder" 2>/dev/null; then
+        holder=$(cat "$SLOT_LOCK/pid" "$SLOT_LOCK/owner" 2>/dev/null | head -1)
+        # ps, not kill -0: signalling another worker's process can fail across sandboxes (EPERM reads as dead)
+        if [ -n "$holder" ] && ! ps -p "$holder" >/dev/null 2>&1; then
             rm -rf "$SLOT_LOCK"; continue
         fi
         age=$(( $(date +%s) - $(stat -f %m "$SLOT_LOCK" 2>/dev/null || date +%s) ))
@@ -44,6 +45,7 @@ slot_lock_take() {
         sleep 1
     done
     echo $$ >"$SLOT_LOCK/pid"
+    echo $$ >"$SLOT_LOCK/owner"
 }
 
 slot_take() {

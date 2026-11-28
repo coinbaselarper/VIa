@@ -506,8 +506,11 @@ private:
     Target albedo_target_[2];
     std::chrono::steady_clock::time_point created_ = std::chrono::steady_clock::now();
     // GTA6RT_METAL_GBUFFER_CHECK=<s> (default 10, 0: off), in every run: the frame s seconds after the first upscaled
-    // one reads back RT0 of its main G-buffer pass (the render-size pass of 4+ targets with the most draws) and logs
-    // its coverage with a verdict. Without other scene switches the probe does nothing else.
+    // one reads back the G-buffer's RT0 (the render-size set of 4+ targets with the most draws in the frame) at the
+    // end of the last pass that drew into it, and logs its coverage with a verdict: NO MAIN PASS under 500 draws in
+    // that set, BROKEN under GTA6RT_METAL_GBUFFER_CHECK_MIN % (default 50) of RT0 written; with the frame's indirect
+    // draws (empty ones, mesh groups into that set). It sees G-buffer loss, not faults added after the G-buffer.
+    // Without other scene switches the probe does nothing else.
     static double check_seconds();
     void check_boundary(gpu::CommandList& out, const Resolve& resolve, bool& copied);
     void check_report();
@@ -517,16 +520,22 @@ private:
     bool check_done_ = false, check_started_ = false;
     std::chrono::steady_clock::time_point first_latch_{};
     std::uint64_t check_frame_ = 0, check_upscaled_ = 0, check_best_calls_ = 0, check_passes_ = 0, check_skipped_ = 0;
-    std::string check_best_first_, check_best_last_;
-    std::vector<Readback> check_reads_;
+    struct CheckSet {
+        ResourceId rt0 = 0;
+        std::uint64_t calls = 0, passes = 0, biggest = 0;
+        std::string first, last;
+        std::vector<Readback> reads;
+    };
+    std::vector<CheckSet> check_sets_;
     struct ArgNote {
         std::string name;
         bool mesh = false, count = false;
         std::uint32_t max_count = 0;
+        ResourceId gset = 0;
     };
     std::unique_ptr<gpu::Buffer> check_args_;
     std::vector<ArgNote> check_arg_notes_;
-    void check_args_report();
+    void check_args_report(ResourceId gbuffer);
 };
 
 // Replays one closed IR list into `out` (ADAPTER.md section 4). Commands the backend cannot do yet are counted and

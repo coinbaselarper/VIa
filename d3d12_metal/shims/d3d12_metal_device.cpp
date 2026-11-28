@@ -91,6 +91,7 @@
 #include <unordered_set>
 #include <shared_mutex>
 #include <string>
+#include <tuple>
 #include <type_traits>
 #include <cwchar>
 #if defined(__x86_64__)
@@ -1674,6 +1675,8 @@ struct DeviceState {
     float max_sampler_lod_bias = 15.99f;
     std::uint32_t f16_half_top_location = 29;
     std::atomic<std::uint64_t> host_imports{0};  // slot-133 windows over the title's pages
+    std::mutex host_window_mutex;  // leaf
+    std::map<std::uintptr_t, std::pair<std::uint64_t, double>> host_window_ranges;  // base -> (bytes, made at s)
     std::atomic<std::uint64_t> uploads{0}, upload_bytes{0}, zeroed_textures{0};
     leonida::metal_rt_alias::Pool rt_alias;  // slot-133 render targets on shared title pages
 
@@ -7573,6 +7576,10 @@ public:
             // so no command buffer reads the window after.
             device_.idle_uploads();
             device_.host_imports.fetch_sub(1, std::memory_order_relaxed);
+            {
+                std::lock_guard lock(device_.host_window_mutex);
+                device_.host_window_ranges.erase(host_window_base_);
+            }
             leonida::metal_ledger::remove_imported(host_window_bytes_);
         }
         if (in_arena_) device_.arena_release(arena_offset_, desc_.Width, DeviceState::arena_buffer);
@@ -7794,6 +7801,11 @@ public:
         }
         device_.host_imports.fetch_add(1, std::memory_order_relaxed);
         host_window_bytes_ = bytes;
+        host_window_base_ = base;
+        {
+            std::lock_guard lock(device_.host_window_mutex);
+            device_.host_window_ranges[base] = {bytes, leonida::run_counters::process_age_s()};
+        }
         leonida::metal_ledger::add_imported(bytes);
         mapped_ = address;
         va_ = start;
@@ -8050,6 +8062,24 @@ public:
     }
     bool shared() const { return shared_; }
     VkDeviceSize unbound_bytes() const { return deferred_.load(std::memory_order_acquire) ? deferred_bytes_ : 0; }
+    struct RtCensus {
+        std::uint64_t width = 0, bytes = 0, uses = 0, hi = 0;
+        const void* extent = nullptr;
+        bool made = false;
+        int format = 0;
+    };
+    bool rt_census(RtCensus& out) const {
+        if (!alias_watch_) return false;
+        out.width = desc_.Width;
+        out.format = int(desc_.Format);
+        out.bytes = deferred_bytes_;
+        out.made = !deferred_.load(std::memory_order_acquire);
+        out.uses = alias_watch_->reads.load(std::memory_order_relaxed) + alias_watch_->writes.load(std::memory_order_relaxed);
+        out.extent = alias_watch_->extent.load(std::memory_order_acquire);
+        out.hi = alias_watch_->hi;
+        return true;
+    }
+    std::uint64_t in_place_texture_bytes() const { return in_place_ ? in_place_bytes_ : 0; }
     void publish_streamed_texture() {}
     bool back_streamed_texture() { return back_title_texture(); }
 
@@ -8504,6 +8534,7 @@ private:
     std::shared_ptr<leonida::gpu::Texture> rebase_texture_;  // begin_rebase .. finish_rebase
     std::uint32_t rebase_base_ = 0;
     std::uint64_t host_window_bytes_ = 0;
+    std::uintptr_t host_window_base_ = 0;
     const leonida::gpu::Buffer* external_buffer_ = nullptr;  // a range of an external block (arena full)
     std::uint64_t external_offset_ = 0, external_bytes_ = 0;
     bool in_place_ = false;
@@ -11418,7 +11449,8 @@ public:
             }
             const bool overlays_set = std::getenv("GTA6RT_METAL_SHADER_OVERLAY") && *std::getenv("GTA6RT_METAL_SHADER_OVERLAY");
             const std::string overlays = env("GTA6RT_METAL_SHADER_OVERLAY",
-                                             (root + "/build/mspeed-x86_64/overlay.tsv:" + root + "/build/expo-x86_64/rectvs/manifest.tsv:" + root + "/build/gpass-x86_64/mop/overlay.tsv:" + root +
+                                             (root + "/build/wired2-x86_64/psni/overlay.tsv:" + root + "/build/wired2-x86_64/csov/overlay.tsv:" +
+                                              root + "/build/mspeed-x86_64/overlay.tsv:" + root + "/build/expo-x86_64/rectvs/manifest.tsv:" + root + "/build/gpass-x86_64/mop/overlay.tsv:" + root +
                                               "/build/tmem-x86_64/overlay.tsv:" + root +
                                               "/build/mcc-x86_64/overlay.tsv:" + root +
                                               "/build/d3d12_metal-msl-overrides/manifest.tsv:" + root +
@@ -11730,6 +11762,153 @@ public:
         report_title_classes(seconds);
         report_layer_sizes(seconds);
         report_replaced_images(seconds);
+        static const bool census = [] {
+            const char* v = std::getenv("GTA6RT_METAL_MEMORY_CENSUS");
+            return v && *v == '1';
+        }();
+        if (census) report_memory_census(seconds);
+    }
+
+    // GTA6RT_METAL_MEMORY_CENSUS=1: imported title memory by kind, the slot-133 windows' pages against the pool blocks
+    // the chunks already wire (one wiring per physical page), and render-target candidates by width.
+    void report_memory_census(double seconds) {
+        auto& st = state_;
+        const auto t0 = std::chrono::steady_clock::now();
+        std::vector<std::pair<std::uintptr_t, std::pair<std::uint64_t, double>>> windows;
+        {
+            std::lock_guard lock(st.host_window_mutex);
+            windows.assign(st.host_window_ranges.begin(), st.host_window_ranges.end());
+        }
+        std::uint64_t win_bytes = 0, win_pool = 0, win_not_pool = 0, win_blocks_on_chunks = 0, win_blocks_alone = 0;
+        std::uint64_t chunks_wired = 0, spans = 0, mirrors = 0, in_place_windows = 0, in_place_window_count = 0;
+        std::vector<std::tuple<std::uint64_t, double, std::uint64_t>> largest;  // bytes, made at, bytes on chunk blocks
+        {
+            std::lock_guard lock(st.title_window_mutex);
+            chunks_wired = st.title_pool_wired;
+            spans = st.title_pool_spans.size();
+            mirrors = st.pool_mirror_bytes.load(std::memory_order_relaxed);
+            in_place_windows = st.in_place_window_bytes;
+            in_place_window_count = st.in_place_windows.size();
+            const std::uint64_t grain = st.title_pool_chunk_bytes;
+            std::vector<std::uint8_t> marked(st.title_pool_covered.size(), 0);
+            for (const auto& [base, w] : windows) {
+                const std::uint64_t end = base + w.first;
+                std::uint64_t on_chunks = 0;
+                win_bytes += w.first;
+                for (std::uint64_t at = base; at < end;) {
+                    void* host = nullptr;
+                    std::uint64_t run = 0;
+                    if (!st.title_pool_base || !rt::xmem::title_pool_view(at, &host, &run) || !run) {
+                        const std::uint64_t next = std::min<std::uint64_t>(end, (at + 16384) & ~std::uint64_t(16383));
+                        win_not_pool += next - at;
+                        at = next;
+                        continue;
+                    }
+                    const std::uint64_t n = std::min<std::uint64_t>(run, end - at);
+                    const std::uint64_t off = static_cast<std::uint64_t>(static_cast<std::uint8_t*>(host) - st.title_pool_base);
+                    win_pool += n;
+                    for (std::uint64_t b = off / grain; b * grain < off + n && b < marked.size(); ++b) {
+                        const std::uint64_t lo = std::max(off, b * grain), hi = std::min(off + n, (b + 1) * grain);
+                        if (st.title_pool_covered[b]) on_chunks += hi - lo;
+                        if (!marked[b]) {
+                            marked[b] = 1;
+                            ++(st.title_pool_covered[b] ? win_blocks_on_chunks : win_blocks_alone);
+                        }
+                    }
+                    at += n;
+                }
+                largest.emplace_back(w.first, w.second, on_chunks);
+            }
+        }
+        std::sort(largest.begin(), largest.end(), [](const auto& a, const auto& b) { return std::get<0>(a) > std::get<0>(b); });
+        std::string top;
+        for (std::size_t i = 0; i < largest.size() && i < 8; ++i) {
+            char text[96];
+            std::snprintf(text, sizeof text, "%s%.1f MiB at t=%.0fs (%.0f%% on chunk blocks)", i ? ", " : "",
+                          double(std::get<0>(largest[i])) / 1048576.0, std::get<1>(largest[i]),
+                          std::get<0>(largest[i]) ? 100.0 * double(std::get<2>(largest[i])) / double(std::get<0>(largest[i])) : 0.0);
+            top += text;
+        }
+        struct Row {
+            std::uint64_t n = 0, bytes = 0, made = 0, made_bytes = 0, used = 0, used_bytes = 0, placed = 0;
+            std::set<const void*> extents;
+        };
+        Row rows[3];
+        std::map<const void*, unsigned> extent_classes;
+        std::map<const void*, std::uint64_t> extent_used_hi;
+        std::uint64_t in_place_textures = 0, in_place_texture_bytes = 0;
+        {
+            std::lock_guard lock(st.title_texture_mutex);
+            for (const auto& [address, t] : st.title_textures) {
+                if (!t->resource) continue;
+                if (const std::uint64_t b = t->resource->in_place_texture_bytes()) ++in_place_textures, in_place_texture_bytes += b;
+                Resource::RtCensus c;
+                if (!t->resource->rt_census(c)) continue;
+                const int k = c.width >= 3000 ? 0 : c.width >= 1500 ? 1 : 2;
+                Row& r = rows[k];
+                ++r.n;
+                r.bytes += c.bytes;
+                if (c.made) ++r.made, r.made_bytes += c.bytes;
+                if (c.uses) ++r.used, r.used_bytes += c.bytes;
+                if (c.extent) {
+                    ++r.placed;
+                    r.extents.insert(c.extent);
+                    extent_classes[c.extent] |= 1u << k;
+                    std::uint64_t& hi = extent_used_hi[c.extent];
+                    if (c.uses) hi = std::max(hi, c.hi);
+                }
+            }
+        }
+        std::string rts;
+        static const char* names[3] = {">= 3000 wide", "1500-2999 wide", "< 1500 wide"};
+        for (int k = 0; k < 3; ++k) {
+            std::uint64_t ext = 0, alone = 0;
+            for (const void* x : rows[k].extents) {
+                const std::uint64_t b = static_cast<const leonida::metal_rt_alias::Extent*>(x)->bytes;
+                ext += b;
+                if (extent_classes[x] == (1u << k)) alone += b;
+            }
+            char text[256];
+            std::snprintf(text, sizeof text,
+                          "%s%s: %llu (%.0f MiB), made %llu (%.0f MiB), used %llu (%.0f MiB), placed %llu in %zu extents "
+                          "of %.0f MiB (%.0f MiB in extents of this class only)",
+                          k ? "; " : "", names[k], static_cast<unsigned long long>(rows[k].n), double(rows[k].bytes) / 1048576.0,
+                          static_cast<unsigned long long>(rows[k].made), double(rows[k].made_bytes) / 1048576.0,
+                          static_cast<unsigned long long>(rows[k].used), double(rows[k].used_bytes) / 1048576.0,
+                          static_cast<unsigned long long>(rows[k].placed), rows[k].extents.size(), double(ext) / 1048576.0,
+                          double(alone) / 1048576.0);
+            rts += text;
+        }
+        std::uint64_t extent_bytes = 0, unused_extents = 0, unused_extent_bytes = 0, past_used = 0;
+        for (const auto& [x, hi] : extent_used_hi) {
+            const std::uint64_t b = static_cast<const leonida::metal_rt_alias::Extent*>(x)->bytes;
+            extent_bytes += b;
+            if (!hi) ++unused_extents, unused_extent_bytes += b;
+            else if (b > hi) past_used += b - hi;
+        }
+        {
+            char text[200];
+            std::snprintf(text, sizeof text,
+                          "; extents %zu of %.0f MiB: %llu with no used member (%.0f MiB), %.0f MiB past the end of the "
+                          "highest used member in the rest",
+                          extent_used_hi.size(), double(extent_bytes) / 1048576.0,
+                          static_cast<unsigned long long>(unused_extents), double(unused_extent_bytes) / 1048576.0,
+                          double(past_used) / 1048576.0);
+            rts += text;
+        }
+        const double grain_mib = double(state_.title_pool_chunk_bytes) / 1048576.0;
+        std::fprintf(stderr,
+                     "[rt] gpu-memory census t=%.0fs: imports: pool chunks %.0f MiB (%llu span buffers), slot-133 windows "
+                     "%zu %.0f MiB (on pool pages %.0f MiB: blocks the chunks wire too %.0f MiB, blocks only windows wire "
+                     "%.0f MiB; not pool %.0f MiB; largest %s), in-place windows %llu %.0f MiB, title textures in place "
+                     "%llu %.0f MiB, mirrors %.0f MiB | render-target candidates: %s (%.1f ms)\n",
+                     seconds, double(chunks_wired) / 1048576.0, static_cast<unsigned long long>(spans), windows.size(),
+                     double(win_bytes) / 1048576.0, double(win_pool) / 1048576.0, double(win_blocks_on_chunks) * grain_mib,
+                     double(win_blocks_alone) * grain_mib, double(win_not_pool) / 1048576.0, top.c_str(),
+                     static_cast<unsigned long long>(in_place_window_count), double(in_place_windows) / 1048576.0,
+                     static_cast<unsigned long long>(in_place_textures), double(in_place_texture_bytes) / 1048576.0,
+                     double(mirrors) / 1048576.0, rts.c_str(),
+                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
     }
 
     // Replaced image entries and the texture bytes their views keep alive (a view's size is its parent's; entries over

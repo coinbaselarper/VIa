@@ -1683,20 +1683,50 @@ void SceneProbe::finish_readbacks(bool all) {
 void SceneProbe::check_boundary(gpu::CommandList& out, const Resolve& resolve, bool& copied) {
     if (cur_.count < 4 || !cur_.rts[0].id || !render_size(cur_.rts[0])) return;
     ++check_passes_;
-    if (cur_.calls <= check_best_calls_ || check_reads_.size() >= 32) return;
-    std::vector<Readback> group;
-    for (std::uint32_t i = 0; i < cur_.count; ++i) {
-        gpu::Texture* t = cur_.rts[i].id && render_size(cur_.rts[i]) ? resolve(cur_.rts[i].id) : nullptr;
-        if (!t || !queue_readback(out, t, cur_.rts[i], "rt" + std::to_string(i), false)) continue;
-        group.push_back(std::move(readbacks_.back()));
-        readbacks_.pop_back();
+    CheckSet* set = nullptr;
+    for (CheckSet& s : check_sets_)
+        if (s.rt0 == cur_.rts[0].id) set = &s;
+    if (!set) {
+        if (check_sets_.size() >= 4) return;
+        check_sets_.push_back({});
+        set = &check_sets_.back();
+        set->rt0 = cur_.rts[0].id;
+        set->first = cur_.first;
     }
-    if (group.empty()) return;
-    check_reads_ = std::move(group);
-    check_best_calls_ = cur_.calls;
-    check_best_first_ = cur_.first;
-    check_best_last_ = cur_.last;
-    copied = true;
+    set->calls += cur_.calls;
+    ++set->passes;
+    set->biggest = std::max(set->biggest, cur_.calls);
+    set->last = cur_.last;
+    check_best_calls_ = std::max(check_best_calls_, set->calls);
+    if (set->reads.empty()) {
+        for (std::uint32_t i = 0; i < cur_.count; ++i) {
+            gpu::Texture* t = cur_.rts[i].id && render_size(cur_.rts[i]) ? resolve(cur_.rts[i].id) : nullptr;
+            if (!t || !queue_readback(out, t, cur_.rts[i], "rt" + std::to_string(i), false)) continue;
+            set->reads.push_back(std::move(readbacks_.back()));
+            readbacks_.pop_back();
+        }
+        copied |= !set->reads.empty();
+        return;
+    }
+    gpu::Barrier fence;
+    fence.type = gpu::BarrierType::uav;
+    out.barrier({&fence, 1});
+    for (const Readback& r : set->reads) {
+        const std::uint32_t i = std::uint32_t(std::strtoul(r.name.c_str() + 2, nullptr, 10));
+        gpu::Texture* t = i < cur_.count && cur_.rts[i].id == r.target.id ? resolve(r.target.id) : nullptr;
+        if (!t) continue;
+        gpu::BufferTextureCopy k;
+        k.buffer = r.buffer.get();
+        k.row_pitch = r.pitch;
+        k.texture = t;
+        k.mip = r.target.mip;
+        k.layer = r.target.layer;
+        k.width = r.target.width;
+        k.height = r.target.height;
+        out.copy_texture_to_buffer(k);
+        copied = true;
+    }
+    out.barrier({&fence, 1});
 }
 
 bool SceneProbe::check_args_slot(const char* pipeline, bool mesh, bool has_count, std::uint32_t max_count,
@@ -1719,14 +1749,15 @@ bool SceneProbe::check_args_slot(const char* pipeline, bool mesh, bool has_count
     }
     buffer = check_args_.get();
     offset = std::uint64_t(check_arg_notes_.size()) * 32;
-    check_arg_notes_.push_back({pipeline ? pipeline : "?", mesh, has_count, max_count});
+    const ResourceId gset = cur_.count >= 4 && render_size(cur_.rts[0]) ? cur_.rts[0].id : 0;
+    check_arg_notes_.push_back({pipeline ? pipeline : "?", mesh, has_count, max_count, gset});
     return true;
 }
 
 // Per pipeline family (the name up to its first '~' or ','): indirect draws of the check frame, how many had nothing
 // to draw (count word 0, or a first record of 0 groups / 0 vertices / 0 instances) and the groups their first records
 // name; the families with most draws first.
-void SceneProbe::check_args_report() {
+void SceneProbe::check_args_report(ResourceId gbuffer) {
     if (!check_args_ || check_arg_notes_.empty()) {
         std::fprintf(stderr, "[rt] d3d12-metal G-buffer check: no indirect draw in the check frame\n");
         return;
@@ -1735,7 +1766,7 @@ void SceneProbe::check_args_report() {
         std::uint64_t draws = 0, empty = 0, uncopied = 0, groups = 0;
     };
     std::map<std::string, Family> families;
-    Family all, mesh;
+    Family all, mesh, gmesh;
     const auto* w = static_cast<const std::uint32_t*>(check_args_->cpu_pointer());
     for (std::size_t i = 0; i < check_arg_notes_.size(); ++i) {
         const ArgNote& n = check_arg_notes_[i];
@@ -1746,7 +1777,7 @@ void SceneProbe::check_args_report() {
         const std::uint32_t count = n.count ? std::min(r[4], std::max(n.max_count, 1u)) : 1u;
         const std::uint64_t work = n.mesh ? std::uint64_t(r[0]) * r[1] * r[2] : std::uint64_t(r[0]) * r[1];
         const bool empty = !uncopied && (count == 0 || work == 0);
-        for (Family* x : {&f, &all, n.mesh ? &mesh : nullptr}) {
+        for (Family* x : {&f, &all, n.mesh ? &mesh : nullptr, n.mesh && gbuffer && n.gset == gbuffer ? &gmesh : nullptr}) {
             if (!x) continue;
             ++x->draws;
             x->uncopied += uncopied;
@@ -1767,22 +1798,29 @@ void SceneProbe::check_args_report() {
     }
     std::fprintf(stderr,
                  "[rt] d3d12-metal G-buffer check: indirect draws of the check frame %llu (%llu empty, %llu not copied); "
-                 "mesh %llu (%llu empty, %llu groups in their first records) || %s\n",
+                 "mesh %llu (%llu empty, %llu groups in their first records); G-buffer mesh draws %llu (%llu empty, %llu "
+                 "groups) || %s\n",
                  static_cast<unsigned long long>(all.draws), static_cast<unsigned long long>(all.empty),
                  static_cast<unsigned long long>(all.uncopied), static_cast<unsigned long long>(mesh.draws),
-                 static_cast<unsigned long long>(mesh.empty), static_cast<unsigned long long>(mesh.groups), text.c_str());
+                 static_cast<unsigned long long>(mesh.empty), static_cast<unsigned long long>(mesh.groups),
+                 static_cast<unsigned long long>(gmesh.draws), static_cast<unsigned long long>(gmesh.empty),
+                 static_cast<unsigned long long>(gmesh.groups), text.c_str());
 }
 
 void SceneProbe::check_report() {
-    check_args_report();
+    const double world_s = check_after_s_;
+    const CheckSet* best = nullptr;
+    for (const CheckSet& s : check_sets_)
+        if (!s.reads.empty() && (!best || s.calls > best->calls)) best = &s;
+    check_args_report(best ? best->rt0 : 0);
     check_args_.reset();
     check_arg_notes_.clear();
-    const double world_s = check_after_s_;
-    if (check_reads_.empty()) {
+    if (!best) {
         std::fprintf(stderr, "[rt] d3d12-metal G-buffer check (world+%.0f s, upscaled frame %llu): no render-size pass of "
                              "4+ targets in %llu frames: UNKNOWN\n",
                      world_s, static_cast<unsigned long long>(check_upscaled_),
                      static_cast<unsigned long long>(check_skipped_ + 1));
+        check_sets_.clear();
         return;
     }
     static const double min_pct = [] {
@@ -1791,7 +1829,7 @@ void SceneProbe::check_report() {
     }();
     std::string text;
     double rt0 = 0, material5 = 0;
-    for (const Readback& r : check_reads_) {
+    for (const Readback& r : best->reads) {
         const Target& t = r.target;
         const auto* src = static_cast<const std::uint8_t*>(r.buffer->cpu_pointer());
         std::uint64_t any = 0, m5 = 0, n = 0;
@@ -1810,15 +1848,16 @@ void SceneProbe::check_report() {
         text += b;
     }
     std::fprintf(stderr,
-                 "[rt] d3d12-metal G-buffer check (world+%.0f s, upscaled frame %llu): main G-buffer pass %s%s%s (%llu "
-                 "draws; %llu passes of 4+ render-size targets): texels written %s; RT0 alpha 5/255 (material 5) "
-                 "%.1f%%: %s\n",
-                 world_s, static_cast<unsigned long long>(check_upscaled_), short_name(check_best_first_).c_str(),
-                 check_best_last_ != check_best_first_ ? " .. " : "",
-                 check_best_last_ != check_best_first_ ? short_name(check_best_last_).c_str() : "",
-                 static_cast<unsigned long long>(check_best_calls_), static_cast<unsigned long long>(check_passes_),
-                 text.c_str(), material5, rt0 < min_pct ? "BROKEN" : "ok");
-    check_reads_.clear();
+                 "[rt] d3d12-metal G-buffer check (world+%.0f s, upscaled frame %llu): G-buffer %s%s%s (%llu draws in "
+                 "%llu passes, biggest %llu; %zu target sets, %llu passes of 4+ render-size targets): texels written "
+                 "after its last pass %s; RT0 alpha 5/255 (material 5) %.1f%%: %s\n",
+                 world_s, static_cast<unsigned long long>(check_upscaled_), short_name(best->first).c_str(),
+                 best->last != best->first ? " .. " : "", best->last != best->first ? short_name(best->last).c_str() : "",
+                 static_cast<unsigned long long>(best->calls), static_cast<unsigned long long>(best->passes),
+                 static_cast<unsigned long long>(best->biggest), check_sets_.size(),
+                 static_cast<unsigned long long>(check_passes_), text.c_str(), material5,
+                 best->calls < 500 ? "NO MAIN PASS" : rt0 < min_pct ? "BROKEN" : "ok");
+    check_sets_.clear();
 }
 
 void SceneProbe::end_frame() {
@@ -1827,6 +1866,7 @@ void SceneProbe::end_frame() {
         ++check_skipped_;
         ++check_upscaled_;
         check_passes_ = 0;
+        check_sets_.clear();
         check_args_.reset();
         check_arg_notes_.clear();
     } else if (check_armed_.load(std::memory_order_relaxed)) {

@@ -1,5 +1,33 @@
 # port/d3d12_metal status (round 7)
 
+## Round 16, stability worker (2026-11-27 17:10-19:30, 22:55-23:45): residency crash fixed with a test; skipped first-use work at world entry fixed (waits); a G-buffer check in every run; the band / town-loss fault remains; terrain lockup is not a loop spin; one launcher helper
+
+M = measured, I = inferred. Load 3-6 at run starts, every run alone. Details and evidence in the worker's spike notes.
+- **G-buffer check (every run, log only, `GTA6RT_METAL_GBUFFER_CHECK=0` off):** at world+10 s the G-buffer's RT0 is
+  read back after the LAST pass that draws into it (the G-buffer is drawn in 4-6 passes split by compute; the old check
+  read the biggest single pass and misjudged good runs), plus the frame's indirect draws (empty ones, mesh groups into
+  the G-buffer). Verdict `NO MAIN PASS` / `BROKEN` (RT0 < 50%) / `ok`. It catches the town missing from the G-buffer
+  (RT0 9-15%) and a frame without the main pass; it does NOT catch the band at y~380 of 1080 (M, 20 runs).
+- **Skipped first-use pipelines (fixed, default):** with the windowed prebuild ~800 compute passes and ~960 draws meet
+  a compiling pipeline at world entry. Skipped: 5 of 5 runs broken (blue/white world, sky everywhere, magenta stripe).
+  `GTA6RT_METAL_COMPUTE_WAIT` / `GTA6RT_METAL_DRAW_WAIT` (default on, `=0` off) wait instead: 0 of 12 runs with that
+  form; costs ~2.6 s of waits at world entry (M, same binary, 2+ runs a leg).
+- **Still open (cause not found):** a band / stripe at one screen row, dark blocks and fewer buildings culled in, in 6
+  of 8 default runs and with the windowed or full prebuild, wide indices on or off (M). Clean runs cull in ~2.5x the
+  groups of one building family that band runs do (M): the fault is upstream of the G-buffer (culling inputs, I).
+  Ruled out by the logs (no difference clean vs broken): commit-gate timeouts, dropped held submissions, T# refusals,
+  table generations, pipeline waits, alias hazards. 10 consecutive good entries: not reached.
+- **`residency_for_submit` crash (fixed, test):** a bindless table generation could be freed while a submission that
+  had read it was still encoding (pipeline waits of hundreds of ms); in-flight submissions now count in the marks
+  that retire it (`src/submission_marks.h`); `tools/submission_marks_test.sh` (ASan): 37 uses-after-free in 326
+  stressed submissions with the old marks, 0 with the new. No recurrence since (M).
+- **Terrain mesh lockup (offline probe):** a capped build of the shader (every loop bounded) still locked the GPU, so
+  it is not a loop spin and no loop cap was shipped; the probe input pairs another shader's descriptors, which the
+  title does not do (I). The shipped row's per-entry caps allow ~2^32 steps on a wrong input (I). No more GPU probes.
+- **Once:** a segfault in `objc_msgSend` (address 0x4) at world+15 s with both waits off (M, 1 run); not followed.
+- **Launchers:** `tools/slot_lib.sh` is the one helper (rules: top of the Metal requests file); lock liveness now by
+  `ps -p` and an `owner` file is honoured.
+
 ## Round 16, stencil worker (2026-11-27 17:05-18:50): stencil T#s now read the stencil (X32_Stencil8), the dot-speckle of every surface is gone; the 1D / 2D-storage index ranges are wide by default; view sharing makes a noise band and is off; depth-stencil UAV planes are needed (316 + 1 asked) but not built
 
 Details, tables and PNGs: the worker's spike folder (r14-stencil). Same-binary A/Bs, two or more runs a leg, alone in
