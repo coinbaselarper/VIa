@@ -1683,11 +1683,16 @@ void SceneProbe::finish_readbacks(bool all) {
 void SceneProbe::check_boundary(gpu::CommandList& out, const Resolve& resolve, bool& copied) {
     if (cur_.count < 4 || !cur_.rts[0].id || !render_size(cur_.rts[0])) return;
     ++check_passes_;
-    if (cur_.calls <= check_best_calls_ || check_reads_.size() >= 16) return;
-    gpu::Texture* t = resolve(cur_.rts[0].id);
-    if (!t || !queue_readback(out, t, cur_.rts[0], "gbuffer-check", false)) return;
-    check_reads_.push_back(std::move(readbacks_.back()));
-    readbacks_.pop_back();
+    if (cur_.calls <= check_best_calls_ || check_reads_.size() >= 32) return;
+    std::vector<Readback> group;
+    for (std::uint32_t i = 0; i < cur_.count; ++i) {
+        gpu::Texture* t = cur_.rts[i].id && render_size(cur_.rts[i]) ? resolve(cur_.rts[i].id) : nullptr;
+        if (!t || !queue_readback(out, t, cur_.rts[i], "rt" + std::to_string(i), false)) continue;
+        group.push_back(std::move(readbacks_.back()));
+        readbacks_.pop_back();
+    }
+    if (group.empty()) return;
+    check_reads_ = std::move(group);
     check_best_calls_ = cur_.calls;
     check_best_first_ = cur_.first;
     check_best_last_ = cur_.last;
@@ -1775,43 +1780,56 @@ void SceneProbe::check_report() {
     const double world_s = check_after_s_;
     if (check_reads_.empty()) {
         std::fprintf(stderr, "[rt] d3d12-metal G-buffer check (world+%.0f s, upscaled frame %llu): no render-size pass of "
-                             "4+ targets in the frame (%llu seen): UNKNOWN\n",
+                             "4+ targets in %llu frames: UNKNOWN\n",
                      world_s, static_cast<unsigned long long>(check_upscaled_),
-                     static_cast<unsigned long long>(check_passes_));
+                     static_cast<unsigned long long>(check_skipped_ + 1));
         return;
     }
-    const Readback& r = check_reads_.back();
-    const Target& t = r.target;
-    const auto* src = static_cast<const std::uint8_t*>(r.buffer->cpu_pointer());
-    std::uint64_t rgb = 0, any = 0, n = 0;
-    for (std::uint32_t y = 0; y < t.height; ++y)
-        for (std::uint32_t x = 0; x < t.width; ++x, ++n) {
-            float v[4] = {0, 0, 0, 0};
-            const int c = decode_texel(t.format, src + std::size_t(y) * r.pitch + std::size_t(x) * r.texel, v);
-            const bool col = (c > 0 && v[0] > 0) || (c > 1 && v[1] > 0) || (c > 2 && v[2] > 0);
-            rgb += col;
-            any += col || (c > 3 && v[3] > 0);
-        }
     static const double min_pct = [] {
         const char* v = std::getenv("GTA6RT_METAL_GBUFFER_CHECK_MIN");
         return v && *v ? std::strtod(v, nullptr) : 50.0;
     }();
-    const double pct = n ? 100.0 * double(rgb) / double(n) : 0;
+    std::string text;
+    double rt0 = 0, material5 = 0;
+    for (const Readback& r : check_reads_) {
+        const Target& t = r.target;
+        const auto* src = static_cast<const std::uint8_t*>(r.buffer->cpu_pointer());
+        std::uint64_t any = 0, m5 = 0, n = 0;
+        for (std::uint32_t y = 0; y < t.height; ++y)
+            for (std::uint32_t x = 0; x < t.width; ++x, ++n) {
+                const std::uint8_t* p = src + std::size_t(y) * r.pitch + std::size_t(x) * r.texel;
+                float v[4] = {0, 0, 0, 0};
+                const int c = decode_texel(t.format, p, v);
+                any += (c > 0 && v[0] != 0) || (c > 1 && v[1] != 0) || (c > 2 && v[2] != 0) || (c > 3 && v[3] != 0);
+                m5 += r.texel == 4 && p[3] == 5;
+            }
+        const double pct = n ? 100.0 * double(any) / double(n) : 0;
+        if (r.name == "rt0") rt0 = pct, material5 = n ? 100.0 * double(m5) / double(n) : 0;
+        char b[96];
+        std::snprintf(b, sizeof b, "%s%s f%u %.1f%%", text.empty() ? "" : ", ", r.name.c_str(), t.format, pct);
+        text += b;
+    }
     std::fprintf(stderr,
                  "[rt] d3d12-metal G-buffer check (world+%.0f s, upscaled frame %llu): main G-buffer pass %s%s%s (%llu "
-                 "draws; %llu passes of 4+ render-size targets): RT0 %s %.1f%% of texels with colour, %.1f%% any "
-                 "channel: %s\n",
+                 "draws; %llu passes of 4+ render-size targets): texels written %s; RT0 alpha 5/255 (material 5) "
+                 "%.1f%%: %s\n",
                  world_s, static_cast<unsigned long long>(check_upscaled_), short_name(check_best_first_).c_str(),
                  check_best_last_ != check_best_first_ ? " .. " : "",
                  check_best_last_ != check_best_first_ ? short_name(check_best_last_).c_str() : "",
                  static_cast<unsigned long long>(check_best_calls_), static_cast<unsigned long long>(check_passes_),
-                 target_text(t).c_str(), pct, n ? 100.0 * double(any) / double(n) : 0, pct < min_pct ? "BROKEN" : "ok");
+                 text.c_str(), material5, rt0 < min_pct ? "BROKEN" : "ok");
     check_reads_.clear();
 }
 
 void SceneProbe::end_frame() {
     std::lock_guard lock(mutex_);
-    if (check_armed_.load(std::memory_order_relaxed)) {
+    if (check_armed_.load(std::memory_order_relaxed) && !check_best_calls_ && check_skipped_ < 30) {
+        ++check_skipped_;
+        ++check_upscaled_;
+        check_passes_ = 0;
+        check_args_.reset();
+        check_arg_notes_.clear();
+    } else if (check_armed_.load(std::memory_order_relaxed)) {
         check_armed_.store(false, std::memory_order_release);
         check_started_ = true;
         check_frame_ = frame_;

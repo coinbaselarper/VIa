@@ -516,7 +516,7 @@ private:
     std::atomic<bool> check_armed_{false};
     bool check_done_ = false, check_started_ = false;
     std::chrono::steady_clock::time_point first_latch_{};
-    std::uint64_t check_frame_ = 0, check_upscaled_ = 0, check_best_calls_ = 0, check_passes_ = 0;
+    std::uint64_t check_frame_ = 0, check_upscaled_ = 0, check_best_calls_ = 0, check_passes_ = 0, check_skipped_ = 0;
     std::string check_best_first_, check_best_last_;
     std::vector<Readback> check_reads_;
     struct ArgNote {

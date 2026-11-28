@@ -6442,12 +6442,14 @@ struct DeviceState {
         VkImageAspectFlags aspects = 0;
         unsigned sampled_class = 0;
         std::string share;  // GTA6RT_METAL_VIEW_SHARE: the view identity whose index this entry shares
+        std::chrono::steady_clock::time_point replaced_at{};  // when it went to replaced_images
     };
     // GTA6RT_METAL_VIEW_SHARE=1 (off by default): T#s whose views would be identical (same texture, format, channels,
     // levels, layers, swizzle, MIN_LOD) share one bindless index and view, counted per index. Measured (vfx-d3, txt-p1,
     // spk-a): the 2D array (65,536) fills about 40 s into the world and the 1D array (4,096) before it; every later
     // T# of that dimension reads the fallback. Title T#s that differ only in words the view ignores (data in words 4-7)
-    // each took an index.
+    // each took an index. Not default: with it, world presents show a full-width band of noise at one screen row in
+    // about half of the runs, never without it (cause not found).
     static bool view_share_on() {
         static const bool on = [] {
             const char* v = std::getenv("GTA6RT_METAL_VIEW_SHARE");
@@ -6548,6 +6550,36 @@ struct DeviceState {
     std::map<leonida::DescriptorKey, ImageEntry> image_entries;
     std::multimap<std::uint64_t, leonida::DescriptorKey> image_keys;  // by the texture's address
     std::vector<ImageEntry> replaced_images;  // kept until their texture goes: work in flight may still use them
+    // A replaced entry's views keep their parent texture's memory alive (a Metal view does), so a title texture that
+    // grew or a T# that now names another texture keeps the old texture until the image's address is forgotten.
+    // GTA6RT_METAL_REPLACED_RELEASE_S=<s> (off by default): an entry replaced longer ago than that is released (views
+    // and bindless index); the backend still defers each texture's release past the command buffers before it.
+    static double replaced_release_s() {
+        static const double s = [] {
+            const char* v = std::getenv("GTA6RT_METAL_REPLACED_RELEASE_S");
+            return v && *v ? std::max(0.0, std::atof(v)) : 0.0;
+        }();
+        return s;
+    }
+    std::chrono::steady_clock::time_point replaced_sweep_at{};
+    std::uint64_t replaced_released = 0, replaced_released_bytes = 0;
+    void retire_image_entry(const ImageEntry& old) {  // descriptor_mutex held
+        replaced_images.push_back(old);
+        const auto now = std::chrono::steady_clock::now();
+        replaced_images.back().replaced_at = now;
+        const double keep_s = replaced_release_s();
+        if (keep_s <= 0 || now - replaced_sweep_at < std::chrono::seconds(1)) return;
+        replaced_sweep_at = now;
+        const auto cutoff = now - std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(keep_s));
+        std::erase_if(replaced_images, [&](const ImageEntry& entry) {
+            if (entry.replaced_at > cutoff) return false;
+            ++replaced_released;
+            replaced_released_bytes += std::max<std::uint64_t>(entry.sampled ? entry.sampled->size() : 0,
+                                                               entry.storage ? entry.storage->size() : 0);
+            release(entry);
+            return true;
+        });
+    }
     std::map<leonida::DescriptorKey, std::unique_ptr<leonida::gpu::Sampler>> sampler_entries;
     struct CustomBorderColor {
         bool is_int = false;
@@ -6795,7 +6827,7 @@ struct DeviceState {
                                                  aspects, sampled, storage, sampled_class, words);
         if (take_shared_view(entry, share)) {
             if (existing != image_entries.end()) {
-                replaced_images.push_back(existing->second);
+                retire_image_entry(existing->second);
                 existing->second = entry;
             } else {
                 image_entries.emplace(words, entry);
@@ -6826,7 +6858,7 @@ struct DeviceState {
         }
         keep_shared_view(entry, share);
         if (existing != image_entries.end()) {
-            replaced_images.push_back(existing->second);
+            retire_image_entry(existing->second);
             existing->second = entry;
         } else {
             image_entries.emplace(words, entry);
@@ -6895,7 +6927,7 @@ struct DeviceState {
                                                    old.storage_format, old.aspects, old.sampled != nullptr,
                                                    old.storage != nullptr, old.sampled_class, words);
             if (take_shared_view(entry, share)) {
-                replaced_images.push_back(old);
+                retire_image_entry(old);
                 old = entry;
                 bindless->insert_key(it->second, entry.index);
                 ++made;
@@ -6916,7 +6948,7 @@ struct DeviceState {
             entry.index = bindless->add_image(entry.dimension, entry.sampled.get(), views, entry.sampled_class);
             if (!entry.index) continue;
             keep_shared_view(entry, share);
-            replaced_images.push_back(old);
+            retire_image_entry(old);
             old = entry;
             bindless->insert_key(it->second, entry.index);
             ++made;
@@ -11697,6 +11729,48 @@ public:
         if (leonida::metal_rt_alias::watching()) report_rt_alias(seconds);
         report_title_classes(seconds);
         report_layer_sizes(seconds);
+        report_replaced_images(seconds);
+    }
+
+    // Replaced image entries and the texture bytes their views keep alive (a view's size is its parent's; entries over
+    // one address with the same size are counted once), by age; GTA6RT_METAL_REPLACED_RELEASE_S releases.
+    void report_replaced_images(double seconds) {
+        auto& st = state_;
+        std::unique_lock lock(st.descriptor_mutex, std::try_to_lock);
+        if (!lock.owns_lock()) return;
+        const auto now = std::chrono::steady_clock::now();
+        std::set<std::pair<std::uint64_t, std::uint64_t>> parents, parents_old, live;
+        for (const auto& [key, e] : st.image_entries) {
+            const std::uint64_t b = std::max<std::uint64_t>(e.sampled ? e.sampled->size() : 0, e.storage ? e.storage->size() : 0);
+            live.insert({e.address, b});
+        }
+        std::uint64_t bytes = 0, bytes_old = 0, shared_with_live = 0, with_views = 0, same_bytes = 0;
+        std::set<std::pair<std::uint64_t, std::uint64_t>> same;
+        std::set<const void*> live_views;
+        for (const auto& [key, e] : st.image_entries)
+            for (const auto* v : {e.sampled.get(), e.storage.get()})
+                if (v) live_views.insert(v);
+        for (const auto& e : st.replaced_images) {
+            const std::uint64_t b = std::max<std::uint64_t>(e.sampled ? e.sampled->size() : 0, e.storage ? e.storage->size() : 0);
+            if (!b) continue;
+            ++with_views;
+            if (live.count({e.address, b})) {
+                ++shared_with_live;
+                const bool view_live = (e.sampled && live_views.count(e.sampled.get())) || (e.storage && live_views.count(e.storage.get()));
+                if (!view_live && same.insert({e.address, b}).second) same_bytes += b;
+                continue;
+            }
+            if (parents.insert({e.address, b}).second) bytes += b;
+            if (now - e.replaced_at > std::chrono::seconds(10) && parents_old.insert({e.address, b}).second) bytes_old += b;
+        }
+        std::fprintf(stderr, "[rt] gpu-memory replaced t=%.0fs: %zu replaced image entries (%llu with views, %llu over a size a "
+                             "live entry at that address has, %.1f MiB of them through views no live entry holds: kept if "
+                             "another texture); textures they alone keep: %zu, %.1f MiB (%.1f MiB replaced "
+                             "over 10 s ago); released %llu (%.1f MiB of views; GTA6RT_METAL_REPLACED_RELEASE_S %.0f)\n",
+                     seconds, st.replaced_images.size(), static_cast<unsigned long long>(with_views),
+                     static_cast<unsigned long long>(shared_with_live), double(same_bytes) / 1048576.0, parents.size(), double(bytes) / 1048576.0,
+                     double(bytes_old) / 1048576.0, static_cast<unsigned long long>(st.replaced_released),
+                     double(st.replaced_released_bytes) / 1048576.0, DeviceState::replaced_release_s());
     }
 
     // Entry counts of the layer's registries (each read under its own lock when that lock is free, else "busy"), so a

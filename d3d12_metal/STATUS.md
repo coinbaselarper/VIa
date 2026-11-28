@@ -1,5 +1,67 @@
 # port/d3d12_metal status (round 7)
 
+## Round 16, stencil worker (2026-11-27 17:05-18:50): stencil T#s now read the stencil (X32_Stencil8), the dot-speckle of every surface is gone; the 1D / 2D-storage index ranges are wide by default; view sharing makes a noise band and is off; depth-stencil UAV planes are needed (316 + 1 asked) but not built
+
+Details, tables and PNGs: the worker's spike folder (r14-stencil). Same-binary A/Bs, two or more runs a leg, alone in
+the slot; every run ended on the 4 Hz wired stop or the 13,312 cap at world+30..50 s; 0 failed command buffers, 0 GPU
+faults, no gpuEvent from these runs (the count went 10 -> 13 during the round: another worker's hang probes).
+M = measured, I = inferred; load 3.2-12.8 at run starts.
+
+- **Stencil view, default ON (`GTA6RT_METAL_STENCIL_VIEW=0` off).** Every stencil T# (GFX10 8_UINT on a texture with a
+  stencil aspect: title-built and plane-1 SRVs) used to get a view in the texture's own `Depth32Float_Stencil8`
+  format, which reads the DEPTH plane; shaders read its `.y` as the stencil class (M: offline probe and code). Now
+  `make_view` gives it `X32_Stencil8` (stencil in R, measured offline) with the T#'s swizzle (byte in G), and a stencil
+  view has its own view identity. One path covers the D16S8 / D24S8 / D32S8 families (all `Depth32Float_Stencil8` on
+  Metal). A/B (M): isolated "2-G-buffer" pixels written by the G-buffer fixup kernel 14.6-22.8 k off vs 0.12-0.24 k on;
+  composite dots, whole frame / roof box: 0.26-0.86% / 3.6-5.0% off vs 0.13-0.20% / 0.12-0.20% on; what stays class 3
+  is whole objects (foliage, rails, stilts, glass). A house that turns black is black albedo in RT0 in both legs (the
+  known streaming fault), not the fixup.
+- **`GTA6RT_METAL_BINDLESS_WIDE`, default ON (`=0` off):** 0 refused binds (vs 16-42 k by world+45 s), the pier
+  walkway / dock edges / deck lit at world present 101 where both-off runs have them black; no GPU or memory cost
+  measurable (GPU 357-366 vs 341-375 ms a frame, Metal allocated ~8.0 GiB in both).
+- **`GTA6RT_METAL_VIEW_SHARE`, back to OFF (it was default 17:55-18:41):** with it, a full-width band of noise ~20 rows
+  tall at one screen row appears in single presents of 7 of 12 runs, never in 8 runs without it (M, by detector and by
+  eye); with it alone (WIDE off) 3 of 6 dumped presents. Cause not found.
+- **Depth-stencil UAV planes (census, M):** the title asks 312 UAVs of D16 shadow maps' depth (R16_UNORM views), 4 of
+  screen-size depths (R32_FLOAT / R16_UNORM) and 1 of a D24S8 stencil plane (R8_UINT); all write nothing on Metal
+  (E_NOTIMPL). Not built: it needs depth/stencil <-> colour-plane blits at the texture's UAV transitions (the Vulkan
+  path's `copy_depth_uav`), i.e. the barrier path plus a gpu API, outside this task's files; memory: a same-size copy of
+  every such texture, wired.
+- **Translator rows (speckle worker), re-checked with the right stencil:** 64-bit image atomics (3 rows) and the
+  early-fragment-test rows WITHOUT KILL_ENABLE (136) hold in 2 warm runs each (no harm, no measurable gain); the
+  magenta band of the full early-depth set comes from the 14 KILL_ENABLE rows (I: early tests write depth/stencil
+  before a discard can cancel them); implicit LOD in compute: no verdict (one of two runs odd); mesh clamp: no rows.
+- Files: `shims/d3d12_metal_device.cpp` (`stencil_view_on`, `bind_image_views_locked`, `make_view`, a census line in
+  `refresh_title_textures`, a counter and a bounded log in `CreateUnorderedAccessView`, the `view_share_on` default),
+  `src/metal_bindless.cpp` (constructor: WIDE default), port/metal `mtl_formats.mm` (DXGI 22 -> `X32_Stencil8`),
+  `mtl_device.mm` (`create_texture_view`: a stencil view only of a pixel-format-view `Depth32Float_Stencil8`).
+- Next (ranked): (1) the depth-stencil UAV planes (blits at UAV transitions); (2) the SHARE band (which index is shared
+  when it shows; per-index ownership log in one band run); (3) a second `lod` pair; the KILL early-depth rows bisected.
+
+## Round 16, GPU-budget worker (2026-11-27 17:06-18:40): a steady world frame is 387 ms of GPU, almost all shader stages run one at a time; non-shader terms ~3%; the structured mesh rows take 22-27 ms off
+
+M = measured, I = inferred; 11 world runs, 0 failed command buffers, 0 GPU faults, every run ended on the machine-wired
+stop or the machine guard 5-70 s into the world.
+- New opt-in timing (port/metal queue, under `GTA6RT_METAL_PASS_TIMING`): `_MODES=b|s|p` per window (b: every encoder's
+  stage-boundary timestamps without waits, every command buffer of every queue with encode / gate-hold / kernel / GPU
+  times and a counter-clock calibration; s: splits now also cut explicit render passes and compute encoders at kernel
+  changes), `_TRIGGER=<file>` (windows counted from the world). Metal allows 32 counter sample buffers a process, so
+  command buffers share sample slabs. `gpu_budget.py` (cache tools) turns the TSV into a budget whose rows sum to the
+  window exactly.
+- Steady frame (M, defaults, 13 frames): 387 ms = compute 180 (46.5%) + vertex/mesh 146 (37.7%) + fragment 47.5 (12.3%;
+  tile load/store 4.5-7.5 of it, offline probe x census bytes) + GPU idle 9.2 (submission latency 6.2, commit-gate holds
+  2.6, waiting for an encode 0.4) + pass structure and untimed ~4. Command buffers on the GPU 97.5%, equal to the encoder
+  sum within 0.1%. Two stages run at once only 1-1.4% of the time: barriers join every earlier encoder.
+- The round-15 "unattributed" time: the mesh census never split explicit render passes (the G-buffer passes), and the
+  compute census covered selected kernels only.
+- The 19 structured mesh rows of round 14: same binary, two runs a leg: 387 -> 365 ms a frame, geometry 146 -> 126,
+  controls equal, presented frames with no difference beyond run-to-run spread; proposed as default (requests file).
+- Prebuild "window" (I, 2 of 2 runs against 4 of 4 with "all"): 700+ pipelines not ready at world entry, then a broken
+  world for the whole run; a candidate cause of the intermittent broken scene.
+- Reachable (I): ~2.9 frames/s with every non-shader term removed, ~3-3.3 with more shader passes of the current kind.
+  The next 2x needs concurrency (resource-precise barriers, GPU-side waits for committed signallers) and a wave64
+  emulation without cross-SIMD rounds for the G-buffer geometry.
+
 ## Round 15, visible-faults worker (2026-11-27 14:10-17:05): the dark blocks / sawtooth / pale rectangle are NOT the hair copy (measured) but are already in the pre-upscale colour; the "T# view refused" class is the 2D storage index range (4,096) running full; minimap, water and albedo not fixed; no before/after from the hand-over view
 
 Tree `build/vfx-x86_64` (kept: `gta6rt.b6` = live sources of 15:57 + the bindless line below, the binary of the A/B

@@ -4,7 +4,8 @@ d3d12_metal/tools/rehash_world.py plans them), rebuilt with wired2_passes (defau
 placed first, plus the prebuild manifest + catalog for prepare_shaders.
 
   wired2_rebuild.py plan WORK [--stages ps,cs] [--top N] [--limit N]   (--top: the N largest libraries)
-  wired2_rebuild.py build WORK [--jobs J] [--passes hash_noinline]
+  WIRED2_PASSES=hash_noinline wired2_rebuild.py build WORK [--jobs J]      (passes: wired2_passes.PASSES)
+  WIRED2_RECIPE_OPTS=merge_typed_reads ...                                 (recipe options added to SPIR-V rows)
   wired2_rebuild.py overlay WORK
   wired2_rebuild.py manifest WORK
 
@@ -87,22 +88,25 @@ def one(job, work):
             spv_path = RW.spv_of(meta, job["names"])
             if not os.path.exists(spv_path):
                 raise RuntimeError("no corpus SPIR-V " + spv_path)
-            opts = RW.opts_of(meta)
-            if "output_variants" in opts:
+            ref = RW.opts_of(meta)
+            if "output_variants" in ref:
                 import out_types
-                opts["output_signature"] = out_types.dxbc_targets(R.dxbc_of(spv_path))
+                ref["output_signature"] = out_types.dxbc_targets(R.dxbc_of(spv_path))
+            opts = dict(ref)
+            for o in [x for x in os.environ.get("WIRED2_RECIPE_OPTS", "").split(",") if x]:
+                opts[o] = True
             raw = open(spv_path, "rb").read()
             words = list(R.spv.struct.unpack("<%dI" % (len(raw) // 4), raw))
-            if RW.FNV_WORD not in words:
+            if RW.FNV_WORD not in words and PASSES == ["hash_noinline"] and opts == ref:
                 r.update(status="ok", sites=0, wall_s=round(time.monotonic() - t0, 2))
                 os.makedirs(os.path.dirname(done), exist_ok=True)
                 json.dump(r, open(done + ".tmp", "w"))
                 os.replace(done + ".tmp", done)
                 return r
-            w, passes, extra = R.prepare(words, meta["stage"], opts)
+            _, rpasses, rextra = R.prepare(words, meta["stage"], ref)
             translator = None
             for d in (RW.SPIRV, os.path.dirname(spv_path)):
-                if R.cache_key(raw, R.translator_id(d), passes, extra) == meta["key"]:
+                if R.cache_key(raw, R.translator_id(d), rpasses, rextra) == meta["key"]:
                     translator = R.translator_id(d)
                     break
             if translator is None:
@@ -112,7 +116,7 @@ def one(job, work):
             if nr.get("status") != "ok":
                 raise RuntimeError("compile_one: %s %s" % (nr.get("status"), nr.get("error", "")[:300]))
             r["info"] = nr.get("wired2")
-            r["sites"] = applied(nr)
+            r["sites"] = applied(nr) + int(opts != ref)
             if nr.get("cached"):
                 r["cached"] = True
             if r["sites"]:

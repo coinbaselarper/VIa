@@ -160,7 +160,6 @@ def budget(rows, cbs, a, b, window, top):
                 acc[stages[i][2]] += share
             if len(active) == 1:
                 excl[stages[next(iter(active))][2]] += dt
-            acc["~overlap (time with >1 stage running)"] += 0
             if len(active) > 1:
                 excl["~overlap (time with >1 stage running)"] += dt
         elif cb_active > 0:
@@ -281,7 +280,8 @@ def main():
         for k, v in res_w["acc"].items():
             groups[group(k)] += v
         tot = sum(groups.values())
-        print(f"  sum of rows {tot * 1e3 / f:.1f} ms a frame (window {res_w['seconds'] * 1e3 / f:.1f})")
+        print(f"  sum of rows {tot * 1e3 / f:.1f} ms a frame (window {res_w['seconds'] * 1e3 / f:.1f}); of it with more "
+              f"than one stage running {res_w['excl'].get('~overlap (time with >1 stage running)', 0) * 1e3 / f:.1f} ms")
         for k, v in sorted(groups.items(), key=lambda x: -x[1]):
             print(f"    {v * 1e3 / f:8.1f} ms  {100 * v / tot:5.1f}%  {k}")
         print("  top rows:")

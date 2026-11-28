@@ -51,10 +51,10 @@ DescriptorHashKind table_hash_kind() {
 MetalBindless::MetalBindless(gpu::Device& device, MetalContext& context)
     : device_(device), context_(context), table_(16, table_hash_kind()) {
     counts_ = kCounts;
-    // GTA6RT_METAL_BINDLESS_WIDE=1 (off by default): the 1D bindings and the 2D storage bindings get the 2D sampled
-    // count. A 2D index with a storage view must lie below the storage count, so 4,096 title UAV T#s filled the 2D
-    // index space for them about 40 s into the world, and 4,096 1D T#s filled the 1D one before it.
-    if (const char* v = std::getenv("GTA6RT_METAL_BINDLESS_WIDE"); v && std::strcmp(v, "0") != 0) {
+    // GTA6RT_METAL_BINDLESS_WIDE (on; =0 off): the 1D bindings and the 2D storage bindings get the 2D sampled count. A
+    // 2D index with a storage view must lie below the storage count, so 4,096 title UAV T#s filled the 2D index space
+    // for them about 40 s into the world, and 4,096 1D T#s filled the 1D one before it.
+    if (const char* v = std::getenv("GTA6RT_METAL_BINDLESS_WIDE"); !v || std::strcmp(v, "0") != 0) {
         for (const std::uint32_t b : {4u, 5u, 8u, 9u, 10u, 17u, 18u, 19u}) counts_[b] = kCounts[0];
         std::fprintf(stderr, "[rt] d3d12-metal: bindless 1D and 2D storage bindings widened to %u entries "
                              "(GTA6RT_METAL_BINDLESS_WIDE)\n", kCounts[0]);
