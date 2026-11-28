@@ -1,5 +1,37 @@
 # port/d3d12_metal status (round 7)
 
+## Round 16, wired-memory worker 2 (2026-11-27 17:05-19:30, 22:49-00:10): code-size overlays default (-0.2 GiB game wired, measured); the target (-1.5 GiB) and the ten-minute run are not reached; a census of where the game's wired memory is; the pool mirror draws again but changes the G-buffer
+
+Details, tables and the census: the worker's spike folder (r14-wired). M = measured, I = inferred. Same-binary pairs,
+two runs a leg, alone in the slot, cap 14,848; 0 failed command buffers, 0 GPU faults, gpuEvent-gta6rt 13 before and
+after every run (the task's "10" predates the stability worker's three 17:29-17:35 lockups). Load 4-6.5 at run starts.
+
+- **Default ON: two shader overlays that shrink native code** (rows built by `shaderc_msl/tools/wired2_rebuild.py`):
+  the 299 largest world compute libraries with integer-only helpers out of line (two hot kernels also with
+  `merge_typed_reads`: compute scratch 349 -> 205 MiB offline) and every world pixel library with the bindless probe
+  loop out of line (native fragment code -19.5% on a 25-library sample). Their 1,967 tier pipelines are in two archive
+  directories the default tier list now names. A/B (M): game wired -190 MiB on average at world+20..50 s, graphics
+  ledger -190..-245 MiB at world+30, pipeline memory -150..-300 MiB; presents: the same view and faults in both legs.
+  `GTA6RT_METAL_SHADER_OVERLAY` / `GTA6RT_METAL_ARCHIVE_TIERS` set by hand replace the defaults as before.
+- **Where the game's ~6.1 GiB of wired is at world+33 s (M, opt-in `GTA6RT_METAL_MEMORY_CENSUS=1`, 96% attributed):**
+  title pool chunks 21%, render targets 17%, title texture copies 15%, pipelines 14%, driver scratch and driver memory
+  11%, slot-133 buffer windows (wrapped whole; one is bound whole by a single V#) 9%, arena + hash table 8%. Render-target
+  extents hold only ~34 MiB no used target needs; the render scratch pool is 280 MiB (the world's pixel rows), not 520.
+- **Final default build: both runs ended on the 4 Hz wired stop at world+86/87 s, ~20 s after the hand-over (I, by
+  present index)**, game wired 6.5-6.6 GiB at world+60, 6.75 at the stop; compressor 4.7-5.2 GiB, footprint 13.3-13.6
+  GiB; 2.2-2.8 frames/s before the hand-over, 3.2-3.6 after. Each stop fired on a one-second jump of +100..+390 MiB.
+- **Pool mirror (`GTA6RT_METAL_TITLE_POOL_MIRROR=1`, still off):** with today's sources the world is lit in 3 of 3 runs
+  (also with the pipeline waits off), copies fall from 79-95 to 15-43 MiB a submission (1.7 -> 0.4-0.9 ms), no memory
+  cost measured; but the G-buffer at world+10 s has 16.9% / 37.4% / 47.9% coverage against 48-56% in 7 runs without:
+  GPU writes into mirrored title memory persist where copy windows discard them (I). `main` alone: clean in 1 run.
+- Files: `shims/d3d12_metal_device.cpp` (the overlay default list; census: `report_memory_census`,
+  `Resource::rt_census`, `in_place_texture_bytes`, slot-133 window ranges in `create_host_buffer` / the destructor;
+  earlier this round `report_replaced_images`, `retire_image_entry`, opt-in `GTA6RT_METAL_REPLACED_RELEASE_S`),
+  `cache/src/pcache.cpp` (`resolve_tiers` default).
+- Next (ranked): (1) evicting unused title texture copies needs a GPU use stamp in the bindless lookup (translator +
+  bindless owners); (2) the fmix32 table rebuild (-80..-160 MiB); (3) name the one-second jumps that fire the stop (a
+  4 Hz ledger sampler beside an allocation log); (4) the mirror's G-buffer difference: which mirrored range the GPU writes.
+
 ## Round 16, stability worker (2026-11-27 17:10-19:30, 22:55-23:45): residency crash fixed with a test; skipped first-use work at world entry fixed (waits); a G-buffer check in every run; the band / town-loss fault remains; terrain lockup is not a loop spin; one launcher helper
 
 M = measured, I = inferred. Load 3-6 at run starts, every run alone. Details and evidence in the worker's spike notes.

@@ -745,7 +745,7 @@ bool same_dir(const std::string& a, const std::string& b) {
 }
 
 // GTA6RT_METAL_ARCHIVE_TIERS: "off", or directories separated by ':'. Unset: the world tier
-// (<port>/build/pc7/arch-world) when it exists.
+// (<port>/build/pc7/arch-world) and the default code-size overlays' tier pipelines, each when it exists.
 std::vector<std::string> resolve_tiers(const std::string& own) {
     std::vector<std::string> out, want;
     const char* v = std::getenv("GTA6RT_METAL_ARCHIVE_TIERS");
@@ -766,7 +766,11 @@ std::vector<std::string> resolve_tiers(const std::string& own) {
 #ifdef GTA6RT_D3D12_METAL_PORT_ROOT
         if (!root) root = GTA6RT_D3D12_METAL_PORT_ROOT;
 #endif
-        if (root) want.push_back(std::string(root) + "/build/pc7/arch-world");
+        if (root) {
+            want.push_back(std::string(root) + "/build/pc7/arch-world");
+            want.push_back(std::string(root) + "/build/wired2-x86_64/csov/arch");
+            want.push_back(std::string(root) + "/build/wired2-x86_64/psni/arch");
+        }
     }
     for (const auto& d : want)
         if (is_dir(d) && !same_dir(d, own)) out.push_back(d);

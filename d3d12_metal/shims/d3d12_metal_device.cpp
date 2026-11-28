@@ -11438,6 +11438,7 @@ public:
             config.builders = builders ? unsigned(std::strtoul(builders, nullptr, 10)) : 2u;
             // GTA6RT_METAL_SHADER_DEBUG_OVERLAY (only with GTA6RT_METAL_GPU_DEBUG: its shaders write the debug buffer)
             // first, then GTA6RT_METAL_SHADER_OVERLAY (':'-separated, the first listed winning; "off": none; default
+            // the code-size rows first (pixel and compute helpers out of line, shaderc_msl/tools/wired2_rebuild.py),
             // the thread-memory kernels, shaderc_msl round 9 (merge_typed_reads, loop_cap), then the mesh shaders whose
             // staged outputs are thread variables, shaderc_msl/tools/mesh_out_private.py, then the mesh shaders packed
             // or split under Metal's threadgroup limit, d3d12_metal/tools/mesh_tg_pack.py + msl_overlay.py, then the
